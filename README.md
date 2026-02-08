@@ -1,14 +1,33 @@
-# ai-sdk-rs (v0.1)
+# ai-sdk-rs (v0.1.1)
 
 A tiny, open-source Rust AI SDK inspired by [Vercel's AI SDK](https://github.com/vercel/ai), but in Rust.
 
-## Features (v0.1)
+## Features (v0.1.1)
 - Unified `LanguageModel` trait + common chat types
 - `EmbeddingModel` trait + OpenAI-compatible embeddings endpoint
-- OpenAI-compatible providers (OpenAI, Groq, etc.)
+- Built-in providers: OpenAI, Azure OpenAI, Anthropic, Google, Google Vertex, Amazon Bedrock, Gateway
+- OpenAI-compatible adapter modes for third-party compatible endpoints
 - Google (Gemini / AI Studio) provider
 - Streaming to a normalized `Event` stream
 - Examples: text and streaming CLI
+
+## Supported Providers (Built-in)
+
+- `openai`
+- `azure`
+- `anthropic`
+- `google`
+- `google-vertex`
+- `amazon-bedrock`
+- `gateway`
+
+Compatibility adapters (not part of the built-in list): `openai-compatible`, `openai-compatible-chat`, `openai-compatible-completion`.
+
+## Installation
+
+```bash
+cargo add ai-sdk-rs
+```
 
 ## Quick start
 
