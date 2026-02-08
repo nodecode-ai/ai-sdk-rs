@@ -153,7 +153,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## License
 
 MIT License
-
-Copyright (c) 2026 Nodecode.ai
-
-See [`LICENSE`](LICENSE) for the full text.
