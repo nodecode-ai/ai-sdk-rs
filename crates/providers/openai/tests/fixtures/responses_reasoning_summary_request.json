@@ -1,0 +1,18 @@
+{
+  "model": "gpt-4o",
+  "input": [
+    {
+      "type": "reasoning",
+      "id": "rs_1",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "step one"
+        }
+      ],
+      "encrypted_content": "enc"
+    }
+  ],
+  "store": false,
+  "stream": true
+}

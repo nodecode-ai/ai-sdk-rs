@@ -1,0 +1,64 @@
+[package]
+name = "ai-sdk-rs"
+version = "0.1.1"
+edition = "2021"
+autoexamples = false
+license = "MIT"
+authors = ["nodecode.ai"]
+description = "AI SDK for Rust with unified model/provider abstractions"
+repository = "https://github.com/nodecode/ai-sdk-rs"
+homepage = "https://github.com/nodecode/ai-sdk-rs"
+documentation = "https://docs.rs/ai-sdk-rs"
+readme = "README.md"
+keywords = ["ai", "llm", "sdk", "streaming", "providers"]
+categories = ["api-bindings", "asynchronous", "web-programming::http-client"]
+rust-version = "1.78"
+
+[workspace]
+members = [
+  ".",
+  "examples/embed-openai-compatible",
+  "examples/generate-stream",
+  "examples/openai-reasoning-summary",
+]
+resolver = "2"
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+aws-credential-types = "1"
+aws-sigv4 = { version = "1", features = ["http0-compat", "sign-http", "http1"] }
+aws-smithy-eventstream = "0.60.11"
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5"
+dirs = "5"
+futures-core = "0.3"
+futures-util = "0.3"
+governor = { version = "0.6", default-features = false, features = ["std", "futures"] }
+http = "1"
+inventory = "0.3"
+once_cell = "1"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls-native-roots", "socks"] }
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tracing = "0.1"
+url = "2"
+urlencoding = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[features]
+default = ["reqwest", "stream"]
+reqwest = []
+stream = []

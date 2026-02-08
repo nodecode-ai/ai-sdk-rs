@@ -1,0 +1,11 @@
+[package]
+name = "anthropic-hello-twice"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+futures-util = "0.3"
+serde_json = "1"
+ai-sdk-rs = { path = "../.." }

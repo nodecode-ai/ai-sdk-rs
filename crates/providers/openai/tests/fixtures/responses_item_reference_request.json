@@ -1,0 +1,34 @@
+{
+  "model": "gpt-4o",
+  "input": [
+    {
+      "type": "item_reference",
+      "id": "msg_123"
+    },
+    {
+      "type": "item_reference",
+      "id": "lsh_123"
+    },
+    {
+      "type": "local_shell_call_output",
+      "call_id": "call-1",
+      "output": "ok"
+    },
+    {
+      "type": "item_reference",
+      "id": "mcpr_1"
+    },
+    {
+      "type": "mcp_approval_response",
+      "approval_request_id": "mcpr_1",
+      "approve": true
+    }
+  ],
+  "store": true,
+  "tools": [
+    {
+      "type": "local_shell"
+    }
+  ],
+  "stream": true
+}

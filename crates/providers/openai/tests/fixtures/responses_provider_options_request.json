@@ -1,0 +1,47 @@
+{
+  "model": "gpt-4o",
+  "input": [
+    {
+      "role": "system",
+      "content": "System prompt"
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Hello"
+        }
+      ]
+    }
+  ],
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "strict": true,
+      "name": "response",
+      "description": "Return a JSON object",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "conversation": "conv_123",
+  "max_tool_calls": 2,
+  "prompt_cache_key": "cache-key",
+  "prompt_cache_retention": "24h",
+  "truncation": "disabled",
+  "reasoning": {
+    "effort": "low"
+  },
+  "stream": true
+}
