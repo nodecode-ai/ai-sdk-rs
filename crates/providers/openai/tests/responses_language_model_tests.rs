@@ -679,3 +679,113 @@ async fn request_body_includes_provider_tool_outputs() {
     let body = transport.last_body().expect("request body");
     assert_eq!(body, provider_tool_outputs_fixture());
 }
+
+#[tokio::test]
+async fn request_defaults_do_not_override_explicit_reasoning_effort() {
+    let prompt = vec![v2t::PromptMessage::User {
+        content: vec![v2t::UserPart::Text {
+            text: "Hello".into(),
+            provider_options: None,
+        }],
+        provider_options: None,
+    }];
+    let mut provider_options = v2t::ProviderOptions::new();
+    provider_options.insert(
+        "openai".into(),
+        HashMap::from([("reasoningEffort".into(), json!("xhigh"))]),
+    );
+    let opts = v2t::CallOptions {
+        prompt,
+        provider_options,
+        ..Default::default()
+    };
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: Some(json!({
+            "openai": {
+                "reasoning": {
+                    "effort": "low",
+                    "summary": "auto"
+                }
+            }
+        })),
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    let body = transport.last_body().expect("request body");
+    assert_eq!(
+        body.get("reasoning").and_then(|r| r.get("effort")),
+        Some(&json!("xhigh"))
+    );
+    assert_eq!(
+        body.get("reasoning").and_then(|r| r.get("summary")),
+        Some(&json!("auto"))
+    );
+}
+
+#[tokio::test]
+async fn request_defaults_apply_reasoning_when_effort_not_explicit() {
+    let prompt = vec![v2t::PromptMessage::User {
+        content: vec![v2t::UserPart::Text {
+            text: "Hello".into(),
+            provider_options: None,
+        }],
+        provider_options: None,
+    }];
+    let opts = v2t::CallOptions {
+        prompt,
+        ..Default::default()
+    };
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: Some(json!({
+            "openai": {
+                "reasoning": {
+                    "effort": "low",
+                    "summary": "auto"
+                }
+            }
+        })),
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    let body = transport.last_body().expect("request body");
+    assert_eq!(
+        body.get("reasoning").and_then(|r| r.get("effort")),
+        Some(&json!("low"))
+    );
+    assert_eq!(
+        body.get("reasoning").and_then(|r| r.get("summary")),
+        Some(&json!("auto"))
+    );
+}

@@ -28,7 +28,9 @@ use crate::provider_openai::error::map_transport_error;
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, SdkError>> + Send>>;
 
-pub struct OpenAIResponsesLanguageModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport> {
+pub struct OpenAIResponsesLanguageModel<
+    T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
+> {
     pub model_id: String,
     pub config: OpenAIConfig,
     pub http: T,
@@ -4185,11 +4187,11 @@ fn build_request_body(
         // reasoning object
         if prov.reasoning_effort.is_some() || prov.reasoning_summary.is_some() {
             let mut r = serde_json::Map::new();
-            if let Some(e) = prov.reasoning_effort {
-                r.insert("effort".into(), Value::String(e));
+            if let Some(e) = prov.reasoning_effort.as_ref() {
+                r.insert("effort".into(), Value::String(e.clone()));
             }
-            if let Some(s) = prov.reasoning_summary {
-                r.insert("summary".into(), Value::String(s));
+            if let Some(s) = prov.reasoning_summary.as_ref() {
+                r.insert("summary".into(), Value::String(s.clone()));
             }
             body["reasoning"] = Value::Object(r);
         }
@@ -4231,6 +4233,26 @@ fn build_request_body(
                     .is_some(),
                 "openai request defaults merged"
             );
+            // Keep explicit provider options authoritative for effort while preserving
+            // defaults for other reasoning fields (e.g. summary).
+            if is_reasoning_model {
+                if let Some(explicit_effort) = prov.reasoning_effort.as_ref() {
+                    if let Some(body_obj) = body.as_object_mut() {
+                        let reasoning = body_obj
+                            .entry("reasoning".to_string())
+                            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                        if !reasoning.is_object() {
+                            *reasoning = Value::Object(serde_json::Map::new());
+                        }
+                        if let Some(reasoning_obj) = reasoning.as_object_mut() {
+                            reasoning_obj.insert(
+                                "effort".to_string(),
+                                Value::String(explicit_effort.clone()),
+                            );
+                        }
+                    }
+                }
+            }
         } else {
             tracing::debug!(
                 provider_scope = %cfg.provider_scope_name,
