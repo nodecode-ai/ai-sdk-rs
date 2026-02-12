@@ -36,7 +36,9 @@ pub struct AnthropicMessagesConfig<T: HttpTransport> {
     pub default_options: Option<v2t::ProviderOptions>,
 }
 
-pub struct AnthropicMessagesLanguageModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport> {
+pub struct AnthropicMessagesLanguageModel<
+    T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
+> {
     model_id: AnthropicMessagesModelId,
     cfg: AnthropicMessagesConfig<T>,
 }

@@ -5,11 +5,15 @@ use crate::ai_sdk_core::options as sdkopt;
 use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
 use crate::ai_sdk_core::transport::TransportConfig;
 use crate::ai_sdk_core::{EmbeddingModel, ImageModel, LanguageModel, SdkError};
-use crate::ai_sdk_provider::{apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials};
+use crate::ai_sdk_provider::{
+    apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials,
+};
 use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 use crate::ai_sdk_types::v2 as v2t;
 
-use crate::provider_openai_compatible::chat::language_model::{OpenAICompatibleChatConfig, OpenAICompatibleChatLanguageModel};
+use crate::provider_openai_compatible::chat::language_model::{
+    OpenAICompatibleChatConfig, OpenAICompatibleChatLanguageModel,
+};
 use crate::provider_openai_compatible::completion::language_model::{
     OpenAICompatibleCompletionConfig, OpenAICompatibleCompletionLanguageModel,
 };
@@ -17,7 +21,9 @@ use crate::provider_openai_compatible::embedding::embedding_model::{
     OpenAICompatibleEmbeddingConfig, OpenAICompatibleEmbeddingModel,
     DEFAULT_MAX_EMBEDDINGS_PER_CALL,
 };
-use crate::provider_openai_compatible::image::image_model::{OpenAICompatibleImageConfig, OpenAICompatibleImageModel};
+use crate::provider_openai_compatible::image::image_model::{
+    OpenAICompatibleImageConfig, OpenAICompatibleImageModel,
+};
 
 const _TRACE_PREFIX: &str = "[OPENAI-COMP-CMPL]";
 

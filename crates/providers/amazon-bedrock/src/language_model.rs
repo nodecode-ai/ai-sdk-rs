@@ -12,7 +12,9 @@ use tracing::instrument;
 use crate::provider_amazon_bedrock::config::BedrockConfig;
 use crate::provider_amazon_bedrock::error::map_transport_error;
 use crate::provider_amazon_bedrock::messages::{convert_prompt, ConvertedPrompt};
-use crate::provider_amazon_bedrock::options::{map_to_owned, parse_bedrock_provider_options, BedrockProviderOptions};
+use crate::provider_amazon_bedrock::options::{
+    map_to_owned, parse_bedrock_provider_options, BedrockProviderOptions,
+};
 use crate::provider_amazon_bedrock::signing::{prepare_request, PreparedRequest};
 
 const TRACE_PREFIX: &str = "[BEDROCK]";

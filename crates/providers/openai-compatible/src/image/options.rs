@@ -48,5 +48,9 @@ pub fn apply_provider_defaults(
     provider_scope_name: &str,
     defaults: Option<&v2t::ProviderOptions>,
 ) -> ImageCallOptions {
-    crate::ai_sdk_core::request_builder::defaults::build_image_options(opts, provider_scope_name, defaults)
+    crate::ai_sdk_core::request_builder::defaults::build_image_options(
+        opts,
+        provider_scope_name,
+        defaults,
+    )
 }

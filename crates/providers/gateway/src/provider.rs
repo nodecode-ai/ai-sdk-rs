@@ -6,7 +6,9 @@ use crate::ai_sdk_core::options as sdkopt;
 use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
 use crate::ai_sdk_core::transport::TransportConfig;
 use crate::ai_sdk_core::{LanguageModel, SdkError};
-use crate::ai_sdk_provider::{apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials};
+use crate::ai_sdk_provider::{
+    apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials,
+};
 use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 use crate::ai_sdk_types::v2 as v2t;
 use serde_json::Value as JsonValue;

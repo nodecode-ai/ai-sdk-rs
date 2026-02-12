@@ -1,7 +1,7 @@
 //! Vercel-compatible LanguageModel interface (formerly V2) and helpers.
 
-use crate::core::SdkError;
 use crate::ai_sdk_types::v2 as v2t;
+use crate::core::SdkError;
 use futures_core::Stream;
 use std::pin::Pin;
 
@@ -48,8 +48,10 @@ pub trait LanguageModel: Send + Sync {
         &self,
         options: v2t::CallOptions,
     ) -> Result<GenerateResponse, crate::core::SdkError>;
-    async fn do_stream(&self, options: v2t::CallOptions)
-        -> Result<StreamResponse, crate::core::SdkError>;
+    async fn do_stream(
+        &self,
+        options: v2t::CallOptions,
+    ) -> Result<StreamResponse, crate::core::SdkError>;
 }
 
 // No adapters or converters: providers implement the v2 surface directly.

@@ -27,8 +27,9 @@ pub struct OpenAICompatibleChatConfig<T: HttpTransport> {
     pub default_options: Option<v2t::ProviderOptions>,
 }
 
-pub struct OpenAICompatibleChatLanguageModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport>
-{
+pub struct OpenAICompatibleChatLanguageModel<
+    T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
+> {
     model_id: String,
     cfg: OpenAICompatibleChatConfig<T>,
 }

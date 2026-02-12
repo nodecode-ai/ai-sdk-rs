@@ -26,7 +26,8 @@ pub struct OpenAICompatibleImageConfig<T: HttpTransport> {
     pub default_options: Option<v2t::ProviderOptions>,
 }
 
-pub struct OpenAICompatibleImageModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport> {
+pub struct OpenAICompatibleImageModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport>
+{
     model_id: String,
     cfg: OpenAICompatibleImageConfig<T>,
 }

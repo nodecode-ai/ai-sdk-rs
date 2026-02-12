@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::ai_sdk_core::request_builder::defaults::{build_call_options, request_overrides_from_json};
+use crate::ai_sdk_core::request_builder::defaults::{
+    build_call_options, request_overrides_from_json,
+};
 use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
 use crate::ai_sdk_core::{GenerateResponse, LanguageModel, PartStream, SdkError, StreamResponse};
 use crate::ai_sdk_streaming_sse::SseDecoder;
@@ -263,7 +265,9 @@ where
                 request_overrides_from_json(&self.config.provider_scope_name, defaults)
             {
                 let disallow = ["model", "prompt", "stream", "tools", "input"];
-                crate::ai_sdk_core::options::merge_options_with_disallow(&mut body, &overrides, &disallow);
+                crate::ai_sdk_core::options::merge_options_with_disallow(
+                    &mut body, &overrides, &disallow,
+                );
             }
         }
 
@@ -326,7 +330,9 @@ where
                 request_overrides_from_json(&self.config.provider_scope_name, defaults)
             {
                 let disallow = ["model", "prompt", "stream", "tools", "input"];
-                crate::ai_sdk_core::options::merge_options_with_disallow(&mut body, &overrides, &disallow);
+                crate::ai_sdk_core::options::merge_options_with_disallow(
+                    &mut body, &overrides, &disallow,
+                );
             }
         }
         let headers = self.merge_headers(&options.headers, true);

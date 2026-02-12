@@ -30,7 +30,9 @@ pub struct OpenAICompatibleEmbeddingConfig<T: HttpTransport> {
     pub default_options: Option<v2t::ProviderOptions>,
 }
 
-pub struct OpenAICompatibleEmbeddingModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport> {
+pub struct OpenAICompatibleEmbeddingModel<
+    T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
+> {
     model_id: String,
     cfg: OpenAICompatibleEmbeddingConfig<T>,
 }

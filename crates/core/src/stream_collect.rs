@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use futures_util::StreamExt;
 
+use crate::ai_sdk_types::v2 as v2t;
 use crate::core::SdkError;
 use crate::core::{GenerateResponse, StreamResponse};
-use crate::ai_sdk_types::v2 as v2t;
 
 /// Controls how stream parts are collapsed into a `GenerateResponse`.
 #[derive(Debug, Clone, Copy)]

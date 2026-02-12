@@ -9,8 +9,12 @@ use crate::ai_sdk_streaming_sse::SseDecoder;
 use crate::ai_sdk_types::v2 as v2t;
 
 use crate::provider_google_vertex::error::map_transport_error_to_sdk_error;
-use crate::provider_google_vertex::options::{parse_google_vertex_provider_options, GoogleVertexProviderOptions};
-use crate::provider_google_vertex::prepare_tools::{convert_json_schema_to_openapi_schema, prepare_tools};
+use crate::provider_google_vertex::options::{
+    parse_google_vertex_provider_options, GoogleVertexProviderOptions,
+};
+use crate::provider_google_vertex::prepare_tools::{
+    convert_json_schema_to_openapi_schema, prepare_tools,
+};
 use crate::provider_google_vertex::prompt::{convert_to_google_prompt, GooglePrompt};
 
 const TRACE_PREFIX: &str = "[GOOGLE-VERTEX]";
@@ -27,7 +31,8 @@ pub struct GoogleVertexConfig<T: HttpTransport = crate::reqwest_transport::Reqwe
     pub default_options: Option<v2t::ProviderOptions>,
 }
 
-pub struct GoogleVertexLanguageModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport> {
+pub struct GoogleVertexLanguageModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport>
+{
     pub model_id: String,
     pub cfg: GoogleVertexConfig<T>,
 }

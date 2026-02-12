@@ -14,7 +14,9 @@ use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 use crate::ai_sdk_types::v2 as v2t;
 use serde_json::Value as JsonValue;
 
-use crate::provider_anthropic::messages::language_model::{AnthropicMessagesConfig, AnthropicMessagesLanguageModel};
+use crate::provider_anthropic::messages::language_model::{
+    AnthropicMessagesConfig, AnthropicMessagesLanguageModel,
+};
 const OAUTH_BETA_HEADER_VALUE: &str = "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14";
 const DEFAULT_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_STAINLESS_TIMEOUT_SECS: u64 = 600;

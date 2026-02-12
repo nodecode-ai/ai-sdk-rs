@@ -22,6 +22,8 @@ pub use crate::core::image::{ImageModel, ImageResponse, ImageResponseMeta};
 pub use crate::core::v2::{GenerateResponse, LanguageModel, PartStream, StreamResponse};
 // Convenience re-exports of common types
 pub use crate::ai_sdk_types::embedding::{EmbedOptions, EmbedUsage, Embedding};
-pub use crate::ai_sdk_types::image::{ImageData, ImageFile, ImageOptions, ImageUsage, ImageWarning};
+pub use crate::ai_sdk_types::image::{
+    ImageData, ImageFile, ImageOptions, ImageUsage, ImageWarning,
+};
 pub use crate::ai_sdk_types::v2 as types;
 pub use crate::ai_sdk_types::Event;
