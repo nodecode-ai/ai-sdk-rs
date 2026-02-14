@@ -98,7 +98,8 @@ fn build_google(
     transport_cfg.idle_read_timeout = std::time::Duration::from_secs(45);
     apply_stream_idle_timeout_ms(def, &mut transport_cfg);
 
-    let http = crate::reqwest_transport::ReqwestTransport::new(&transport_cfg);
+    let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
+        .map_err(SdkError::Transport)?;
 
     let cfg = GoogleGenAiConfig {
         provider_name: "google.gen-ai",

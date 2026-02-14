@@ -121,9 +121,10 @@ fn build_base_config(
         def.headers.keys().collect::<Vec<_>>()
     );
 
-    let http = crate::reqwest_transport::ReqwestTransport::default();
     let mut cfg = TransportConfig::default();
     apply_stream_idle_timeout_ms(def, &mut cfg);
+    let http =
+        crate::reqwest_transport::ReqwestTransport::try_new(&cfg).map_err(SdkError::Transport)?;
     let query_params = def
         .query_params
         .iter()

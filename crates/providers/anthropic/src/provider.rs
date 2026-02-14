@@ -141,7 +141,8 @@ fn build_anthropic(
     transport_cfg.idle_read_timeout = DEFAULT_IDLE_READ_TIMEOUT;
     apply_stream_idle_timeout_ms(def, &mut transport_cfg);
 
-    let http = crate::reqwest_transport::ReqwestTransport::new(&transport_cfg);
+    let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
+        .map_err(SdkError::Transport)?;
 
     let supported_urls =
         HashMap::from([("image/*".to_string(), vec![r"^https?://.*$".to_string()])]);

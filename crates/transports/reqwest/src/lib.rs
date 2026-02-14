@@ -20,7 +20,7 @@ pub struct ReqwestTransport {
 }
 
 impl ReqwestTransport {
-    pub fn new(cfg: &TransportConfig) -> Self {
+    pub fn try_new(cfg: &TransportConfig) -> Result<Self, TransportError> {
         let mut builder = Client::builder()
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .pool_idle_timeout(Duration::from_secs(90))
@@ -32,8 +32,29 @@ impl ReqwestTransport {
         }
         // connect timeout
         builder = builder.connect_timeout(cfg.connect_timeout);
-        Self {
-            client: builder.build().expect("reqwest client build"),
+        let client = builder.build().map_err(|err| {
+            TransportError::Other(format!(
+                "reqwest client build failed: {}",
+                format_reqwest_error_chain(&err)
+            ))
+        })?;
+        Ok(Self { client })
+    }
+
+    pub fn new(cfg: &TransportConfig) -> Self {
+        // Keep compatibility with existing call sites while removing panics.
+        match Self::try_new(cfg) {
+            Ok(transport) => transport,
+            Err(err) => {
+                debug!(
+                    target: "ai_sdk::transport::reqwest",
+                    error = %err,
+                    "falling back to reqwest::Client::new after transport init failure"
+                );
+                Self {
+                    client: Client::new(),
+                }
+            }
         }
     }
 }

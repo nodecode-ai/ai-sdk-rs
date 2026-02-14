@@ -258,7 +258,8 @@ fn build_azure(
     let mut transport_cfg = TransportConfig::default();
     transport_cfg.idle_read_timeout = Duration::from_secs(45);
     apply_stream_idle_timeout_ms(def, &mut transport_cfg);
-    let http = crate::reqwest_transport::ReqwestTransport::new(&transport_cfg);
+    let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
+        .map_err(SdkError::Transport)?;
 
     let config = OpenAIConfig {
         provider_name: "azure.responses".into(),

@@ -163,7 +163,8 @@ fn build_gateway(
     transport_cfg.idle_read_timeout = Duration::from_secs(45);
     apply_stream_idle_timeout_ms(def, &mut transport_cfg);
 
-    let http = crate::reqwest_transport::ReqwestTransport::new(&transport_cfg);
+    let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
+        .map_err(SdkError::Transport)?;
 
     let supported_urls = HashMap::from([("*/*".to_string(), vec![r"^.*$".to_string()])]);
 
