@@ -20,8 +20,11 @@ pub struct ReqwestTransport {
 }
 
 impl ReqwestTransport {
-    pub fn try_new(cfg: &TransportConfig) -> Result<Self, TransportError> {
-        let mut builder = Client::builder()
+    fn configure_builder(
+        mut builder: reqwest::ClientBuilder,
+        cfg: &TransportConfig,
+    ) -> reqwest::ClientBuilder {
+        builder = builder
             .tcp_keepalive(Some(Duration::from_secs(60)))
             .pool_idle_timeout(Duration::from_secs(90))
             // reqwest 0.12 no longer exposes `http2_keep_alive_interval`; use
@@ -31,7 +34,14 @@ impl ReqwestTransport {
             builder = builder.timeout(req_timeout);
         }
         // connect timeout
-        builder = builder.connect_timeout(cfg.connect_timeout);
+        builder.connect_timeout(cfg.connect_timeout)
+    }
+
+    fn try_new_with_builder(
+        cfg: &TransportConfig,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, TransportError> {
+        let builder = Self::configure_builder(builder, cfg);
         let client = builder.build().map_err(|err| {
             TransportError::Other(format!(
                 "reqwest client build failed: {}",
@@ -41,9 +51,9 @@ impl ReqwestTransport {
         Ok(Self { client })
     }
 
-    pub fn new(cfg: &TransportConfig) -> Self {
+    fn new_with_builder(cfg: &TransportConfig, builder: reqwest::ClientBuilder) -> Self {
         // Keep compatibility with existing call sites while removing panics.
-        match Self::try_new(cfg) {
+        match Self::try_new_with_builder(cfg, builder) {
             Ok(transport) => transport,
             Err(err) => {
                 debug!(
@@ -56,6 +66,14 @@ impl ReqwestTransport {
                 }
             }
         }
+    }
+
+    pub fn try_new(cfg: &TransportConfig) -> Result<Self, TransportError> {
+        Self::try_new_with_builder(cfg, Client::builder())
+    }
+
+    pub fn new(cfg: &TransportConfig) -> Self {
+        Self::new_with_builder(cfg, Client::builder())
     }
 }
 
@@ -654,4 +672,37 @@ fn format_reqwest_error_chain(err: &reqwest::Error) -> String {
         current = src.source();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_new_returns_transport_error_when_client_build_fails() {
+        let cfg = TransportConfig::default();
+        let err = match ReqwestTransport::try_new_with_builder(
+            &cfg,
+            Client::builder().user_agent("bad\nagent"),
+        ) {
+            Ok(_) => panic!("invalid user-agent should fail reqwest client build"),
+            Err(err) => err,
+        };
+        match err {
+            TransportError::Other(message) => {
+                assert!(
+                    message.contains("reqwest client build failed"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("unexpected transport error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_with_builder_does_not_panic_when_client_build_fails() {
+        let cfg = TransportConfig::default();
+        let _transport =
+            ReqwestTransport::new_with_builder(&cfg, Client::builder().user_agent("bad\nagent"));
+    }
 }
