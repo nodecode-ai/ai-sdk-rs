@@ -3,6 +3,7 @@
 pub mod error;
 pub mod prepare_tools;
 pub mod provider;
+pub(crate) mod shared;
 
 pub mod gen_ai {
     pub mod language_model;
