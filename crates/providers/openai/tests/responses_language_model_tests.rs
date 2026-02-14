@@ -119,6 +119,63 @@ fn local_shell_response_fixture() -> Value {
         .expect("local shell response fixture")
 }
 
+fn function_tool_for_strict_passthrough(strict: Option<bool>) -> v2t::FunctionTool {
+    let provider_options = strict.map(|value| {
+        v2t::ProviderOptions::from([(
+            "openai".into(),
+            HashMap::from([("strict".into(), json!(value))]),
+        )])
+    });
+    v2t::FunctionTool {
+        r#type: v2t::FunctionToolType::Function,
+        name: "strict-tool".into(),
+        description: Some("strict passthrough".into()),
+        input_schema: json!({
+            "type":"object",
+            "properties":{"value":{"type":"string"}},
+            "required":["value"],
+            "additionalProperties": false
+        }),
+        provider_options,
+    }
+}
+
+async fn request_body_for_function_tool(function_tool: v2t::FunctionTool) -> Value {
+    let opts = v2t::CallOptions {
+        prompt: vec![v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "Hello".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        }],
+        tools: vec![v2t::Tool::Function(function_tool)],
+        ..Default::default()
+    };
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-4o",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    transport.last_body().expect("request body")
+}
+
 #[tokio::test]
 async fn request_body_includes_responses_provider_options() {
     let prompt = vec![
@@ -278,6 +335,50 @@ async fn request_body_includes_provider_tools_and_tool_choice() {
                 }
             }
         ]))
+    );
+}
+
+#[tokio::test]
+async fn request_body_function_tool_strict_true_passthrough() {
+    let body = request_body_for_function_tool(function_tool_for_strict_passthrough(Some(true))).await;
+    let function_tool = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .expect("function tool payload");
+    assert_eq!(
+        function_tool.get("strict"),
+        Some(&json!(true)),
+        "function tool strict=true must serialize to tools[0].strict=true"
+    );
+}
+
+#[tokio::test]
+async fn request_body_function_tool_strict_false_passthrough() {
+    let body = request_body_for_function_tool(function_tool_for_strict_passthrough(Some(false))).await;
+    let function_tool = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .expect("function tool payload");
+    assert_eq!(
+        function_tool.get("strict"),
+        Some(&json!(false)),
+        "function tool strict=false must serialize to tools[0].strict=false"
+    );
+}
+
+#[tokio::test]
+async fn request_body_function_tool_strict_omitted_when_unspecified() {
+    let body = request_body_for_function_tool(function_tool_for_strict_passthrough(None)).await;
+    let function_tool = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .expect("function tool payload");
+    assert!(
+        function_tool.get("strict").is_none(),
+        "function tool strict field must be omitted when not explicitly specified"
     );
 }
 
