@@ -240,6 +240,19 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
             .await
             .map_err(map_transport_error)?;
 
+        if let Some(error) = json.get("error").filter(|v| !v.is_null()) {
+            let message = error
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| error.to_string());
+            return Err(SdkError::Upstream {
+                status: 400,
+                message,
+                source: None,
+            });
+        }
+
         let approval_request_id_map = extract_approval_request_id_to_tool_call_id(
             &options.prompt,
             &self.config.provider_scope_name,
