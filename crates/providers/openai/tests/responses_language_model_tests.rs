@@ -532,7 +532,14 @@ async fn non_stream_response_error_returns_error() {
         default_options: None,
         request_defaults: None,
     };
-    let transport = TestTransport::new().with_json_response(openai_error_fixture());
+    let error_fixture = openai_error_fixture();
+    let expected_message = error_fixture
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .expect("openai error fixture message")
+        .to_owned();
+    let transport = TestTransport::new().with_json_response(error_fixture);
     let model =
         OpenAIResponsesLanguageModel::new("gpt-4o", cfg, transport, TransportConfig::default());
 
@@ -541,8 +548,14 @@ async fn non_stream_response_error_returns_error() {
         .await
         .expect_err("response.error should propagate as SdkError");
     match err {
-        SdkError::Upstream { message, .. } => {
-            assert!(message.contains("You exceeded your current quota"));
+        SdkError::Upstream {
+            status,
+            message,
+            source,
+        } => {
+            assert_eq!(status, 400);
+            assert_eq!(message, expected_message);
+            assert!(source.is_none());
         }
         other => panic!("unexpected error type: {other:?}"),
     }
