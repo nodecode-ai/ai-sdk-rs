@@ -3105,8 +3105,10 @@ fn build_stream_mapper_config(
         if let Some(rid) = &state.extra.response_id {
             inner.insert("responseId".into(), serde_json::json!(rid));
         }
-        if let Some(st) = &state.extra.service_tier {
-            inner.insert("serviceTier".into(), serde_json::json!(st));
+        if !state.extra.saw_response_failed {
+            if let Some(st) = &state.extra.service_tier {
+                inner.insert("serviceTier".into(), serde_json::json!(st));
+            }
         }
         if !state.extra.logprobs.is_empty() {
             inner.insert(
