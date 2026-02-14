@@ -273,6 +273,9 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
                 usage.cached_input_tokens = Some(v as u64);
             }
         }
+        if let Some(raw_usage) = usage_val {
+            apply_openai_usage_details(raw_usage, &mut usage);
+        }
 
         // Finish reason mapping
         let finish_hint = json
@@ -386,7 +389,8 @@ fn parse_openai_usage(u: &serde_json::Value) -> Option<TokenUsage> {
     let cache_read_tokens = obj
         .get("cache_read_tokens")
         .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+        .map(|v| v as usize)
+        .or_else(|| parse_openai_cached_input_tokens(u).map(|v| v as usize));
     let cache_write_tokens = obj
         .get("cache_write_tokens")
         .and_then(|v| v.as_u64())
@@ -418,6 +422,35 @@ fn parse_openai_usage(u: &serde_json::Value) -> Option<TokenUsage> {
         cache_read_tokens,
         cache_write_tokens,
     })
+}
+
+fn parse_openai_cached_input_tokens(u: &serde_json::Value) -> Option<u64> {
+    u.get("input_tokens_details")
+        .and_then(|v| v.get("cached_tokens"))
+        .or_else(|| {
+            u.get("prompt_tokens_details")
+                .and_then(|v| v.get("cached_tokens"))
+        })
+        .and_then(|v| v.as_u64())
+}
+
+fn parse_openai_reasoning_tokens(u: &serde_json::Value) -> Option<u64> {
+    u.get("output_tokens_details")
+        .and_then(|v| v.get("reasoning_tokens"))
+        .or_else(|| {
+            u.get("completion_tokens_details")
+                .and_then(|v| v.get("reasoning_tokens"))
+        })
+        .and_then(|v| v.as_u64())
+}
+
+fn apply_openai_usage_details(u: &serde_json::Value, usage: &mut v2t::Usage) {
+    if let Some(cached) = parse_openai_cached_input_tokens(u) {
+        usage.cached_input_tokens = Some(cached);
+    }
+    if let Some(reasoning) = parse_openai_reasoning_tokens(u) {
+        usage.reasoning_tokens = Some(reasoning);
+    }
 }
 
 // Ensure tool schemas always have a top-level "type":"object".
@@ -2111,7 +2144,7 @@ impl ProviderChunk for OpenAIResponsesChunk {
                     });
                 }
             }
-            "response.completed" | "response.incomplete" | "response.failed" => {
+            "response.completed" | "response.incomplete" => {
                 if let Some(resp) = json.get("response") {
                     if let Some(usage_val) = resp.get("usage") {
                         if let Some(usage) = parse_openai_usage(usage_val) {
@@ -2141,6 +2174,29 @@ impl ProviderChunk for OpenAIResponsesChunk {
                         value: serde_json::json!({"id": rid, "service_tier": st}),
                     });
                 }
+                if !self.tool_calls.is_empty() {
+                    for (_idx, state) in self.tool_calls.drain() {
+                        events.push(Event::ToolCallEnd { id: state.id });
+                    }
+                    self.pending_deltas.clear();
+                }
+                events.push(Event::Done);
+            }
+            "response.failed" => {
+                // TS parity: failed chunks are not treated as "response finished" chunks.
+                // They should not set incomplete_reason/service_tier driven finish metadata.
+                let failed_payload = json
+                    .get("response")
+                    .map(|resp| {
+                        serde_json::json!({
+                            "id": resp.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        })
+                    })
+                    .unwrap_or_else(|| serde_json::json!({}));
+                events.push(Event::Data {
+                    key: "openai.failed".into(),
+                    value: failed_payload,
+                });
                 if !self.tool_calls.is_empty() {
                     for (_idx, state) in self.tool_calls.drain() {
                         events.push(Event::ToolCallEnd { id: state.id });
@@ -2197,6 +2253,7 @@ struct OpenAIStreamExtras {
     finish_hint: Option<String>,
     response_id: Option<String>,
     service_tier: Option<String>,
+    saw_response_failed: bool,
     store: bool,
     logprobs_enabled: bool,
     has_function_calls: bool,
@@ -2248,7 +2305,16 @@ fn build_stream_mapper_config(
 
     hooks.data = Some(Box::new(
         |state: &mut EventMapperState<OpenAIStreamExtras>, key, value| {
-            if key == "openai.response_metadata" {
+            if key == "usage" {
+                if let Some(usage) = parse_openai_usage(value) {
+                    state.usage.input_tokens = Some(usage.input_tokens as u64);
+                    state.usage.output_tokens = Some(usage.output_tokens as u64);
+                    state.usage.total_tokens = Some(usage.total_tokens as u64);
+                    state.usage.cached_input_tokens = usage.cache_read_tokens.map(|v| v as u64);
+                }
+                apply_openai_usage_details(value, &mut state.usage);
+                return None;
+            } else if key == "openai.response_metadata" {
                 let id = value
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -3006,6 +3072,13 @@ fn build_stream_mapper_config(
                 if let Some(r) = value.get("incomplete_reason").and_then(|v| v.as_str()) {
                     state.extra.finish_hint = Some(r.to_string());
                 }
+            } else if key == "openai.failed" {
+                state.extra.saw_response_failed = true;
+                if state.extra.response_id.is_none() {
+                    if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+                        state.extra.response_id = Some(id.to_string());
+                    }
+                }
             } else if key == "openai.response" {
                 if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
                     state.extra.response_id = Some(id.to_string());
@@ -3019,10 +3092,15 @@ fn build_stream_mapper_config(
     ));
 
     hooks.finish = Some(Box::new(|state: &EventMapperState<OpenAIStreamExtras>| {
-        let reason = map_finish_reason(
-            state.extra.finish_hint.as_deref(),
-            state.extra.has_function_calls,
-        );
+        let reason = if state.extra.saw_response_failed {
+            // TS mapper keeps default "other" for response.failed terminal trajectories.
+            v2t::FinishReason::Other
+        } else {
+            map_finish_reason(
+                state.extra.finish_hint.as_deref(),
+                state.extra.has_function_calls,
+            )
+        };
         let mut inner = HashMap::new();
         if let Some(rid) = &state.extra.response_id {
             inner.insert("responseId".into(), serde_json::json!(rid));
