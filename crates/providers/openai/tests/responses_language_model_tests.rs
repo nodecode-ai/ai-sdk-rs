@@ -109,6 +109,11 @@ fn provider_tool_outputs_fixture() -> Value {
     .expect("provider tool outputs fixture")
 }
 
+fn openai_error_fixture() -> Value {
+    serde_json::from_str(include_str!("fixtures/openai-error.1.json"))
+        .expect("openai error fixture")
+}
+
 #[tokio::test]
 async fn request_body_includes_responses_provider_options() {
     let prompt = vec![
@@ -389,6 +394,47 @@ async fn provider_tool_args_validation_errors() {
             assert!(message.contains("vectorStoreIds"));
         }
         other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn non_stream_response_error_returns_error() {
+    let prompt = vec![v2t::PromptMessage::User {
+        content: vec![v2t::UserPart::Text {
+            text: "Hello".into(),
+            provider_options: None,
+        }],
+        provider_options: None,
+    }];
+    let opts = v2t::CallOptions {
+        prompt,
+        ..Default::default()
+    };
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new().with_json_response(openai_error_fixture());
+    let model =
+        OpenAIResponsesLanguageModel::new("gpt-4o", cfg, transport, TransportConfig::default());
+
+    let err = model
+        .do_generate(opts)
+        .await
+        .expect_err("response.error should propagate as SdkError");
+    match err {
+        SdkError::Upstream { message, .. } => {
+            assert!(message.contains("You exceeded your current quota"));
+        }
+        other => panic!("unexpected error type: {other:?}"),
     }
 }
 
