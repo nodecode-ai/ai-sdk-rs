@@ -4005,6 +4005,17 @@ fn map_tool_choice(
     }
 }
 
+fn function_tool_strict(tool: &v2t::FunctionTool) -> Option<bool> {
+    tool.strict.or_else(|| {
+        tool.provider_options.as_ref().and_then(|opts| {
+            opts.get("openai")
+                .or_else(|| opts.get("openai.responses"))
+                .and_then(|scope| scope.get("strict"))
+                .and_then(|value| value.as_bool())
+        })
+    })
+}
+
 fn build_request_body(
     options: &v2t::CallOptions,
     model_id: &str,
@@ -4219,12 +4230,16 @@ fn build_request_body(
             match tool {
                 v2t::Tool::Function(t) => {
                     let params = normalize_object_schema(&t.input_schema);
-                    tools.push(json!({
+                    let mut function_tool = json!({
                         "type": "function",
                         "name": t.name,
                         "description": t.description,
                         "parameters": params
-                    }));
+                    });
+                    if let Some(strict) = function_tool_strict(t) {
+                        function_tool["strict"] = json!(strict);
+                    }
+                    tools.push(function_tool);
                 }
                 v2t::Tool::Provider(t) => {
                     if let Some(val) = build_openai_provider_tool(t)? {

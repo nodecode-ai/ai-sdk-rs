@@ -206,6 +206,7 @@ fn build_command(
                         name: "json".into(),
                         description: Some("Respond with a JSON object.".into()),
                         input_schema: schema.clone(),
+                        strict: None,
                         provider_options: None,
                         r#type: v2t::FunctionToolType::Function,
                     });

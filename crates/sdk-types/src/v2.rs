@@ -339,6 +339,8 @@ pub struct FunctionTool {
     pub description: Option<String>,
     #[serde(default, rename = "inputSchema")]
     pub input_schema: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

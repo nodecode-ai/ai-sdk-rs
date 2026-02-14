@@ -99,6 +99,7 @@ impl<T: HttpTransport> AnthropicMessagesLanguageModel<T> {
                         name: "json".into(),
                         description: Some("Respond with a JSON object.".into()),
                         input_schema: s.clone(),
+                        strict: None,
                         provider_options: None,
                     });
                 }

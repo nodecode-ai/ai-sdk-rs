@@ -136,6 +136,7 @@ fn function_tool_for_strict_passthrough(strict: Option<bool>) -> v2t::FunctionTo
             "required":["value"],
             "additionalProperties": false
         }),
+        strict,
         provider_options,
     }
 }
@@ -277,6 +278,7 @@ async fn request_body_includes_provider_tools_and_tool_choice() {
             "required":["value"],
             "additionalProperties": false
         }),
+        strict: None,
         provider_options: None,
     };
     let opts = v2t::CallOptions {

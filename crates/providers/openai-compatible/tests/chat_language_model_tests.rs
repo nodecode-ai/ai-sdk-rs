@@ -261,6 +261,7 @@ async fn includes_tools_and_tool_choice_in_request_body() {
             "required":["value"],
             "additionalProperties": false
         }),
+        strict: None,
         provider_options: None,
     };
 
