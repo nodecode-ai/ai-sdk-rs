@@ -143,6 +143,9 @@ fn match_openai_compatible_chat(def: &ProviderDefinition) -> bool {
 fn match_openai_compatible(def: &ProviderDefinition) -> bool {
     matches!(def.sdk_type, SdkType::OpenAICompatible)
 }
+fn match_groq(def: &ProviderDefinition) -> bool {
+    matches!(def.sdk_type, SdkType::Groq)
+}
 fn match_openai_compatible_completion(def: &ProviderDefinition) -> bool {
     matches!(def.sdk_type, SdkType::OpenAICompatibleCompletion)
 }
@@ -293,6 +296,39 @@ inventory::submit! {
         reasoning_scope: None,
     }
 }
+
+inventory::submit! {
+    ProviderRegistration {
+        id: "groq",
+        sdk_type: SdkType::Groq,
+        matches: Some(match_groq),
+        build: build_openai_compatible_chat,
+        reasoning_scope: None,
+    }
+}
+
+macro_rules! register_openai_compatible_alias {
+    ($id:literal) => {
+        inventory::submit! {
+            ProviderRegistration {
+                id: $id,
+                sdk_type: SdkType::OpenAICompatible,
+                matches: Some(match_openai_compatible),
+                build: build_openai_compatible_chat,
+                reasoning_scope: None,
+            }
+        }
+    };
+}
+
+register_openai_compatible_alias!("xai");
+register_openai_compatible_alias!("deepseek");
+register_openai_compatible_alias!("mistral");
+register_openai_compatible_alias!("togetherai");
+register_openai_compatible_alias!("fireworks-ai");
+register_openai_compatible_alias!("deepinfra");
+register_openai_compatible_alias!("openrouter");
+register_openai_compatible_alias!("perplexity");
 
 inventory::submit! {
     ProviderRegistration {
