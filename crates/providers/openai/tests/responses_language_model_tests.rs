@@ -114,6 +114,11 @@ fn openai_error_fixture() -> Value {
         .expect("openai error fixture")
 }
 
+fn local_shell_response_fixture() -> Value {
+    serde_json::from_str(include_str!("fixtures/openai-local-shell-tool.1.json"))
+        .expect("local shell response fixture")
+}
+
 #[tokio::test]
 async fn request_body_includes_responses_provider_options() {
     let prompt = vec![
@@ -436,6 +441,43 @@ async fn non_stream_response_error_returns_error() {
         }
         other => panic!("unexpected error type: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn non_stream_usage_maps_nested_details() {
+    let prompt = vec![v2t::PromptMessage::User {
+        content: vec![v2t::UserPart::Text {
+            text: "Hello".into(),
+            provider_options: None,
+        }],
+        provider_options: None,
+    }];
+    let opts = v2t::CallOptions {
+        prompt,
+        ..Default::default()
+    };
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new().with_json_response(local_shell_response_fixture());
+    let model =
+        OpenAIResponsesLanguageModel::new("gpt-5-codex", cfg, transport, TransportConfig::default());
+
+    let result = model.do_generate(opts).await.expect("generate response");
+    assert_eq!(result.usage.input_tokens, Some(407));
+    assert_eq!(result.usage.cached_input_tokens, Some(0));
+    assert_eq!(result.usage.output_tokens, Some(24));
+    assert_eq!(result.usage.reasoning_tokens, Some(0));
+    assert_eq!(result.usage.total_tokens, Some(431));
 }
 
 #[tokio::test]
