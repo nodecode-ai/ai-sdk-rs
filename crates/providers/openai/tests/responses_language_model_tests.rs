@@ -387,6 +387,46 @@ async fn request_body_function_tool_strict_omitted_when_unspecified() {
 }
 
 #[tokio::test]
+async fn request_body_function_tool_strict_from_provider_options_when_field_unset() {
+    let mut function_tool = function_tool_for_strict_passthrough(None);
+    function_tool.provider_options = Some(v2t::ProviderOptions::from([(
+        "openai".into(),
+        HashMap::from([("strict".into(), json!(true))]),
+    )]));
+    let body = request_body_for_function_tool(function_tool).await;
+    let function_tool = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .expect("function tool payload");
+    assert_eq!(
+        function_tool.get("strict"),
+        Some(&json!(true)),
+        "function tool strict should fall back to provider option when typed strict is unset"
+    );
+}
+
+#[tokio::test]
+async fn request_body_function_tool_strict_prefers_typed_field_over_provider_options() {
+    let mut function_tool = function_tool_for_strict_passthrough(Some(false));
+    function_tool.provider_options = Some(v2t::ProviderOptions::from([(
+        "openai".into(),
+        HashMap::from([("strict".into(), json!(true))]),
+    )]));
+    let body = request_body_for_function_tool(function_tool).await;
+    let function_tool = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .expect("function tool payload");
+    assert_eq!(
+        function_tool.get("strict"),
+        Some(&json!(false)),
+        "typed function tool strict should take precedence over provider option strict"
+    );
+}
+
+#[tokio::test]
 async fn request_body_auto_includes_stream_extras() {
     let prompt = vec![v2t::PromptMessage::User {
         content: vec![v2t::UserPart::Text {
