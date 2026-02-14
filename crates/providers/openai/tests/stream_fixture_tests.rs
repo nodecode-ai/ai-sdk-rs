@@ -33,10 +33,25 @@ impl FixtureTransport {
 }
 
 fn read_fixture_chunks(name: &str) -> Vec<Bytes> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(format!("{name}.chunks.txt"));
+    let fixture_name = format!("{name}.chunks.txt");
+    let candidates = [
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(&fixture_name),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("crates")
+            .join("providers")
+            .join("openai")
+            .join("tests")
+            .join("fixtures")
+            .join(&fixture_name),
+    ];
+    let path = candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .unwrap_or_else(|| candidates[0].clone());
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("missing fixture {path:?}"));
     let mut chunks = Vec::new();
     for line in raw.lines() {
@@ -158,6 +173,16 @@ fn has_error(parts: &[v2t::StreamPart]) -> bool {
 fn assert_ok_stream(parts: &[v2t::StreamPart]) {
     assert!(!has_error(parts));
     assert!(has_finish(parts));
+}
+
+fn finish_usage(parts: &[v2t::StreamPart]) -> &v2t::Usage {
+    parts
+        .iter()
+        .find_map(|part| match part {
+            v2t::StreamPart::Finish { usage, .. } => Some(usage),
+            _ => None,
+        })
+        .expect("finish part")
 }
 
 fn tool_calls<'a>(parts: &'a [v2t::StreamPart], name: &str) -> Vec<&'a v2t::ToolCallPart> {
@@ -362,6 +387,20 @@ async fn stream_local_shell_fixture() {
 }
 
 #[tokio::test]
+async fn stream_usage_maps_nested_details() {
+    let tools = vec![provider_tool("openai.local_shell", "shell", json!({}))];
+    let parts = collect_parts("openai-local-shell-tool.1", "gpt-5-codex", tools, None).await;
+
+    assert_ok_stream(&parts);
+    let usage = finish_usage(&parts);
+    assert_eq!(usage.input_tokens, Some(407));
+    assert_eq!(usage.cached_input_tokens, Some(0));
+    assert_eq!(usage.output_tokens, Some(151));
+    assert_eq!(usage.reasoning_tokens, Some(128));
+    assert_eq!(usage.total_tokens, Some(558));
+}
+
+#[tokio::test]
 async fn stream_shell_fixture() {
     let tools = vec![provider_tool("openai.shell", "shell", json!({}))];
     let parts = collect_parts("openai-shell-tool.1", "gpt-5.1", tools, None).await;
@@ -477,8 +516,53 @@ async fn stream_mcp_approval_turn4_fixture() {
 #[tokio::test]
 async fn stream_error_fixture() {
     let parts = collect_parts("openai-error.1", "gpt-4o-mini", vec![], None).await;
-    assert!(has_error(&parts));
-    assert!(has_finish(&parts));
+    assert!(
+        has_error(&parts),
+        "openai-error fixture must emit an error part before stream termination"
+    );
+    assert!(
+        has_finish(&parts),
+        "openai-error fixture must still emit a finish part after terminal failure"
+    );
+
+    let error_idx = parts
+        .iter()
+        .position(|part| matches!(part, v2t::StreamPart::Error { .. }))
+        .expect("error part index");
+    let (finish_idx, finish_reason, provider_metadata) = parts
+        .iter()
+        .enumerate()
+        .find_map(|(idx, part)| match part {
+            v2t::StreamPart::Finish {
+                finish_reason,
+                provider_metadata,
+                ..
+            } => Some((idx, finish_reason.clone(), provider_metadata.clone())),
+            _ => None,
+        })
+        .expect("finish part details");
+
+    assert!(
+        finish_idx > error_idx,
+        "finish part must be emitted after the error part for openai-error fixture"
+    );
+    assert!(
+        matches!(finish_reason, v2t::FinishReason::Other),
+        "TS baseline treats response.failed as non-finished chunk; finish reason should remain Other"
+    );
+
+    let openai_meta = provider_metadata
+        .as_ref()
+        .and_then(|meta| meta.get("openai"))
+        .expect("finish part should include openai provider metadata");
+    assert!(
+        openai_meta.get("responseId").is_some(),
+        "openai-error fixture finish metadata should include responseId"
+    );
+    assert!(
+        openai_meta.get("serviceTier").is_none(),
+        "TS baseline does not include serviceTier when terminal chunk is response.failed"
+    );
 }
 
 #[tokio::test]
