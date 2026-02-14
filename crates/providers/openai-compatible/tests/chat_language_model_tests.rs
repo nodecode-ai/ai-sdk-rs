@@ -1,7 +1,7 @@
 use crate::ai_sdk_core::error::TransportError;
 use crate::ai_sdk_core::json::without_null_fields;
 use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
-use crate::ai_sdk_core::LanguageModel;
+use crate::ai_sdk_core::{LanguageModel, SdkError};
 use crate::ai_sdk_providers_openai_compatible::chat::language_model::{
     OpenAICompatibleChatConfig, OpenAICompatibleChatLanguageModel,
 };
@@ -15,12 +15,25 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+const NEW_PROVIDER_SCOPES: &[&str] = &[
+    "groq",
+    "xai",
+    "deepseek",
+    "mistral",
+    "togetherai",
+    "fireworks-ai",
+    "deepinfra",
+    "openrouter",
+    "perplexity",
+];
+
 #[derive(Clone)]
 struct TestTransport {
     chunks: Arc<Vec<Bytes>>,
     response_headers: Arc<Mutex<Vec<(String, String)>>>,
     last_body: Arc<Mutex<Option<serde_json::Value>>>,
     last_headers: Arc<Mutex<Option<Vec<(String, String)>>>>,
+    stream_error: Arc<Mutex<Option<TransportError>>>,
 }
 
 impl TestTransport {
@@ -30,11 +43,17 @@ impl TestTransport {
             response_headers: Arc::new(Mutex::new(vec![])),
             last_body: Arc::new(Mutex::new(None)),
             last_headers: Arc::new(Mutex::new(None)),
+            stream_error: Arc::new(Mutex::new(None)),
         }
     }
 
     fn with_response_headers(self, headers: Vec<(String, String)>) -> Self {
         *self.response_headers.lock().unwrap() = headers;
+        self
+    }
+
+    fn with_stream_error(self, error: TransportError) -> Self {
+        *self.stream_error.lock().unwrap() = Some(error);
         self
     }
 
@@ -69,6 +88,9 @@ impl HttpTransport for TestTransport {
         body: &serde_json::Value,
         cfg: &TransportConfig,
     ) -> Result<Self::StreamResponse, TransportError> {
+        if let Some(err) = self.stream_error.lock().unwrap().take() {
+            return Err(err);
+        }
         let cleaned = if cfg.strip_null_fields {
             without_null_fields(body)
         } else {
@@ -104,9 +126,20 @@ fn build_model(
     OpenAICompatibleChatLanguageModel<TestTransport>,
     TestTransport,
 ) {
+    build_model_for_scope(chunks, supports_structured_outputs, "test-provider")
+}
+
+fn build_model_for_scope(
+    chunks: Vec<Bytes>,
+    supports_structured_outputs: bool,
+    provider_scope_name: &str,
+) -> (
+    OpenAICompatibleChatLanguageModel<TestTransport>,
+    TestTransport,
+) {
     let transport = TestTransport::new(chunks);
     let cfg = OpenAICompatibleChatConfig {
-        provider_scope_name: "test-provider".into(),
+        provider_scope_name: provider_scope_name.into(),
         base_url: "https://my.api.com/v1".into(),
         headers: vec![("authorization".into(), "Bearer test-api-key".into())],
         http: transport.clone(),
@@ -354,4 +387,106 @@ async fn merges_openai_compatible_and_provider_specific_options() {
     assert!(!body.as_object().unwrap().contains_key("baseOnly"));
     assert!(!body.as_object().unwrap().contains_key("textVerbosity"));
     assert!(!body.as_object().unwrap().contains_key("ignored"));
+}
+
+#[tokio::test]
+async fn newly_routed_scopes_serialize_request_body_with_identical_precedence() {
+    for scope in NEW_PROVIDER_SCOPES {
+        let (model, transport) = build_model_for_scope(vec![], false, scope);
+
+        let mut provider_options = v2t::ProviderOptions::new();
+        provider_options.insert(
+            "openai-compatible".into(),
+            HashMap::from([
+                ("user".into(), json!("base-user")),
+                ("reasoningEffort".into(), json!("low")),
+                ("textVerbosity".into(), json!("low")),
+                ("baseOnly".into(), json!("ignored")),
+            ]),
+        );
+        provider_options.insert(
+            (*scope).into(),
+            HashMap::from([
+                ("reasoningEffort".into(), json!("high")),
+                ("textVerbosity".into(), json!("high")),
+                ("providerTag".into(), json!(scope)),
+            ]),
+        );
+
+        let _ = model
+            .do_stream(v2t::CallOptions {
+                prompt: vec![v2t::PromptMessage::User {
+                    content: vec![v2t::UserPart::Text {
+                        text: "Hello".into(),
+                        provider_options: None,
+                    }],
+                    provider_options: None,
+                }],
+                provider_options,
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|_| panic!("expected stream request serialization for {scope}"));
+
+        let body = transport.last_body().expect("sent body");
+        assert_eq!(body.get("model"), Some(&json!("grok-beta")));
+        assert_eq!(body.get("user"), Some(&json!("base-user")));
+        assert_eq!(body.get("reasoning_effort"), Some(&json!("high")));
+        assert_eq!(body.get("verbosity"), Some(&json!("high")));
+        assert_eq!(body.get("providerTag"), Some(&json!(scope)));
+        assert!(!body.as_object().unwrap().contains_key("baseOnly"));
+    }
+}
+
+#[tokio::test]
+async fn newly_routed_scopes_map_transport_errors_identically() {
+    for scope in NEW_PROVIDER_SCOPES {
+        let transport = TestTransport::new(vec![]).with_stream_error(TransportError::HttpStatus {
+            status: 400,
+            body: format!(r#"{{"error":{{"message":"{scope} bad request"}}}}"#),
+            retry_after_ms: None,
+            sanitized: "http status 400".into(),
+            headers: Vec::new(),
+        });
+        let cfg = OpenAICompatibleChatConfig {
+            provider_scope_name: (*scope).into(),
+            base_url: "https://my.api.com/v1".into(),
+            headers: vec![("authorization".into(), "Bearer test-api-key".into())],
+            http: transport,
+            transport_cfg: TransportConfig::default(),
+            include_usage: true,
+            supported_urls: HashMap::new(),
+            query_params: vec![],
+            supports_structured_outputs: false,
+            default_options: None,
+        };
+        let model = OpenAICompatibleChatLanguageModel::new("grok-beta", cfg);
+        let result = model
+            .do_stream(v2t::CallOptions {
+                prompt: vec![v2t::PromptMessage::User {
+                    content: vec![v2t::UserPart::Text {
+                        text: "Hello".into(),
+                        provider_options: None,
+                    }],
+                    provider_options: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected upstream error for {scope}"),
+            Err(err) => err,
+        };
+
+        match err {
+            SdkError::Upstream {
+                status, message, ..
+            } => {
+                assert_eq!(status, 400);
+                assert_eq!(message, format!("{scope} bad request"));
+            }
+            other => panic!("expected upstream error for {scope}, got {other:?}"),
+        }
+    }
 }

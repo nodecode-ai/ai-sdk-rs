@@ -6,6 +6,18 @@ use futures_util::stream;
 use futures_util::TryStreamExt;
 use serde_json::json;
 
+const NEW_PROVIDER_SCOPES: &[&str] = &[
+    "groq",
+    "xai",
+    "deepseek",
+    "mistral",
+    "togetherai",
+    "fireworks-ai",
+    "deepinfra",
+    "openrouter",
+    "perplexity",
+];
+
 fn chunk(data: impl Into<String>) -> Result<Bytes, SdkError> {
     Ok(Bytes::from(data.into()))
 }
@@ -436,4 +448,64 @@ async fn streams_usage_with_cache_reasoning_and_prediction_tokens() {
         .expect("openai-compatible metadata");
     assert_eq!(openai_meta.get("acceptedPredictionTokens"), Some(&json!(3)));
     assert_eq!(openai_meta.get("rejectedPredictionTokens"), Some(&json!(1)));
+}
+
+#[tokio::test]
+async fn newly_routed_scopes_preserve_stream_usage_and_provider_metadata_shape() {
+    for scope in NEW_PROVIDER_SCOPES {
+        let parts: Vec<v2t::StreamPart> = build_stream(
+            stream::iter(vec![
+                json_chunk(json!({
+                    "id":"chat-1",
+                    "model":"grok-beta",
+                    "created":789,
+                    "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+                    "usage":{
+                        "prompt_tokens":10,
+                        "completion_tokens":5,
+                        "total_tokens":15,
+                        "prompt_tokens_details":{"cached_tokens":4},
+                        "completion_tokens_details":{
+                            "reasoning_tokens":2,
+                            "accepted_prediction_tokens":3,
+                            "rejected_prediction_tokens":1
+                        }
+                    }
+                })),
+                chunk("data: [DONE]\n\n"),
+            ]),
+            StreamSettings {
+                warnings: vec![],
+                include_raw: false,
+                include_usage: true,
+                provider_scope_name: (*scope).into(),
+            },
+            StreamMode::Chat,
+        )
+        .try_collect()
+        .await
+        .unwrap_or_else(|_| panic!("expected normalized stream parts for {scope}"));
+
+        let finish = parts.iter().find_map(|part| match part {
+            v2t::StreamPart::Finish {
+                usage,
+                provider_metadata,
+                ..
+            } => Some((usage.clone(), provider_metadata.clone())),
+            _ => None,
+        });
+        let (usage, provider_metadata) = finish.expect("finish part");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        assert_eq!(usage.total_tokens, Some(15));
+        assert_eq!(usage.cached_input_tokens, Some(4));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+
+        let provider_metadata = provider_metadata.expect("provider metadata");
+        let scoped_meta = provider_metadata
+            .get(*scope)
+            .unwrap_or_else(|| panic!("expected metadata scope {scope}"));
+        assert_eq!(scoped_meta.get("acceptedPredictionTokens"), Some(&json!(3)));
+        assert_eq!(scoped_meta.get("rejectedPredictionTokens"), Some(&json!(1)));
+    }
 }
