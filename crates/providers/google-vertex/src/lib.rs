@@ -6,3 +6,9 @@ pub(crate) mod options;
 pub mod prepare_tools;
 pub(crate) mod prompt;
 pub mod provider;
+/// Internal boundary seam for Google Vertex reuse of Google shared implementation.
+///
+/// Keep cross-provider reuse centralized here so coupling stays explicit and
+/// callers in this module tree avoid direct path-indirection to
+/// `provider_google::shared::*`.
+mod shared;

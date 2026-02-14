@@ -6,7 +6,6 @@ use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
 use crate::ai_sdk_core::{GenerateResponse, LanguageModel, SdkError, StreamResponse};
 use crate::ai_sdk_types::v2 as v2t;
 
-use crate::provider_google::shared::stream_core::build_google_stream_part_stream;
 use crate::provider_google_vertex::error::map_transport_error_to_sdk_error;
 use crate::provider_google_vertex::options::{
     parse_google_vertex_provider_options, GoogleVertexProviderOptions,
@@ -15,6 +14,7 @@ use crate::provider_google_vertex::prepare_tools::{
     convert_json_schema_to_openapi_schema, prepare_tools,
 };
 use crate::provider_google_vertex::prompt::{convert_to_google_prompt, GooglePrompt};
+use crate::provider_google_vertex::shared::build_google_stream_part_stream;
 
 const TRACE_PREFIX: &str = "[GOOGLE-VERTEX]";
 
