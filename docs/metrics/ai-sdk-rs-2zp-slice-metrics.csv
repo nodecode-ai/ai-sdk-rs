@@ -1,0 +1,6 @@
+issue,commit,rust_files_changed,rust_added,rust_deleted,net_rust_delta,vertex_direct_google_shared_refs_before,vertex_direct_google_shared_refs_after
+ai-sdk-rs-4kn,69d56f7,0,0,0,0,0,0
+ai-sdk-rs-mpj,b44c5b1,0,0,0,0,0,0
+ai-sdk-rs-gsu,d5f6285,1,56,5,51,0,0
+ai-sdk-rs-1ku,148be79,1,261,0,261,7,7
+ai-sdk-rs-2v2,0dca926,7,32,16,16,7,0
