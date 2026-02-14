@@ -65,6 +65,16 @@ fn read_fixture_chunks(name: &str) -> Vec<Bytes> {
     chunks
 }
 
+fn openai_error_fixture_message() -> String {
+    serde_json::from_str::<Value>(include_str!("fixtures/openai-error.1.json"))
+        .expect("openai error fixture json")
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .expect("openai error fixture message")
+        .to_owned()
+}
+
 #[async_trait]
 impl HttpTransport for FixtureTransport {
     type StreamResponse = FixtureStreamResponse;
@@ -516,6 +526,22 @@ async fn stream_mcp_approval_turn4_fixture() {
 #[tokio::test]
 async fn stream_error_fixture() {
     let parts = collect_parts("openai-error.1", "gpt-4o-mini", vec![], None).await;
+    let error_count = parts
+        .iter()
+        .filter(|part| matches!(part, v2t::StreamPart::Error { .. }))
+        .count();
+    assert_eq!(
+        error_count, 1,
+        "openai-error fixture should emit exactly one error part"
+    );
+    let finish_count = parts
+        .iter()
+        .filter(|part| matches!(part, v2t::StreamPart::Finish { .. }))
+        .count();
+    assert_eq!(
+        finish_count, 1,
+        "openai-error fixture should emit exactly one finish part"
+    );
     assert!(
         has_error(&parts),
         "openai-error fixture must emit an error part before stream termination"
@@ -551,17 +577,44 @@ async fn stream_error_fixture() {
         "TS baseline treats response.failed as non-finished chunk; finish reason should remain Other"
     );
 
+    let response_metadata_id = parts
+        .iter()
+        .find_map(|part| match part {
+            v2t::StreamPart::ResponseMetadata { meta } => meta.id.as_deref(),
+            _ => None,
+        })
+        .expect("response metadata id");
     let openai_meta = provider_metadata
         .as_ref()
         .and_then(|meta| meta.get("openai"))
         .expect("finish part should include openai provider metadata");
-    assert!(
-        openai_meta.get("responseId").is_some(),
-        "openai-error fixture finish metadata should include responseId"
+    let finish_response_id = openai_meta
+        .get("responseId")
+        .and_then(Value::as_str)
+        .expect("finish metadata responseId");
+    assert_eq!(
+        finish_response_id, response_metadata_id,
+        "finish responseId should match stream response metadata id"
     );
     assert!(
         openai_meta.get("serviceTier").is_none(),
         "TS baseline does not include serviceTier when terminal chunk is response.failed"
+    );
+
+    let error_message = parts
+        .iter()
+        .find_map(|part| match part {
+            v2t::StreamPart::Error { error } => error
+                .get("error")
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str),
+            _ => None,
+        })
+        .expect("stream error message");
+    assert_eq!(
+        error_message,
+        openai_error_fixture_message(),
+        "stream error message should match openai-error fixture payload"
     );
 }
 
