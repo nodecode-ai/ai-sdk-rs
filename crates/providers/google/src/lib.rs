@@ -10,3 +10,7 @@ pub mod gen_ai {
     pub mod options;
     pub mod prompt;
 }
+
+#[cfg(test)]
+#[path = "../tests/parity_regression_tests.rs"]
+mod parity_regression_tests;

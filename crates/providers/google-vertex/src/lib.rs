@@ -2,7 +2,7 @@
 
 mod error;
 mod language_model;
-mod options;
+pub(crate) mod options;
 pub mod prepare_tools;
-mod prompt;
+pub(crate) mod prompt;
 pub mod provider;

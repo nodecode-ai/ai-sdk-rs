@@ -4,10 +4,9 @@ use std::time::Duration;
 
 use crate::ai_sdk_core::options as sdkopt;
 use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
-use crate::ai_sdk_core::transport::TransportConfig;
 use crate::ai_sdk_core::{LanguageModel, SdkError};
 use crate::ai_sdk_provider::{
-    apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials,
+    build_provider_transport_config, registry::ProviderRegistration, Credentials,
     ReasoningScopeContext,
 };
 use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
@@ -137,9 +136,7 @@ fn build_anthropic(
         headers.push((orig, value));
     }
 
-    let mut transport_cfg = TransportConfig::default();
-    transport_cfg.idle_read_timeout = DEFAULT_IDLE_READ_TIMEOUT;
-    apply_stream_idle_timeout_ms(def, &mut transport_cfg);
+    let transport_cfg = build_provider_transport_config(def, Some(DEFAULT_IDLE_READ_TIMEOUT));
 
     let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;

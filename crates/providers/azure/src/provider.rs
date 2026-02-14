@@ -2,18 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::ai_sdk_core::options as sdkopt;
-use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
-use crate::ai_sdk_core::transport::TransportConfig;
 use crate::ai_sdk_core::{LanguageModel, SdkError, TransportError};
 use crate::ai_sdk_provider::{
-    apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials,
+    build_provider_transport_config, filter_provider_bootstrap_headers,
+    registry::ProviderRegistration, Credentials,
 };
 use crate::ai_sdk_providers_openai::config::OpenAIConfig;
 use crate::ai_sdk_providers_openai::responses::language_model::OpenAIResponsesLanguageModel;
 use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
-use crate::ai_sdk_types::v2 as v2t;
-use serde_json::Value as JsonValue;
 use tracing::info;
 
 const TRACE_PREFIX: &str = "[AZURE]";
@@ -65,50 +61,16 @@ fn default_headers_from_auth(
     headers
 }
 
-fn filter_headers(
-    headers: &HashMap<String, String>,
-    provider_scope: &str,
-) -> (
-    Vec<(String, String)>,
-    Option<v2t::ProviderOptions>,
-    Option<JsonValue>,
-    Option<bool>,
-) {
-    let mut filtered = Vec::new();
-    let mut defaults: Option<v2t::ProviderOptions> = None;
-    let mut raw: Option<JsonValue> = None;
-    let mut use_deployments: Option<bool> = None;
-
+fn parse_use_deployments_from_headers(headers: &HashMap<String, String>) -> Option<bool> {
     for (k, v) in headers {
-        if sdkopt::is_internal_sdk_header(k) {
-            if raw.is_none() {
-                if let Ok(json) = serde_json::from_str::<JsonValue>(v) {
-                    if defaults.is_none() {
-                        defaults = provider_defaults_from_json(provider_scope, &json);
-                    }
-                    raw = Some(json);
-                }
-            }
-            continue;
-        }
-
         let key = k.to_ascii_lowercase();
-        if matches!(
-            key.as_str(),
-            "content-type" | "accept" | "authorization" | "api-key" | "x-api-key"
-        ) {
-            continue;
-        }
         if key == "x-azure-use-deployment-urls" || key == "azure-use-deployment-urls" {
-            if use_deployments.is_none() {
-                use_deployments = parse_bool(v);
+            if let Some(parsed) = parse_bool(v) {
+                return Some(parsed);
             }
-            continue;
         }
-        filtered.push((key, v.clone()));
     }
-
-    (filtered, defaults, raw, use_deployments)
+    None
 }
 
 fn resolve_api_key(creds: &Credentials) -> Option<String> {
@@ -209,8 +171,20 @@ fn build_azure(
 ) -> Result<Arc<dyn LanguageModel>, SdkError> {
     let api_key = resolve_api_key(creds);
     let bearer = resolve_bearer_token(creds);
-    let (extra_headers, default_options, request_defaults, use_deployments_from_headers) =
-        filter_headers(&def.headers, &def.name);
+    let bootstrap_headers = filter_provider_bootstrap_headers(
+        &def.headers,
+        &def.name,
+        &[
+            "content-type",
+            "accept",
+            "authorization",
+            "api-key",
+            "x-api-key",
+            "x-azure-use-deployment-urls",
+            "azure-use-deployment-urls",
+        ],
+    );
+    let use_deployments_from_headers = parse_use_deployments_from_headers(&def.headers);
 
     let use_deployment_urls = use_deployments_from_headers
         .or_else(|| {
@@ -245,7 +219,7 @@ fn build_azure(
     query_params.push(("api-version".into(), api_version.clone()));
 
     let mut headers = default_headers_from_auth(api_key, bearer);
-    headers.extend(extra_headers);
+    headers.extend(bootstrap_headers.headers);
 
     let supported_urls = HashMap::from([
         ("image/*".to_string(), vec![r"^https?://.*$".to_string()]),
@@ -255,9 +229,7 @@ fn build_azure(
         ),
     ]);
 
-    let mut transport_cfg = TransportConfig::default();
-    transport_cfg.idle_read_timeout = Duration::from_secs(45);
-    apply_stream_idle_timeout_ms(def, &mut transport_cfg);
+    let transport_cfg = build_provider_transport_config(def, Some(Duration::from_secs(45)));
     let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;
 
@@ -270,8 +242,8 @@ fn build_azure(
         query_params,
         supported_urls,
         file_id_prefixes: Some(vec!["assistant-".into()]),
-        default_options,
-        request_defaults,
+        default_options: bootstrap_headers.default_options,
+        request_defaults: bootstrap_headers.request_defaults,
     };
 
     info!(

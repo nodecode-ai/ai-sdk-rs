@@ -342,7 +342,8 @@ async fn request_body_includes_provider_tools_and_tool_choice() {
 
 #[tokio::test]
 async fn request_body_function_tool_strict_true_passthrough() {
-    let body = request_body_for_function_tool(function_tool_for_strict_passthrough(Some(true))).await;
+    let body =
+        request_body_for_function_tool(function_tool_for_strict_passthrough(Some(true))).await;
     let function_tool = body
         .get("tools")
         .and_then(|v| v.as_array())
@@ -357,7 +358,8 @@ async fn request_body_function_tool_strict_true_passthrough() {
 
 #[tokio::test]
 async fn request_body_function_tool_strict_false_passthrough() {
-    let body = request_body_for_function_tool(function_tool_for_strict_passthrough(Some(false))).await;
+    let body =
+        request_body_for_function_tool(function_tool_for_strict_passthrough(Some(false))).await;
     let function_tool = body
         .get("tools")
         .and_then(|v| v.as_array())
@@ -572,8 +574,12 @@ async fn non_stream_usage_maps_nested_details() {
         request_defaults: None,
     };
     let transport = TestTransport::new().with_json_response(local_shell_response_fixture());
-    let model =
-        OpenAIResponsesLanguageModel::new("gpt-5-codex", cfg, transport, TransportConfig::default());
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5-codex",
+        cfg,
+        transport,
+        TransportConfig::default(),
+    );
 
     let result = model.do_generate(opts).await.expect("generate response");
     assert_eq!(result.usage.input_tokens, Some(407));

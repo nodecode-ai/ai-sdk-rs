@@ -6,7 +6,8 @@ use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
 use crate::ai_sdk_core::transport::TransportConfig;
 use crate::ai_sdk_core::{EmbeddingModel, ImageModel, LanguageModel, SdkError};
 use crate::ai_sdk_provider::{
-    apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials,
+    build_provider_transport_config, collect_query_params, registry::ProviderRegistration,
+    Credentials,
 };
 use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 use crate::ai_sdk_types::v2 as v2t;
@@ -121,15 +122,10 @@ fn build_base_config(
         def.headers.keys().collect::<Vec<_>>()
     );
 
-    let mut cfg = TransportConfig::default();
-    apply_stream_idle_timeout_ms(def, &mut cfg);
+    let cfg = build_provider_transport_config(def, None);
     let http =
         crate::reqwest_transport::ReqwestTransport::try_new(&cfg).map_err(SdkError::Transport)?;
-    let query_params = def
-        .query_params
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let query_params = collect_query_params(def);
 
     Ok(BaseConfig {
         base_url,

@@ -2,19 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::ai_sdk_core::options as sdkopt;
-use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
-use crate::ai_sdk_core::transport::TransportConfig;
 use crate::ai_sdk_core::{LanguageModel, SdkError};
 use crate::ai_sdk_provider::{
-    apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials,
+    build_provider_transport_config, collect_query_params, filter_provider_bootstrap_headers,
+    registry::ProviderRegistration, Credentials,
 };
 use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
-use crate::ai_sdk_types::v2 as v2t;
 use crate::provider_google_vertex::language_model::{
     GoogleVertexConfig, GoogleVertexLanguageModel,
 };
-use serde_json::Value as JsonValue;
 
 const DEFAULT_API_VERSION: &str = "v1beta1";
 
@@ -36,37 +32,6 @@ fn default_headers(bearer: Option<String>, api_key: Option<String>) -> Vec<(Stri
         }
     }
     h
-}
-
-fn filter_headers(
-    headers: &HashMap<String, String>,
-    provider_scope: &str,
-) -> (Vec<(String, String)>, Option<v2t::ProviderOptions>) {
-    let mut filtered: Vec<(String, String)> = Vec::new();
-    let mut defaults: Option<v2t::ProviderOptions> = None;
-    for (k, v) in headers {
-        if sdkopt::is_internal_sdk_header(k) {
-            if defaults.is_none() {
-                if let Ok(json) = serde_json::from_str::<JsonValue>(v) {
-                    if let Some(parsed) = provider_defaults_from_json(provider_scope, &json) {
-                        defaults = Some(parsed);
-                    }
-                }
-            }
-            continue;
-        }
-        let kl = k.to_ascii_lowercase();
-        if kl == "content-type"
-            || kl == "accept"
-            || kl == "authorization"
-            || kl == "x-api-key"
-            || kl == "x-goog-api-key"
-        {
-            continue;
-        }
-        filtered.push((kl, v.clone()));
-    }
-    (filtered, defaults)
 }
 
 fn resolve_base_url(def: &ProviderDefinition) -> Result<String, SdkError> {
@@ -119,17 +84,25 @@ fn build_google_vertex(
 
     let base_url = resolve_base_url(def)?;
     let mut headers = default_headers(bearer, api_key);
-    let (extra_headers, default_options) = filter_headers(&def.headers, &def.name);
-    headers.extend(extra_headers);
+    let bootstrap_headers = filter_provider_bootstrap_headers(
+        &def.headers,
+        &def.name,
+        &[
+            "content-type",
+            "accept",
+            "authorization",
+            "x-api-key",
+            "x-goog-api-key",
+        ],
+    );
+    headers.extend(bootstrap_headers.headers);
 
     let supported_urls = HashMap::from([(
         "*".to_string(),
         vec![String::from(r"^https?://.*$"), String::from(r"^gs://.*$")],
     )]);
 
-    let mut transport_cfg = TransportConfig::default();
-    transport_cfg.idle_read_timeout = Duration::from_secs(45);
-    apply_stream_idle_timeout_ms(def, &mut transport_cfg);
+    let transport_cfg = build_provider_transport_config(def, Some(Duration::from_secs(45)));
 
     let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;
@@ -142,12 +115,8 @@ fn build_google_vertex(
         http,
         transport_cfg,
         supported_urls,
-        query_params: def
-            .query_params
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        default_options,
+        query_params: collect_query_params(def),
+        default_options: bootstrap_headers.default_options,
     };
 
     let lm = GoogleVertexLanguageModel::new(model.to_string(), cfg);

@@ -2,10 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
-use crate::ai_sdk_core::transport::TransportConfig;
 use crate::ai_sdk_core::{LanguageModel, SdkError};
 use crate::ai_sdk_provider::{
-    apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials,
+    build_provider_transport_config, registry::ProviderRegistration, Credentials,
     ReasoningScopeContext,
 };
 use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
@@ -99,9 +98,8 @@ fn build_bedrock(
 
     let headers: Vec<(String, String)> = header_map.into_values().collect();
 
-    let mut transport_cfg = TransportConfig::default();
-    transport_cfg.idle_read_timeout = std::time::Duration::from_secs(45);
-    apply_stream_idle_timeout_ms(def, &mut transport_cfg);
+    let transport_cfg =
+        build_provider_transport_config(def, Some(std::time::Duration::from_secs(45)));
 
     let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;

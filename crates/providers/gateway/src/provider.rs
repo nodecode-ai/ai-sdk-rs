@@ -2,16 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::ai_sdk_core::options as sdkopt;
-use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
-use crate::ai_sdk_core::transport::TransportConfig;
 use crate::ai_sdk_core::{LanguageModel, SdkError};
 use crate::ai_sdk_provider::{
-    apply_stream_idle_timeout_ms, registry::ProviderRegistration, Credentials,
+    build_provider_transport_config, collect_query_params, filter_provider_bootstrap_headers,
+    registry::ProviderRegistration, Credentials,
 };
 use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
-use crate::ai_sdk_types::v2 as v2t;
-use serde_json::Value as JsonValue;
 
 use crate::provider_gateway::config::{GatewayAuth, GatewayAuthMethod, GatewayConfig};
 use crate::provider_gateway::language_model::GatewayLanguageModel;
@@ -82,48 +78,6 @@ fn to_oidc_auth(value: String) -> Option<GatewayAuth> {
     }
 }
 
-fn filter_headers(
-    headers: &HashMap<String, String>,
-    provider_scope: &str,
-) -> (
-    Vec<(String, String)>,
-    Option<v2t::ProviderOptions>,
-    Option<JsonValue>,
-) {
-    let mut filtered: Vec<(String, String)> = Vec::new();
-    let mut defaults: Option<v2t::ProviderOptions> = None;
-    let mut raw: Option<JsonValue> = None;
-
-    for (k, v) in headers {
-        if sdkopt::is_internal_sdk_header(k) {
-            if raw.is_none() {
-                if let Ok(json) = serde_json::from_str::<JsonValue>(v) {
-                    if defaults.is_none() {
-                        defaults = provider_defaults_from_json(provider_scope, &json);
-                    }
-                    raw = Some(json);
-                }
-            }
-            continue;
-        }
-        let key = k.to_ascii_lowercase();
-        if matches!(
-            key.as_str(),
-            "content-type"
-                | "accept"
-                | "authorization"
-                | "x-api-key"
-                | "ai-gateway-auth-method"
-                | "ai-gateway-protocol-version"
-        ) {
-            continue;
-        }
-        filtered.push((key, v.clone()));
-    }
-
-    (filtered, defaults, raw)
-}
-
 fn build_gateway(
     def: &ProviderDefinition,
     model: &str,
@@ -137,15 +91,25 @@ fn build_gateway(
         def.base_url.trim_end_matches('/').to_string()
     };
 
-    let (extra_headers, default_options, request_defaults) =
-        filter_headers(&def.headers, &def.name);
+    let bootstrap_headers = filter_provider_bootstrap_headers(
+        &def.headers,
+        &def.name,
+        &[
+            "content-type",
+            "accept",
+            "authorization",
+            "x-api-key",
+            "ai-gateway-auth-method",
+            "ai-gateway-protocol-version",
+        ],
+    );
 
     let mut headers = Vec::new();
     headers.push((
         "ai-gateway-protocol-version".to_string(),
         AI_GATEWAY_PROTOCOL_VERSION.to_string(),
     ));
-    headers.extend(extra_headers);
+    headers.extend(bootstrap_headers.headers);
 
     let endpoint_path = match normalize_endpoint_path(&def.endpoint_path) {
         Some(path) => Some(path),
@@ -159,9 +123,7 @@ fn build_gateway(
         }
     };
 
-    let mut transport_cfg = TransportConfig::default();
-    transport_cfg.idle_read_timeout = Duration::from_secs(45);
-    apply_stream_idle_timeout_ms(def, &mut transport_cfg);
+    let transport_cfg = build_provider_transport_config(def, Some(Duration::from_secs(45)));
 
     let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;
@@ -174,15 +136,11 @@ fn build_gateway(
         base_url,
         endpoint_path,
         headers,
-        query_params: def
-            .query_params
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        query_params: collect_query_params(def),
         supported_urls,
         transport_cfg: transport_cfg.clone(),
-        default_options,
-        request_defaults,
+        default_options: bootstrap_headers.default_options,
+        request_defaults: bootstrap_headers.request_defaults,
         auth,
     };
 

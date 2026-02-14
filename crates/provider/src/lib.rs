@@ -5,6 +5,8 @@
 //! builders. The factory crate can then either consume registered builders or
 //! fall back to sdk_type-based construction.
 
+use crate::ai_sdk_core::options as sdkopt;
+use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
 use crate::ai_sdk_core::transport::TransportConfig;
 use crate::ai_sdk_core::{LanguageModel, SdkError};
 use crate::ai_sdk_types::{
@@ -16,6 +18,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
+
+/// Result of scanning provider definition headers during bootstrap.
+///
+/// Header keys in `headers` are always normalized to lowercase.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderBootstrapHeaders {
+    pub headers: Vec<(String, String)>,
+    pub default_options: Option<V2ProviderOptions>,
+    pub request_defaults: Option<JsonValue>,
+}
 
 /// Credentials provided by the application layer.
 #[derive(Debug, Clone)]
@@ -105,6 +117,70 @@ pub fn apply_stream_idle_timeout_ms(def: &ProviderDefinition, cfg: &mut Transpor
         if ms > 0 {
             cfg.idle_read_timeout = Duration::from_millis(ms);
         }
+    }
+}
+
+/// Clone query params from provider definition into request config shape.
+pub fn collect_query_params(def: &ProviderDefinition) -> Vec<(String, String)> {
+    def.query_params
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Build a transport config with provider defaults and idle-timeout overrides.
+pub fn build_provider_transport_config(
+    def: &ProviderDefinition,
+    default_idle_timeout: Option<Duration>,
+) -> TransportConfig {
+    let mut cfg = TransportConfig::default();
+    if let Some(timeout) = default_idle_timeout {
+        cfg.idle_read_timeout = timeout;
+    }
+    apply_stream_idle_timeout_ms(def, &mut cfg);
+    cfg
+}
+
+/// Filter provider definition headers for bootstrap.
+///
+/// - Internal SDK headers are consumed as request/default options.
+/// - Returned headers are lowercased and exclude reserved names.
+pub fn filter_provider_bootstrap_headers(
+    headers: &HashMap<String, String>,
+    provider_scope: &str,
+    reserved_headers: &[&str],
+) -> ProviderBootstrapHeaders {
+    let blocked: HashSet<String> = reserved_headers
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+
+    let mut filtered = Vec::new();
+    let mut default_options: Option<V2ProviderOptions> = None;
+    let mut request_defaults: Option<JsonValue> = None;
+
+    for (k, v) in headers {
+        if sdkopt::is_internal_sdk_header(k) {
+            if request_defaults.is_none() {
+                if let Ok(json) = serde_json::from_str::<JsonValue>(v) {
+                    default_options = provider_defaults_from_json(provider_scope, &json);
+                    request_defaults = Some(json);
+                }
+            }
+            continue;
+        }
+
+        let key = k.to_ascii_lowercase();
+        if blocked.contains(&key) {
+            continue;
+        }
+        filtered.push((key, v.clone()));
+    }
+
+    ProviderBootstrapHeaders {
+        headers: filtered,
+        default_options,
+        request_defaults,
     }
 }
 
@@ -273,4 +349,87 @@ pub fn persisted_reasoning_options(
         }
     }
     build_options_from_scope(&aliases, &scope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai_sdk_types::catalog::{ModelInfo, ProviderDefinition, SdkType};
+    use serde_json::json;
+
+    fn test_provider_def() -> ProviderDefinition {
+        ProviderDefinition {
+            name: "test-provider".into(),
+            display_name: "Test Provider".into(),
+            sdk_type: SdkType::OpenAI,
+            base_url: "https://example.test/v1".into(),
+            env: None,
+            npm: None,
+            doc: None,
+            endpoint_path: "/responses".into(),
+            headers: HashMap::new(),
+            query_params: HashMap::new(),
+            stream_idle_timeout_ms: None,
+            auth_type: "api-key".into(),
+            models: HashMap::<String, ModelInfo>::new(),
+            preserve_model_prefix: true,
+        }
+    }
+
+    #[test]
+    fn filter_provider_bootstrap_headers_extracts_defaults_and_drops_reserved() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Custom-Header".into(), "custom".into());
+        headers.insert("Authorization".into(), "Bearer ignored".into());
+        headers.insert(
+            "x-ai-sdk-options".into(),
+            json!({
+                "test-provider": {
+                    "temperature": 0.1
+                }
+            })
+            .to_string(),
+        );
+
+        let result = filter_provider_bootstrap_headers(
+            &headers,
+            "test-provider",
+            &["authorization", "content-type"],
+        );
+
+        assert_eq!(
+            result.headers,
+            vec![("x-custom-header".to_string(), "custom".to_string())]
+        );
+        assert!(result.request_defaults.is_some());
+        assert!(result.default_options.is_some());
+    }
+
+    #[test]
+    fn build_provider_transport_config_applies_default_and_override() {
+        let mut def = test_provider_def();
+        def.stream_idle_timeout_ms = Some(12_345);
+
+        let cfg = build_provider_transport_config(&def, Some(Duration::from_secs(45)));
+
+        assert_eq!(cfg.idle_read_timeout, Duration::from_millis(12_345));
+    }
+
+    #[test]
+    fn collect_query_params_clones_values() {
+        let mut def = test_provider_def();
+        def.query_params.insert("a".into(), "1".into());
+        def.query_params.insert("b".into(), "2".into());
+
+        let mut params = collect_query_params(&def);
+        params.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(
+            params,
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
+            ]
+        );
+    }
 }
