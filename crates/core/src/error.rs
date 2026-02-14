@@ -138,6 +138,54 @@ impl TransportError {
     }
 }
 
+pub fn http_status_fallback_message(status: u16) -> String {
+    format!("http status {status}")
+}
+
+pub fn build_http_status_transport_error(
+    status: u16,
+    body: String,
+    retry_after_ms: Option<u64>,
+    headers: Vec<(String, String)>,
+) -> TransportError {
+    TransportError::HttpStatus {
+        status,
+        body,
+        retry_after_ms,
+        sanitized: http_status_fallback_message(status),
+        headers,
+    }
+}
+
+pub fn map_http_status_to_upstream_error(
+    status: u16,
+    body: String,
+    retry_after_ms: Option<u64>,
+    headers: Vec<(String, String)>,
+    message: Option<String>,
+) -> SdkError {
+    let fallback = http_status_fallback_message(status);
+    let source = build_http_status_transport_error(status, body, retry_after_ms, headers);
+    SdkError::Upstream {
+        status,
+        message: message.unwrap_or(fallback),
+        source: Some(Box::new(source)),
+    }
+}
+
+pub fn map_http_status_to_rate_limited_error(
+    status: u16,
+    body: String,
+    retry_after_ms: Option<u64>,
+    headers: Vec<(String, String)>,
+) -> SdkError {
+    let source = build_http_status_transport_error(status, body, retry_after_ms, headers);
+    SdkError::RateLimited {
+        retry_after_ms,
+        source: Some(Box::new(source)),
+    }
+}
+
 pub fn display_body_for_error(body: &str) -> String {
     let trimmed = body.trim();
     let looks_like_json = trimmed.starts_with('{') || trimmed.starts_with('[');
@@ -148,5 +196,109 @@ pub fn display_body_for_error(body: &str) -> String {
         }
     } else {
         format!("{} bytes", body.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_http_status_transport_error, http_status_fallback_message,
+        map_http_status_to_rate_limited_error, map_http_status_to_upstream_error, SdkError,
+        TransportError,
+    };
+
+    #[test]
+    fn upstream_helper_uses_parsed_message_when_present() {
+        let mapped = map_http_status_to_upstream_error(
+            418,
+            "{\"error\":\"teapot\"}".into(),
+            Some(1500),
+            vec![("x-test".into(), "1".into())],
+            Some("custom message".into()),
+        );
+
+        match mapped {
+            SdkError::Upstream {
+                status,
+                message,
+                source,
+            } => {
+                assert_eq!(status, 418);
+                assert_eq!(message, "custom message");
+                match source {
+                    Some(source) => match source.as_ref() {
+                        TransportError::HttpStatus { sanitized, .. } => {
+                            assert_eq!(sanitized, "http status 418")
+                        }
+                        other => panic!("unexpected source: {other:?}"),
+                    },
+                    None => panic!("expected source transport error"),
+                }
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_helper_uses_http_status_fallback_when_message_missing() {
+        let mapped = map_http_status_to_upstream_error(
+            503,
+            "upstream unavailable".into(),
+            None,
+            Vec::new(),
+            None,
+        );
+
+        match mapped {
+            SdkError::Upstream { message, .. } => {
+                assert_eq!(message, "http status 503");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_limited_helper_preserves_retry_after() {
+        let mapped =
+            map_http_status_to_rate_limited_error(429, "slow down".into(), Some(2500), Vec::new());
+
+        match mapped {
+            SdkError::RateLimited {
+                retry_after_ms,
+                source,
+            } => {
+                assert_eq!(retry_after_ms, Some(2500));
+                match source {
+                    Some(source) => match source.as_ref() {
+                        TransportError::HttpStatus { sanitized, .. } => {
+                            assert_eq!(sanitized, "http status 429")
+                        }
+                        other => panic!("unexpected source: {other:?}"),
+                    },
+                    None => panic!("expected source transport error"),
+                }
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_message_and_builder_are_consistent() {
+        assert_eq!(http_status_fallback_message(404), "http status 404");
+        let built =
+            build_http_status_transport_error(404, "not found".into(), Some(10), Vec::new());
+        match built {
+            TransportError::HttpStatus {
+                status,
+                retry_after_ms,
+                sanitized,
+                ..
+            } => {
+                assert_eq!(status, 404);
+                assert_eq!(retry_after_ms, Some(10));
+                assert_eq!(sanitized, "http status 404");
+            }
+            other => panic!("unexpected transport variant: {other:?}"),
+        }
     }
 }
