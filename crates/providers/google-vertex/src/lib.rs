@@ -12,3 +12,7 @@ pub mod provider;
 /// callers in this module tree avoid direct path-indirection to
 /// `provider_google::shared::*`.
 mod shared;
+
+#[cfg(test)]
+#[path = "../tests/prepare_tools_tests.rs"]
+mod prepare_tools_tests;

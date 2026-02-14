@@ -1,5 +1,4 @@
 use crate::ai_sdk_provider::{registry, Credentials};
-use ai_sdk_providers_openai_compatible as _;
 use crate::ai_sdk_types::catalog::{ModelInfo, ProviderDefinition, SdkType};
 use std::collections::HashMap;
 

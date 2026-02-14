@@ -14,3 +14,7 @@ pub mod gen_ai {
 #[cfg(test)]
 #[path = "../tests/parity_regression_tests.rs"]
 mod parity_regression_tests;
+
+#[cfg(test)]
+#[path = "../tests/prepare_tools_tests.rs"]
+mod prepare_tools_tests;

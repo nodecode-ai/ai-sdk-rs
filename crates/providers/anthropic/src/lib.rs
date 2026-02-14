@@ -17,3 +17,15 @@ pub mod provider;
 
 // Re-exports for convenience
 pub use messages::language_model::AnthropicMessagesLanguageModel;
+
+#[cfg(test)]
+#[path = "../tests/messages_options_tests.rs"]
+mod messages_options_tests;
+
+#[cfg(test)]
+#[path = "../tests/messages_tools_tests.rs"]
+mod messages_tools_tests;
+
+#[cfg(test)]
+#[path = "../tests/provider_headers_tests.rs"]
+mod provider_headers_tests;
