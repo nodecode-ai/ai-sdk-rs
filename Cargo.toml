@@ -52,6 +52,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 tokio-stream = "0.1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 tokio-util = "0.7"
 tracing = "0.1"
 url = "2"

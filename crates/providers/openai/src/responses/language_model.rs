@@ -21,6 +21,7 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use serde_json::{json, Map, Value};
+use url::Url;
 use uuid::Uuid;
 
 use crate::provider_openai::config::OpenAIConfig;
@@ -115,7 +116,10 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
         ),
         SdkError,
     > {
-        let url = self.endpoint_url();
+        let mut url = self.endpoint_url();
+        if should_use_codex_oauth_websocket_transport(&self.config.endpoint_path) {
+            url = to_websocket_url(&url)?;
+        }
 
         // Merge and lowercase headers, skipping internal SDK headers.
         let mut hdrs: BTreeMap<String, String> = BTreeMap::new();
@@ -157,6 +161,35 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             Err(te) => Err(map_transport_error(te)),
         }
     }
+}
+
+fn should_use_codex_oauth_websocket_transport(endpoint_path: &str) -> bool {
+    endpoint_path
+        .trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case("/backend-api/codex/responses")
+}
+
+fn to_websocket_url(url: &str) -> Result<String, SdkError> {
+    let mut parsed = Url::parse(url).map_err(|err| SdkError::InvalidArgument {
+        message: format!("invalid endpoint url '{url}': {err}"),
+    })?;
+    let new_scheme = match parsed.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        "wss" | "ws" => return Ok(parsed.into()),
+        scheme => {
+            return Err(SdkError::InvalidArgument {
+                message: format!("unsupported endpoint scheme '{scheme}' for websocket stream"),
+            });
+        }
+    };
+    parsed
+        .set_scheme(new_scheme)
+        .map_err(|_| SdkError::InvalidArgument {
+            message: format!("failed to convert endpoint scheme to '{new_scheme}'"),
+        })?;
+    Ok(parsed.into())
 }
 
 // Convenience constructor for default reqwest transport

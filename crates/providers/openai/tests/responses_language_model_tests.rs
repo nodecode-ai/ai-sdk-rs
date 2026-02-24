@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 struct TestTransport {
     last_body: Arc<Mutex<Option<Value>>>,
+    last_url: Arc<Mutex<Option<String>>>,
     json_response: Arc<Mutex<Option<Value>>>,
 }
 
@@ -23,12 +24,17 @@ impl TestTransport {
     fn new() -> Self {
         Self {
             last_body: Arc::new(Mutex::new(None)),
+            last_url: Arc::new(Mutex::new(None)),
             json_response: Arc::new(Mutex::new(None)),
         }
     }
 
     fn last_body(&self) -> Option<Value> {
         self.last_body.lock().unwrap().clone()
+    }
+
+    fn last_url(&self) -> Option<String> {
+        self.last_url.lock().unwrap().clone()
     }
 
     fn with_json_response(self, response: Value) -> Self {
@@ -54,12 +60,13 @@ impl HttpTransport for TestTransport {
 
     async fn post_json_stream(
         &self,
-        _url: &str,
+        url: &str,
         _headers: &[(String, String)],
         body: &Value,
         _cfg: &TransportConfig,
     ) -> Result<Self::StreamResponse, TransportError> {
         *self.last_body.lock().unwrap() = Some(body.clone());
+        *self.last_url.lock().unwrap() = Some(url.to_string());
         Ok(TestStreamResponse)
     }
 
@@ -175,6 +182,80 @@ async fn request_body_for_function_tool(function_tool: v2t::FunctionTool) -> Val
 
     let _ = model.do_stream(opts).await.expect("stream response");
     transport.last_body().expect("request body")
+}
+
+#[tokio::test]
+async fn stream_uses_wss_for_codex_oauth_endpoint_path() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let opts = v2t::CallOptions {
+        prompt: vec![v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "hello".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        }],
+        ..Default::default()
+    };
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    let url = transport.last_url().expect("stream url");
+    assert_eq!(url, "wss://chatgpt.com/backend-api/codex/responses");
+}
+
+#[tokio::test]
+async fn stream_keeps_https_for_standard_openai_responses_path() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-4o",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let opts = v2t::CallOptions {
+        prompt: vec![v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "hello".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        }],
+        ..Default::default()
+    };
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    let url = transport.last_url().expect("stream url");
+    assert_eq!(url, "https://api.openai.com/v1/responses");
 }
 
 #[tokio::test]
