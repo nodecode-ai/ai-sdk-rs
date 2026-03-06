@@ -16,7 +16,7 @@ use crate::ai_sdk_types::v2 as v2t;
 use crate::ai_sdk_types::{Event, TokenUsage};
 use base64::Engine;
 use futures_core::Stream;
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
@@ -28,6 +28,35 @@ use crate::provider_openai::config::OpenAIConfig;
 use crate::provider_openai::error::map_transport_error;
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, SdkError>> + Send>>;
+type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, SdkError>> + Send>>;
+type RawByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, TransportError>> + Send>>;
+
+const OPENAI_WS_BETA_HEADER: &str = "OpenAI-Beta";
+const OPENAI_WS_BETA_VALUE: &str = "responses_websockets=2026-02-06";
+const TRANSPORT_HEADER_EFFECTIVE: &str = "x-ai-sdk-effective-transport";
+const TRANSPORT_HEADER_REQUESTED: &str = "x-ai-sdk-requested-transport";
+const TRANSPORT_HEADER_FALLBACK: &str = "x-ai-sdk-transport-fallback";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseTransportMode {
+    Http,
+    Websocket,
+}
+
+impl ResponseTransportMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Websocket => "websocket",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponseTransportSelection {
+    requested: ResponseTransportMode,
+    fallback_http: bool,
+}
 
 pub struct OpenAIResponsesLanguageModel<
     T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
@@ -92,6 +121,9 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
     }
 
     fn canonicalize_header(lc: &str) -> String {
+        if lc.eq_ignore_ascii_case("openai-beta") {
+            return OPENAI_WS_BETA_HEADER.to_string();
+        }
         lc.split('-')
             .map(|part| {
                 let mut chars = part.chars();
@@ -109,18 +141,9 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
     async fn send(
         &self,
         body: serde_json::Value,
-    ) -> Result<
-        (
-            Pin<Box<dyn Stream<Item = Result<bytes::Bytes, SdkError>> + Send>>,
-            Vec<(String, String)>,
-        ),
-        SdkError,
-    > {
-        let mut url = self.endpoint_url();
-        if should_use_codex_oauth_websocket_transport(&self.config.endpoint_path) {
-            url = to_websocket_url(&url)?;
-        }
-
+        transport: ResponseTransportSelection,
+    ) -> Result<(ByteStream, v2t::Headers), SdkError> {
+        let requested = transport.requested;
         // Merge and lowercase headers, skipping internal SDK headers.
         let mut hdrs: BTreeMap<String, String> = BTreeMap::new();
         hdrs.insert("content-type".into(), "application/json".into());
@@ -131,32 +154,97 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             }
             hdrs.insert(k.to_lowercase(), v.clone());
         }
-        let headers: Vec<(String, String)> = hdrs
-            .into_iter()
-            .map(|(k, v)| (Self::canonicalize_header(&k), v))
-            .collect();
-
         if let Some(l) = &self.limiter {
             let _ = l.until_ready().await;
         }
 
-        // network debug prints removed
+        let primary = self.send_once(&hdrs, &body, requested).await;
+        match primary {
+            Ok((stream, res_headers)) => {
+                if requested == ResponseTransportMode::Websocket {
+                    match prefetch_stream(stream).await {
+                        Ok(stream) => Ok((
+                            stream,
+                            response_headers_with_transport(
+                                res_headers,
+                                requested,
+                                requested,
+                                None,
+                            ),
+                        )),
+                        Err(err) if transport.fallback_http => {
+                            let (stream, res_headers) = self
+                                .send_once(&hdrs, &body, ResponseTransportMode::Http)
+                                .await?;
+                            Ok((
+                                map_transport_stream(stream),
+                                response_headers_with_transport(
+                                    res_headers,
+                                    requested,
+                                    ResponseTransportMode::Http,
+                                    Some(requested),
+                                ),
+                            ))
+                        }
+                        Err(err) => Err(err),
+                    }
+                } else {
+                    Ok((
+                        map_transport_stream(stream),
+                        response_headers_with_transport(res_headers, requested, requested, None),
+                    ))
+                }
+            }
+            Err(err)
+                if requested == ResponseTransportMode::Websocket && transport.fallback_http =>
+            {
+                let (stream, res_headers) = self
+                    .send_once(&hdrs, &body, ResponseTransportMode::Http)
+                    .await?;
+                Ok((
+                    map_transport_stream(stream),
+                    response_headers_with_transport(
+                        res_headers,
+                        requested,
+                        ResponseTransportMode::Http,
+                        Some(requested),
+                    ),
+                ))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn send_once(
+        &self,
+        base_headers: &BTreeMap<String, String>,
+        body: &serde_json::Value,
+        transport: ResponseTransportMode,
+    ) -> Result<(RawByteStream, Vec<(String, String)>), SdkError> {
+        let mut url = self.endpoint_url();
+        if transport == ResponseTransportMode::Websocket {
+            url = to_websocket_url(&url)?;
+        }
+
+        let mut hdrs = base_headers.clone();
+        if transport == ResponseTransportMode::Websocket {
+            hdrs.entry("openai-beta".into())
+                .or_insert_with(|| OPENAI_WS_BETA_VALUE.to_string());
+        }
+        let headers: Vec<(String, String)> = hdrs
+            .into_iter()
+            .map(|(k, v)| (Self::canonicalize_header(&k), v))
+            .collect();
+        let request_body = transport_request_body(body, transport);
 
         match self
             .http
-            .post_json_stream(&url, &headers, &body, &self.transport_cfg)
+            .post_json_stream(&url, &headers, &request_body, &self.transport_cfg)
             .await
         {
             Ok(resp) => {
                 let (stream, res_headers) = <T as HttpTransport>::into_stream(resp);
-                let mapped = stream.map(|chunk_res| {
-                    chunk_res.map_err(|te| match te {
-                        TransportError::IdleReadTimeout(_) => SdkError::Timeout,
-                        TransportError::ConnectTimeout(_) => SdkError::Timeout,
-                        other => SdkError::Transport(other),
-                    })
-                });
-                Ok((Box::pin(mapped), res_headers))
+                Ok((stream, res_headers))
             }
             Err(te) => Err(map_transport_error(te)),
         }
@@ -190,6 +278,66 @@ fn to_websocket_url(url: &str) -> Result<String, SdkError> {
             message: format!("failed to convert endpoint scheme to '{new_scheme}'"),
         })?;
     Ok(parsed.into())
+}
+
+fn transport_request_body(body: &Value, transport: ResponseTransportMode) -> Value {
+    if transport == ResponseTransportMode::Websocket {
+        json!({
+            "type": "response.create",
+            "response": body,
+        })
+    } else {
+        body.clone()
+    }
+}
+
+async fn prefetch_stream(stream: RawByteStream) -> Result<ByteStream, SdkError> {
+    let mut stream = stream;
+    let Some(first) = stream.next().await else {
+        return Err(map_transport_stream_error(TransportError::StreamClosed));
+    };
+    let first = first.map_err(map_transport_stream_error)?;
+    let rest = stream.map(|chunk| chunk.map_err(map_transport_stream_error));
+    Ok(Box::pin(stream::once(async move { Ok(first) }).chain(rest)))
+}
+
+fn map_transport_stream(stream: RawByteStream) -> ByteStream {
+    Box::pin(stream.map(|chunk| chunk.map_err(map_transport_stream_error)))
+}
+
+fn map_transport_stream_error(err: TransportError) -> SdkError {
+    match err {
+        TransportError::IdleReadTimeout(_) => SdkError::Timeout,
+        TransportError::ConnectTimeout(_) => SdkError::Timeout,
+        other => SdkError::Transport(other),
+    }
+}
+
+fn response_headers_with_transport(
+    headers: Vec<(String, String)>,
+    requested: ResponseTransportMode,
+    effective: ResponseTransportMode,
+    fallback_from: Option<ResponseTransportMode>,
+) -> v2t::Headers {
+    let mut out = v2t::Headers::new();
+    for (name, value) in headers {
+        out.insert(name.to_ascii_lowercase(), value);
+    }
+    out.insert(
+        TRANSPORT_HEADER_REQUESTED.to_string(),
+        requested.as_str().to_string(),
+    );
+    out.insert(
+        TRANSPORT_HEADER_EFFECTIVE.to_string(),
+        effective.as_str().to_string(),
+    );
+    if let Some(from) = fallback_from {
+        out.insert(
+            TRANSPORT_HEADER_FALLBACK.to_string(),
+            format!("{}->{}", from.as_str(), effective.as_str()),
+        );
+    }
+    out
 }
 
 // Convenience constructor for default reqwest transport
@@ -369,6 +517,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
             &options.provider_options,
             &self.config.provider_scope_name,
         );
+        let transport_selection = resolve_transport_selection(&self.config.endpoint_path, &prov);
         let tool_name_mapping = build_tool_name_mapping(&options.tools);
         let (mut body, warnings) = build_request_body(&options, &self.model_id, &self.config)?;
         body["stream"] = Value::Bool(true);
@@ -379,8 +528,8 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
             &options.prompt,
             &self.config.provider_scope_name,
         );
-        let stream = self
-            .stream_with_body(body, options.include_raw_chunks)
+        let (stream, response_headers) = self
+            .stream_with_body(body, options.include_raw_chunks, transport_selection)
             .await?;
         let parts = map_events_to_parts(
             stream,
@@ -395,7 +544,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
         Ok(StreamResponse {
             stream: parts,
             request_body: None,
-            response_headers: None,
+            response_headers: Some(response_headers),
         })
     }
 }
@@ -3425,6 +3574,8 @@ struct OpenAIProviderOptionsParsed {
     // Logprobs
     logprobs_bool: Option<bool>,
     logprobs_n: Option<u32>,
+    transport_mode: Option<ResponseTransportMode>,
+    transport_fallback_http: bool,
 }
 
 fn parse_openai_provider_options(
@@ -3482,7 +3633,62 @@ fn parse_openai_provider_options(
             parsed.logprobs_n = Some(n as u32);
         }
     }
+    if let Some((mode, fallback_http)) = parse_transport_provider_options(opts, provider_scope) {
+        parsed.transport_mode = Some(mode);
+        parsed.transport_fallback_http = fallback_http;
+    }
     parsed
+}
+
+fn resolve_transport_selection(
+    endpoint_path: &str,
+    provider_options: &OpenAIProviderOptionsParsed,
+) -> ResponseTransportSelection {
+    let requested = provider_options.transport_mode.unwrap_or_else(|| {
+        if should_use_codex_oauth_websocket_transport(endpoint_path) {
+            ResponseTransportMode::Websocket
+        } else {
+            ResponseTransportMode::Http
+        }
+    });
+    ResponseTransportSelection {
+        requested,
+        fallback_http: provider_options.transport_fallback_http,
+    }
+}
+
+fn parse_transport_provider_options(
+    opts: &v2t::ProviderOptions,
+    provider_scope: &str,
+) -> Option<(ResponseTransportMode, bool)> {
+    for scope_name in [provider_scope, "openai", "openai.responses"] {
+        let Some(scope) = opts.get(scope_name) else {
+            continue;
+        };
+        let Some(transport) = scope.get("transport").and_then(|value| value.as_object()) else {
+            continue;
+        };
+        let mode = transport
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .and_then(parse_transport_mode)?;
+        let fallback_http = transport
+            .get("fallback")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("http"));
+        return Some((mode, fallback_http));
+    }
+    None
+}
+
+fn parse_transport_mode(value: &str) -> Option<ResponseTransportMode> {
+    if value.eq_ignore_ascii_case("websocket") {
+        Some(ResponseTransportMode::Websocket)
+    } else if value.eq_ignore_ascii_case("http") {
+        Some(ResponseTransportMode::Http)
+    } else {
+        None
+    }
 }
 
 fn get_provider_option_value<'a>(
@@ -4434,13 +4640,14 @@ fn json_object_keys(value: &Value) -> Vec<String> {
 }
 
 impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
-    pub(crate) async fn stream_with_body(
+    async fn stream_with_body(
         &self,
         body: Value,
         include_raw: bool,
-    ) -> Result<EventStream, SdkError> {
+        transport: ResponseTransportSelection,
+    ) -> Result<(EventStream, v2t::Headers), SdkError> {
         // Build headers for logging
-        let (bytes, _resp_headers) = match self.send(body).await {
+        let (bytes, response_headers) = match self.send(body, transport).await {
             Ok(ok) => ok,
             Err(e) => {
                 return Err(e);
@@ -4451,6 +4658,6 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             .with_provider("openai_official")
             .include_raw(include_raw)
             .build(bytes);
-        Ok(Box::pin(pipeline))
+        Ok((Box::pin(pipeline), response_headers))
     }
 }

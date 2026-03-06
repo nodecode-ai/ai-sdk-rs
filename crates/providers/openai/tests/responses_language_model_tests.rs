@@ -8,16 +8,26 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::stream;
+use futures_util::stream::BoxStream;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+
+enum StreamBehavior {
+    Chunks(Vec<Result<Bytes, TransportError>>),
+    Error(TransportError),
+}
 
 #[derive(Clone)]
 struct TestTransport {
     last_body: Arc<Mutex<Option<Value>>>,
     last_url: Arc<Mutex<Option<String>>>,
+    last_headers: Arc<Mutex<Vec<(String, String)>>>,
+    stream_urls: Arc<Mutex<Vec<String>>>,
     json_response: Arc<Mutex<Option<Value>>>,
+    stream_behaviors: Arc<Mutex<VecDeque<StreamBehavior>>>,
 }
 
 impl TestTransport {
@@ -25,7 +35,10 @@ impl TestTransport {
         Self {
             last_body: Arc::new(Mutex::new(None)),
             last_url: Arc::new(Mutex::new(None)),
+            last_headers: Arc::new(Mutex::new(Vec::new())),
+            stream_urls: Arc::new(Mutex::new(Vec::new())),
             json_response: Arc::new(Mutex::new(None)),
+            stream_behaviors: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -37,37 +50,69 @@ impl TestTransport {
         self.last_url.lock().unwrap().clone()
     }
 
+    fn last_headers(&self) -> Vec<(String, String)> {
+        self.last_headers.lock().unwrap().clone()
+    }
+
+    fn stream_urls(&self) -> Vec<String> {
+        self.stream_urls.lock().unwrap().clone()
+    }
+
     fn with_json_response(self, response: Value) -> Self {
         *self.json_response.lock().unwrap() = Some(response);
         self
     }
+
+    fn with_stream_behavior(self, behavior: StreamBehavior) -> Self {
+        self.stream_behaviors.lock().unwrap().push_back(behavior);
+        self
+    }
 }
 
-struct TestStreamResponse;
+struct TestStreamResponse {
+    stream: BoxStream<'static, Result<Bytes, TransportError>>,
+}
 
 #[async_trait]
 impl HttpTransport for TestTransport {
     type StreamResponse = TestStreamResponse;
 
     fn into_stream(
-        _resp: Self::StreamResponse,
+        resp: Self::StreamResponse,
     ) -> (
         Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
         Vec<(String, String)>,
     ) {
-        (Box::pin(stream::iter(vec![])), vec![])
+        (resp.stream, vec![])
     }
 
     async fn post_json_stream(
         &self,
         url: &str,
-        _headers: &[(String, String)],
+        headers: &[(String, String)],
         body: &Value,
         _cfg: &TransportConfig,
     ) -> Result<Self::StreamResponse, TransportError> {
         *self.last_body.lock().unwrap() = Some(body.clone());
         *self.last_url.lock().unwrap() = Some(url.to_string());
-        Ok(TestStreamResponse)
+        *self.last_headers.lock().unwrap() = headers.to_vec();
+        self.stream_urls.lock().unwrap().push(url.to_string());
+        let behavior = self
+            .stream_behaviors
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+                    b"data: {\"type\":\"response.completed\"}\n\n",
+                ))])
+            });
+        match behavior {
+            StreamBehavior::Chunks(chunks) => Ok(TestStreamResponse {
+                stream: Box::pin(stream::iter(chunks)),
+            }),
+            StreamBehavior::Error(err) => Err(err),
+        }
     }
 
     async fn post_json(
@@ -93,6 +138,19 @@ fn provider_options_fixture() -> Value {
         "fixtures/responses_provider_options_request.json"
     ))
     .expect("provider options fixture")
+}
+
+fn websocket_transport_options() -> v2t::ProviderOptions {
+    v2t::ProviderOptions::from([(
+        "openai".into(),
+        HashMap::from([(
+            "transport".into(),
+            json!({
+                "mode": "websocket",
+                "fallback": "http",
+            }),
+        )]),
+    )])
 }
 
 fn item_reference_fixture() -> Value {
@@ -219,6 +277,122 @@ async fn stream_uses_wss_for_codex_oauth_endpoint_path() {
     let _ = model.do_stream(opts).await.expect("stream response");
     let url = transport.last_url().expect("stream url");
     assert_eq!(url, "wss://chatgpt.com/backend-api/codex/responses");
+}
+
+#[tokio::test]
+async fn stream_uses_websocket_when_provider_transport_requests_it() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://example.invalid/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-4o",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let opts = v2t::CallOptions {
+        prompt: vec![v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "hello".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        }],
+        provider_options: websocket_transport_options(),
+        ..Default::default()
+    };
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    let url = transport.last_url().expect("stream url");
+    assert_eq!(url, "wss://example.invalid/v1/responses");
+    assert_eq!(
+        transport.last_body().expect("request body"),
+        json!({
+            "type": "response.create",
+            "response": {
+                "model": "gpt-4o",
+                "input": [{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
+                "stream": true
+            }
+        })
+    );
+    assert!(transport
+        .last_headers()
+        .iter()
+        .any(|(name, value)| name == "OpenAI-Beta" && value == "responses_websockets=2026-02-06"));
+}
+
+#[tokio::test]
+async fn stream_falls_back_to_http_when_websocket_stream_closes_before_first_event() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://example.invalid/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new()
+        .with_stream_behavior(StreamBehavior::Chunks(vec![]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\"}\n\n",
+        ))]));
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-4o",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let opts = v2t::CallOptions {
+        prompt: vec![v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "hello".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        }],
+        provider_options: websocket_transport_options(),
+        ..Default::default()
+    };
+
+    let response = model.do_stream(opts).await.expect("stream response");
+    assert_eq!(
+        response
+            .response_headers
+            .as_ref()
+            .and_then(|headers| headers.get("x-ai-sdk-effective-transport"))
+            .map(String::as_str),
+        Some("http")
+    );
+    assert_eq!(
+        response
+            .response_headers
+            .as_ref()
+            .and_then(|headers| headers.get("x-ai-sdk-transport-fallback"))
+            .map(String::as_str),
+        Some("websocket->http")
+    );
+    assert_eq!(
+        transport.stream_urls(),
+        vec![
+            "wss://example.invalid/v1/responses".to_string(),
+            "https://example.invalid/v1/responses".to_string()
+        ]
+    );
 }
 
 #[tokio::test]
