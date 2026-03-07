@@ -1,18 +1,20 @@
 use crate::ai_sdk_core::error::{SdkError, TransportError};
-use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
+use crate::ai_sdk_core::transport::{
+    HttpTransport, JsonStreamWebsocketConnection, TransportConfig, TransportStream,
+};
 use crate::ai_sdk_core::LanguageModel;
 use crate::ai_sdk_providers_openai::config::OpenAIConfig;
 use crate::ai_sdk_providers_openai::responses::language_model::OpenAIResponsesLanguageModel;
 use crate::ai_sdk_types::v2 as v2t;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_core::Stream;
 use futures_util::stream;
 use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 enum StreamBehavior {
@@ -26,6 +28,9 @@ struct TestTransport {
     last_url: Arc<Mutex<Option<String>>>,
     last_headers: Arc<Mutex<Vec<(String, String)>>>,
     stream_urls: Arc<Mutex<Vec<String>>>,
+    websocket_connect_urls: Arc<Mutex<Vec<String>>>,
+    websocket_request_bodies: Arc<Mutex<Vec<Value>>>,
+    websocket_response_headers: Arc<Mutex<Vec<(String, String)>>>,
     json_response: Arc<Mutex<Option<Value>>>,
     stream_behaviors: Arc<Mutex<VecDeque<StreamBehavior>>>,
 }
@@ -37,6 +42,9 @@ impl TestTransport {
             last_url: Arc::new(Mutex::new(None)),
             last_headers: Arc::new(Mutex::new(Vec::new())),
             stream_urls: Arc::new(Mutex::new(Vec::new())),
+            websocket_connect_urls: Arc::new(Mutex::new(Vec::new())),
+            websocket_request_bodies: Arc::new(Mutex::new(Vec::new())),
+            websocket_response_headers: Arc::new(Mutex::new(Vec::new())),
             json_response: Arc::new(Mutex::new(None)),
             stream_behaviors: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -58,6 +66,14 @@ impl TestTransport {
         self.stream_urls.lock().unwrap().clone()
     }
 
+    fn websocket_connect_urls(&self) -> Vec<String> {
+        self.websocket_connect_urls.lock().unwrap().clone()
+    }
+
+    fn websocket_request_bodies(&self) -> Vec<Value> {
+        self.websocket_request_bodies.lock().unwrap().clone()
+    }
+
     fn with_json_response(self, response: Value) -> Self {
         *self.json_response.lock().unwrap() = Some(response);
         self
@@ -67,22 +83,73 @@ impl TestTransport {
         self.stream_behaviors.lock().unwrap().push_back(behavior);
         self
     }
+
+    fn with_websocket_response_headers(self, headers: Vec<(String, String)>) -> Self {
+        *self.websocket_response_headers.lock().unwrap() = headers;
+        self
+    }
 }
 
 struct TestStreamResponse {
     stream: BoxStream<'static, Result<Bytes, TransportError>>,
 }
 
+struct TestWebsocketConnection {
+    transport: TestTransport,
+    closed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl JsonStreamWebsocketConnection for TestWebsocketConnection {
+    async fn send_json_stream(
+        &self,
+        body: &Value,
+        _cfg: &TransportConfig,
+    ) -> Result<TransportStream, TransportError> {
+        *self.transport.last_body.lock().unwrap() = Some(body.clone());
+        self.transport
+            .websocket_request_bodies
+            .lock()
+            .unwrap()
+            .push(body.clone());
+        let behavior = self
+            .transport
+            .stream_behaviors
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+                    b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-default\"}}\n\n",
+                ))])
+            });
+        match behavior {
+            StreamBehavior::Chunks(chunks) => Ok(Box::pin(stream::iter(chunks))),
+            StreamBehavior::Error(err) => {
+                self.closed.store(true, Ordering::SeqCst);
+                Err(err)
+            }
+        }
+    }
+
+    fn response_headers(&self) -> Vec<(String, String)> {
+        self.transport
+            .websocket_response_headers
+            .lock()
+            .unwrap()
+            .clone()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
 #[async_trait]
 impl HttpTransport for TestTransport {
     type StreamResponse = TestStreamResponse;
 
-    fn into_stream(
-        resp: Self::StreamResponse,
-    ) -> (
-        Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
-        Vec<(String, String)>,
-    ) {
+    fn into_stream(resp: Self::StreamResponse) -> (TransportStream, Vec<(String, String)>) {
         (resp.stream, vec![])
     }
 
@@ -130,6 +197,24 @@ impl HttpTransport for TestTransport {
             .clone()
             .ok_or_else(|| TransportError::Other("post_json unused".into()))?;
         Ok((response, vec![]))
+    }
+
+    async fn connect_json_stream_websocket(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        _cfg: &TransportConfig,
+    ) -> Result<Box<dyn JsonStreamWebsocketConnection>, TransportError> {
+        *self.last_url.lock().unwrap() = Some(url.to_string());
+        *self.last_headers.lock().unwrap() = headers.to_vec();
+        self.websocket_connect_urls
+            .lock()
+            .unwrap()
+            .push(url.to_string());
+        Ok(Box::new(TestWebsocketConnection {
+            transport: self.clone(),
+            closed: Arc::new(AtomicBool::new(false)),
+        }))
     }
 }
 
@@ -242,6 +327,23 @@ async fn request_body_for_function_tool(function_tool: v2t::FunctionTool) -> Val
     transport.last_body().expect("request body")
 }
 
+async fn drain_stream_response(response: crate::ai_sdk_core::StreamResponse) {
+    let mut stream = response.stream;
+    while let Some(item) = stream.next().await {
+        let _ = item.expect("stream part");
+    }
+}
+
+fn request_shape_without_incremental_fields(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("input");
+        object.remove("previous_response_id");
+        object.remove("generate");
+    }
+    value
+}
+
 #[tokio::test]
 async fn stream_uses_wss_for_codex_oauth_endpoint_path() {
     let cfg = OpenAIConfig {
@@ -277,6 +379,92 @@ async fn stream_uses_wss_for_codex_oauth_endpoint_path() {
     let _ = model.do_stream(opts).await.expect("stream response");
     let url = transport.last_url().expect("stream url");
     assert_eq!(url, "wss://chatgpt.com/backend-api/codex/responses");
+    assert_eq!(
+        transport.last_body().expect("request body"),
+        json!({
+            "type": "response.create",
+            "model": "gpt-5.3-codex",
+            "input": [{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
+            "stream": true
+        })
+    );
+}
+
+#[tokio::test]
+async fn codex_websocket_forwards_call_headers_and_client_metadata() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let opts = v2t::CallOptions {
+        prompt: vec![v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "second".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        }],
+        provider_options: v2t::ProviderOptions::from([(
+            "openai".into(),
+            HashMap::from([
+                ("previousResponseId".into(), json!("resp-1")),
+                (
+                    "clientMetadata".into(),
+                    json!({
+                        "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+                    }),
+                ),
+            ]),
+        )]),
+        headers: HashMap::from([
+            (
+                "x-codex-turn-metadata".to_string(),
+                "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}".to_string(),
+            ),
+            (
+                "x-codex-beta-features".to_string(),
+                "multi_agent".to_string(),
+            ),
+        ]),
+        ..Default::default()
+    };
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    assert_eq!(
+        transport.last_body().expect("request body"),
+        json!({
+            "type": "response.create",
+            "model": "gpt-5.3-codex",
+            "input": [{"role":"user","content":[{"type":"input_text","text":"second"}]}],
+            "previous_response_id": "resp-1",
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+            },
+            "stream": true
+        })
+    );
+    assert!(transport.last_headers().iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("x-codex-turn-metadata")
+            && value == "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+    }));
+    assert!(transport.last_headers().iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("x-codex-beta-features") && value == "multi_agent"
+    }));
 }
 
 #[tokio::test]
@@ -392,6 +580,213 @@ async fn stream_falls_back_to_http_when_websocket_stream_closes_before_first_eve
             "wss://example.invalid/v1/responses".to_string(),
             "https://example.invalid/v1/responses".to_string()
         ]
+    );
+}
+
+#[tokio::test]
+async fn cold_codex_turn_session_prewarms_then_reuses_same_hot_websocket_session() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new()
+        .with_websocket_response_headers(vec![(
+            "x-codex-turn-state".to_string(),
+            "ts-1".to_string(),
+        )])
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"warm-1\"}}\n\n",
+        ))]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        ))]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\"}}\n\n",
+        ))]));
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let mut session = model.new_turn_session();
+    let first = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "hello".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            tools: vec![v2t::Tool::Function(function_tool_for_strict_passthrough(None))],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([(
+                    "clientMetadata".into(),
+                    json!({
+                        "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+                    }),
+                )]),
+            )]),
+            headers: HashMap::from([(
+                "x-codex-turn-metadata".to_string(),
+                "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}".to_string(),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("first stream response");
+    let first_headers = first.response_headers.clone().expect("first headers");
+    drain_stream_response(first).await;
+
+    let second = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "second".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            tools: vec![v2t::Tool::Function(function_tool_for_strict_passthrough(None))],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([(
+                    "clientMetadata".into(),
+                    json!({
+                        "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+                    }),
+                )]),
+            )]),
+            headers: HashMap::from([(
+                "x-codex-turn-metadata".to_string(),
+                "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}".to_string(),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("second stream response");
+    let second_headers = second.response_headers.clone().expect("second headers");
+    drain_stream_response(second).await;
+
+    assert_eq!(
+        transport.websocket_connect_urls(),
+        vec!["wss://chatgpt.com/backend-api/codex/responses".to_string()]
+    );
+    let request_bodies = transport.websocket_request_bodies();
+    assert_eq!(
+        request_bodies.len(),
+        3,
+        "expected warmup, real, and follow-up frames"
+    );
+    let warmup = &request_bodies[0];
+    let first_real = &request_bodies[1];
+    let second_real = &request_bodies[2];
+    assert_eq!(
+        warmup.get("type").and_then(|value| value.as_str()),
+        Some("response.create")
+    );
+    assert_eq!(
+        warmup.get("generate").and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(warmup.get("input"), Some(&json!([])));
+    assert_eq!(
+        request_shape_without_incremental_fields(warmup),
+        request_shape_without_incremental_fields(first_real)
+    );
+    assert_eq!(
+        first_real
+            .get("previous_response_id")
+            .and_then(|value| value.as_str()),
+        Some("warm-1")
+    );
+    assert_eq!(
+        second_real
+            .get("previous_response_id")
+            .and_then(|value| value.as_str()),
+        Some("resp-1")
+    );
+    assert_eq!(second_real.get("generate"), None);
+    assert_eq!(
+        first_headers
+            .get("x-ai-sdk-provider-session-prewarmed")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        first_headers
+            .get("x-ai-sdk-provider-session-request-count")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        first_headers
+            .get("x-ai-sdk-provider-previous-response-id-used")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        first_headers
+            .get("x-ai-sdk-provider-session-warmup-response-id-used")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        first_headers
+            .get("x-ai-sdk-provider-session-reused")
+            .map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        second_headers
+            .get("x-ai-sdk-provider-session-connections")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        second_headers
+            .get("x-ai-sdk-provider-session-prewarmed")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        second_headers
+            .get("x-ai-sdk-provider-session-request-count")
+            .map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        second_headers
+            .get("x-ai-sdk-provider-session-reused")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        second_headers
+            .get("x-ai-sdk-provider-previous-response-id-used")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        second_headers
+            .get("x-ai-sdk-provider-session-warmup-response-id-used")
+            .map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        second_headers.get("x-codex-turn-state").map(String::as_str),
+        Some("ts-1")
     );
 }
 

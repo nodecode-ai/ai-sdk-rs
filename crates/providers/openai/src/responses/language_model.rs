@@ -1,15 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::ai_sdk_core::error::{SdkError, TransportError};
 use crate::ai_sdk_core::options::merge_options_with_disallow;
 use crate::ai_sdk_core::request_builder::defaults::request_overrides_from_json;
-use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
+use crate::ai_sdk_core::transport::{
+    HttpTransport, JsonStreamWebsocketConnection, TransportConfig,
+};
 use crate::ai_sdk_core::{
     map_events_to_parts, EventMapperConfig, EventMapperHooks, EventMapperState, GenerateResponse,
-    LanguageModel, StreamResponse,
+    LanguageModel, LanguageModelTurnSession, StreamResponse,
 };
 use crate::ai_sdk_streaming_sse::{PipelineBuilder, ProviderChunk, SseEvent};
 use crate::ai_sdk_types::v2 as v2t;
@@ -33,9 +35,19 @@ type RawByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, TransportErr
 
 const OPENAI_WS_BETA_HEADER: &str = "OpenAI-Beta";
 const OPENAI_WS_BETA_VALUE: &str = "responses_websockets=2026-02-06";
+const CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const TRANSPORT_HEADER_EFFECTIVE: &str = "x-ai-sdk-effective-transport";
 const TRANSPORT_HEADER_REQUESTED: &str = "x-ai-sdk-requested-transport";
 const TRANSPORT_HEADER_FALLBACK: &str = "x-ai-sdk-transport-fallback";
+const PROVIDER_SESSION_CONNECTIONS_HEADER: &str = "x-ai-sdk-provider-session-connections";
+const PROVIDER_SESSION_PREWARMED_HEADER: &str = "x-ai-sdk-provider-session-prewarmed";
+const PROVIDER_SESSION_REQUEST_COUNT_HEADER: &str = "x-ai-sdk-provider-session-request-count";
+const PROVIDER_SESSION_REUSED_HEADER: &str = "x-ai-sdk-provider-session-reused";
+const PROVIDER_SESSION_RESET_REASON_HEADER: &str = "x-ai-sdk-provider-session-reset-reason";
+const PROVIDER_PREVIOUS_RESPONSE_ID_USED_HEADER: &str =
+    "x-ai-sdk-provider-previous-response-id-used";
+const PROVIDER_WARMUP_RESPONSE_ID_USED_HEADER: &str =
+    "x-ai-sdk-provider-session-warmup-response-id-used";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseTransportMode {
@@ -56,6 +68,36 @@ impl ResponseTransportMode {
 struct ResponseTransportSelection {
     requested: ResponseTransportMode,
     fallback_http: bool,
+}
+
+#[derive(Debug, Default)]
+struct OpenAIResponsesTurnSessionState {
+    turn_state: Option<String>,
+    last_request: Option<Value>,
+    last_response_id: Option<String>,
+    last_response_id_from_warmup: bool,
+    warmup_completed: bool,
+    connection_count: usize,
+    request_count: usize,
+    last_reset_reason: Option<String>,
+    force_http: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OpenAIResponsesTurnSessionTelemetry {
+    connections: usize,
+    prewarmed: bool,
+    request_count: usize,
+    reused: bool,
+    previous_response_id_used: bool,
+    warmup_response_id_used: bool,
+    reset_reason: Option<String>,
+}
+
+struct OpenAIResponsesTurnSession<'a, T: HttpTransport> {
+    model: &'a OpenAIResponsesLanguageModel<T>,
+    websocket: Option<Box<dyn JsonStreamWebsocketConnection>>,
+    state: Arc<Mutex<OpenAIResponsesTurnSessionState>>,
 }
 
 pub struct OpenAIResponsesLanguageModel<
@@ -138,13 +180,7 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             .join("-")
     }
 
-    async fn send(
-        &self,
-        body: serde_json::Value,
-        transport: ResponseTransportSelection,
-    ) -> Result<(ByteStream, v2t::Headers), SdkError> {
-        let requested = transport.requested;
-        // Merge and lowercase headers, skipping internal SDK headers.
+    fn request_headers(&self, extra: &HashMap<String, String>) -> BTreeMap<String, String> {
         let mut hdrs: BTreeMap<String, String> = BTreeMap::new();
         hdrs.insert("content-type".into(), "application/json".into());
         hdrs.insert("accept".into(), "application/json".into());
@@ -154,6 +190,23 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             }
             hdrs.insert(k.to_lowercase(), v.clone());
         }
+        for (k, v) in extra {
+            if crate::ai_sdk_core::options::is_internal_sdk_header(k) {
+                continue;
+            }
+            hdrs.insert(k.to_lowercase(), v.clone());
+        }
+        hdrs
+    }
+
+    async fn send(
+        &self,
+        body: serde_json::Value,
+        transport: ResponseTransportSelection,
+        extra_headers: &HashMap<String, String>,
+    ) -> Result<(ByteStream, v2t::Headers), SdkError> {
+        let requested = transport.requested;
+        let hdrs = self.request_headers(extra_headers);
         if let Some(l) = &self.limiter {
             let _ = l.until_ready().await;
         }
@@ -235,7 +288,7 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             .into_iter()
             .map(|(k, v)| (Self::canonicalize_header(&k), v))
             .collect();
-        let request_body = transport_request_body(body, transport);
+        let request_body = transport_request_body(body, transport, &self.config.endpoint_path);
 
         match self
             .http
@@ -249,6 +302,576 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             Err(te) => Err(map_transport_error(te)),
         }
     }
+}
+
+impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a, T> {
+    fn new(model: &'a OpenAIResponsesLanguageModel<T>) -> Self {
+        Self {
+            model,
+            websocket: None,
+            state: Arc::new(Mutex::new(OpenAIResponsesTurnSessionState::default())),
+        }
+    }
+
+    fn clear_incremental_state(&self, reason: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.turn_state = None;
+        state.last_request = None;
+        state.last_response_id = None;
+        state.last_response_id_from_warmup = false;
+        state.warmup_completed = false;
+        state.request_count = 0;
+        state.last_reset_reason = Some(reason.to_string());
+    }
+
+    fn activate_http_fallback(&mut self, reason: &str) {
+        self.websocket = None;
+        let mut state = self.state.lock().unwrap();
+        state.turn_state = None;
+        state.last_request = None;
+        state.last_response_id = None;
+        state.last_response_id_from_warmup = false;
+        state.warmup_completed = false;
+        state.request_count = 0;
+        state.force_http = true;
+        state.last_reset_reason = Some(reason.to_string());
+    }
+
+    fn websocket_headers(&self, extra_headers: &HashMap<String, String>) -> Vec<(String, String)> {
+        let turn_state = self.state.lock().unwrap().turn_state.clone();
+        let mut merged = extra_headers.clone();
+        if let Some(turn_state) = turn_state {
+            merged
+                .entry(CODEX_TURN_STATE_HEADER.to_string())
+                .or_insert(turn_state);
+        }
+        let mut hdrs = self.model.request_headers(&merged);
+        hdrs.entry("openai-beta".into())
+            .or_insert_with(|| OPENAI_WS_BETA_VALUE.to_string());
+        hdrs.into_iter()
+            .map(|(k, v)| {
+                (
+                    OpenAIResponsesLanguageModel::<T>::canonicalize_header(&k),
+                    v,
+                )
+            })
+            .collect()
+    }
+
+    async fn ensure_websocket_connection(
+        &mut self,
+        headers: &[(String, String)],
+    ) -> Result<bool, SdkError> {
+        let needs_new = self
+            .websocket
+            .as_ref()
+            .map(|connection| connection.is_closed())
+            .unwrap_or(true);
+        if !needs_new {
+            return Ok(true);
+        }
+
+        if self.websocket.is_some() {
+            self.clear_incremental_state("websocket_reconnect");
+            self.websocket = None;
+        }
+
+        let url = to_websocket_url(&self.model.endpoint_url())?;
+        let connection = self
+            .model
+            .http
+            .connect_json_stream_websocket(&url, headers, &self.model.transport_cfg)
+            .await
+            .map_err(map_transport_error)?;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.connection_count = state.connection_count.saturating_add(1);
+        }
+        self.websocket = Some(connection);
+        Ok(false)
+    }
+
+    fn should_prewarm_websocket(&self, body: &Value) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.warmup_completed
+            && state.request_count == 0
+            && state.last_response_id.is_none()
+            && body.get("previous_response_id").is_none()
+    }
+
+    fn warmup_websocket_body(&self, body: &Value) -> (Value, Value) {
+        let mut warmup_body = body.clone();
+        if let Some(object) = warmup_body.as_object_mut() {
+            object.insert("generate".to_string(), Value::Bool(false));
+            object.insert("input".to_string(), Value::Array(Vec::new()));
+            object.remove("previous_response_id");
+        }
+        let transport_body = transport_request_body(
+            &warmup_body,
+            ResponseTransportMode::Websocket,
+            &self.model.config.endpoint_path,
+        );
+        (warmup_body, transport_body)
+    }
+
+    async fn send_websocket_request(
+        &mut self,
+        transport_body: &Value,
+    ) -> Result<(ByteStream, Vec<(String, String)>), SdkError> {
+        let transport_headers = self
+            .websocket
+            .as_ref()
+            .map(|connection| connection.response_headers())
+            .unwrap_or_default();
+        let raw_stream = match self
+            .websocket
+            .as_ref()
+            .ok_or_else(|| SdkError::Transport(TransportError::StreamClosed))?
+            .send_json_stream(transport_body, &self.model.transport_cfg)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                self.clear_incremental_state("websocket_reconnect");
+                self.websocket = None;
+                return Err(map_transport_error(err));
+            }
+        };
+        let stream = match prefetch_stream(raw_stream).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                self.clear_incremental_state("websocket_reconnect");
+                self.websocket = None;
+                return Err(err);
+            }
+        };
+        let mut state = self.state.lock().unwrap();
+        state.request_count = state.request_count.saturating_add(1);
+        Ok((stream, transport_headers))
+    }
+
+    async fn prewarm_websocket_session(&mut self, body: &Value) -> Result<(), SdkError> {
+        let (warmup_body, warmup_transport_body) = self.warmup_websocket_body(body);
+        let (stream, _) = self.send_websocket_request(&warmup_transport_body).await?;
+        let pipeline = PipelineBuilder::<OpenAIResponsesChunk>::new()
+            .with_provider("openai_official")
+            .include_raw(false)
+            .build(stream);
+        let mut parts = map_events_to_parts(
+            Box::pin(pipeline),
+            build_stream_mapper_config(
+                Vec::new(),
+                build_tool_name_mapping(&[]),
+                HashMap::new(),
+                false,
+                false,
+            ),
+        );
+        let mut completed_response_id = None;
+        while let Some(item) = parts.next().await {
+            match item {
+                Ok(v2t::StreamPart::Finish {
+                    provider_metadata, ..
+                }) => {
+                    completed_response_id =
+                        provider_response_id_from_metadata(provider_metadata.as_ref());
+                }
+                Ok(_) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let Some(response_id) = completed_response_id else {
+            return Err(SdkError::Transport(TransportError::Other(
+                "codex websocket warmup completed without a response id".into(),
+            )));
+        };
+        let mut state = self.state.lock().unwrap();
+        state.last_request = Some(warmup_body);
+        state.last_response_id = Some(response_id);
+        state.last_response_id_from_warmup = true;
+        state.warmup_completed = true;
+        Ok(())
+    }
+
+    fn prepared_websocket_body(&self, mut body: Value) -> (Value, Value, bool, bool) {
+        let mut previous_response_id_used = false;
+        let mut warmup_response_id_used = false;
+        let (last_response_id, last_request, last_response_id_from_warmup) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.last_response_id.clone(),
+                state.last_request.clone(),
+                state.last_response_id_from_warmup,
+            )
+        };
+        if let Some(last_response_id) = last_response_id {
+            if request_shape_matches_previous(last_request.as_ref(), &body) {
+                if let Some(object) = body.as_object_mut() {
+                    object.insert(
+                        "previous_response_id".to_string(),
+                        Value::String(last_response_id),
+                    );
+                    previous_response_id_used = true;
+                    warmup_response_id_used = last_response_id_from_warmup;
+                }
+            }
+        }
+        let transport_body = transport_request_body(
+            &body,
+            ResponseTransportMode::Websocket,
+            &self.model.config.endpoint_path,
+        );
+        (
+            body,
+            transport_body,
+            previous_response_id_used,
+            warmup_response_id_used,
+        )
+    }
+
+    fn response_headers(
+        &self,
+        transport_headers: Vec<(String, String)>,
+        requested: ResponseTransportMode,
+        effective: ResponseTransportMode,
+        fallback_from: Option<ResponseTransportMode>,
+        reused: bool,
+        previous_response_id_used: bool,
+        warmup_response_id_used: bool,
+    ) -> v2t::Headers {
+        let mut headers =
+            response_headers_with_transport(transport_headers, requested, effective, fallback_from);
+        let telemetry = {
+            let state = self.state.lock().unwrap();
+            if let Some(turn_state) = state.turn_state.as_ref() {
+                headers
+                    .entry(CODEX_TURN_STATE_HEADER.to_string())
+                    .or_insert_with(|| turn_state.clone());
+            }
+            OpenAIResponsesTurnSessionTelemetry {
+                connections: state.connection_count,
+                prewarmed: state.warmup_completed,
+                request_count: state.request_count,
+                reused,
+                previous_response_id_used,
+                warmup_response_id_used,
+                reset_reason: state.last_reset_reason.clone(),
+            }
+        };
+        headers.insert(
+            PROVIDER_SESSION_CONNECTIONS_HEADER.to_string(),
+            telemetry.connections.to_string(),
+        );
+        headers.insert(
+            PROVIDER_SESSION_PREWARMED_HEADER.to_string(),
+            telemetry.prewarmed.to_string(),
+        );
+        headers.insert(
+            PROVIDER_SESSION_REQUEST_COUNT_HEADER.to_string(),
+            telemetry.request_count.to_string(),
+        );
+        headers.insert(
+            PROVIDER_SESSION_REUSED_HEADER.to_string(),
+            telemetry.reused.to_string(),
+        );
+        headers.insert(
+            PROVIDER_PREVIOUS_RESPONSE_ID_USED_HEADER.to_string(),
+            telemetry.previous_response_id_used.to_string(),
+        );
+        headers.insert(
+            PROVIDER_WARMUP_RESPONSE_ID_USED_HEADER.to_string(),
+            telemetry.warmup_response_id_used.to_string(),
+        );
+        if let Some(reason) = telemetry.reset_reason {
+            headers.insert(PROVIDER_SESSION_RESET_REASON_HEADER.to_string(), reason);
+        }
+        if let Some(turn_state) = headers.get(CODEX_TURN_STATE_HEADER).cloned() {
+            self.state.lock().unwrap().turn_state = Some(turn_state);
+        }
+        headers
+    }
+
+    fn wrap_stream_state(
+        &self,
+        parts: crate::ai_sdk_core::PartStream,
+        request_body: Value,
+        track_incremental_state: bool,
+    ) -> crate::ai_sdk_core::PartStream {
+        let state = Arc::clone(&self.state);
+        Box::pin(async_stream::stream! {
+            let mut stream = parts;
+            let mut completed_response_id = None;
+            let mut completed = false;
+            while let Some(item) = stream.next().await {
+                match &item {
+                    Ok(v2t::StreamPart::Finish { provider_metadata, .. }) => {
+                        completed = true;
+                        completed_response_id = provider_response_id_from_metadata(provider_metadata.as_ref());
+                    }
+                    Err(_) => {
+                        completed = false;
+                        completed_response_id = None;
+                    }
+                    _ => {}
+                }
+                yield item;
+            }
+
+            let mut state = state.lock().unwrap();
+            if track_incremental_state {
+                state.last_request = Some(request_body);
+                state.last_response_id_from_warmup = false;
+                state.last_response_id = if completed {
+                    completed_response_id
+                } else {
+                    None
+                };
+            } else {
+                state.last_request = None;
+                state.last_response_id = None;
+                state.last_response_id_from_warmup = false;
+            }
+            state.last_reset_reason = None;
+        })
+    }
+
+    async fn stream_http_request(
+        &self,
+        body: Value,
+        include_raw: bool,
+        requested: ResponseTransportMode,
+        extra_headers: &HashMap<String, String>,
+        warnings: Vec<v2t::CallWarning>,
+        tool_name_mapping: ToolNameMapping,
+        approval_request_id_map: HashMap<String, String>,
+        store_for_stream: bool,
+        logprobs_enabled: bool,
+    ) -> Result<StreamResponse, SdkError> {
+        if let Some(limiter) = &self.model.limiter {
+            let _ = limiter.until_ready().await;
+        }
+        let base_headers = self.model.request_headers(extra_headers);
+        let request_body = transport_request_body(
+            &body,
+            ResponseTransportMode::Http,
+            &self.model.config.endpoint_path,
+        );
+        let (stream, transport_headers) = self
+            .model
+            .send_once(&base_headers, &body, ResponseTransportMode::Http)
+            .await?;
+        let response_headers = self.response_headers(
+            transport_headers,
+            requested,
+            ResponseTransportMode::Http,
+            Some(ResponseTransportMode::Websocket),
+            false,
+            false,
+            false,
+        );
+        let pipeline = PipelineBuilder::<OpenAIResponsesChunk>::new()
+            .with_provider("openai_official")
+            .include_raw(include_raw)
+            .build(map_transport_stream(stream));
+        let parts = map_events_to_parts(
+            Box::pin(pipeline),
+            build_stream_mapper_config(
+                warnings,
+                tool_name_mapping,
+                approval_request_id_map,
+                store_for_stream,
+                logprobs_enabled,
+            ),
+        );
+        Ok(StreamResponse {
+            stream: self.wrap_stream_state(parts, request_body.clone(), false),
+            request_body: Some(request_body),
+            response_headers: Some(response_headers),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
+    for OpenAIResponsesTurnSession<'_, T>
+{
+    fn provider_name(&self) -> &'static str {
+        "OpenAI"
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model.model_id
+    }
+
+    async fn do_stream(&mut self, options: v2t::CallOptions) -> Result<StreamResponse, SdkError> {
+        let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
+            options,
+            &self.model.config.provider_scope_name,
+            self.model.config.default_options.as_ref(),
+        );
+        let prov = parse_openai_provider_options(
+            &options.provider_options,
+            &self.model.config.provider_scope_name,
+        );
+        let transport_selection =
+            resolve_transport_selection(&self.model.config.endpoint_path, &prov);
+        if transport_selection.requested != ResponseTransportMode::Websocket
+            || !should_use_codex_oauth_websocket_transport(&self.model.config.endpoint_path)
+        {
+            return self.model.do_stream(options).await;
+        }
+
+        let tool_name_mapping = build_tool_name_mapping(&options.tools);
+        let (mut body, warnings) =
+            build_request_body(&options, &self.model.model_id, &self.model.config)?;
+        body["stream"] = Value::Bool(true);
+        let store_for_stream = prov.store.unwrap_or(false);
+        let logprobs_enabled =
+            prov.logprobs_bool.unwrap_or(false) || prov.logprobs_n.unwrap_or(0) > 0;
+        let approval_request_id_map = extract_approval_request_id_to_tool_call_id(
+            &options.prompt,
+            &self.model.config.provider_scope_name,
+        );
+
+        if self.state.lock().unwrap().force_http {
+            return self
+                .stream_http_request(
+                    body,
+                    options.include_raw_chunks,
+                    transport_selection.requested,
+                    &options.headers,
+                    warnings,
+                    tool_name_mapping,
+                    approval_request_id_map,
+                    store_for_stream,
+                    logprobs_enabled,
+                )
+                .await;
+        }
+
+        if let Some(limiter) = &self.model.limiter {
+            let _ = limiter.until_ready().await;
+        }
+
+        let websocket_headers = self.websocket_headers(&options.headers);
+        let reused = match self.ensure_websocket_connection(&websocket_headers).await {
+            Ok(reused) => reused,
+            Err(err) if transport_selection.fallback_http => {
+                self.activate_http_fallback("websocket_http_fallback");
+                return self
+                    .stream_http_request(
+                        body,
+                        options.include_raw_chunks,
+                        transport_selection.requested,
+                        &options.headers,
+                        warnings,
+                        tool_name_mapping,
+                        approval_request_id_map,
+                        store_for_stream,
+                        logprobs_enabled,
+                    )
+                    .await;
+            }
+            Err(err) => return Err(err),
+        };
+        if self.should_prewarm_websocket(&body) {
+            match self.prewarm_websocket_session(&body).await {
+                Ok(()) => {}
+                Err(err) if transport_selection.fallback_http => {
+                    self.activate_http_fallback("websocket_http_fallback");
+                    return self
+                        .stream_http_request(
+                            body,
+                            options.include_raw_chunks,
+                            transport_selection.requested,
+                            &options.headers,
+                            warnings,
+                            tool_name_mapping,
+                            approval_request_id_map,
+                            store_for_stream,
+                            logprobs_enabled,
+                        )
+                        .await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let (session_body, transport_body, previous_response_id_used, warmup_response_id_used) =
+            self.prepared_websocket_body(body.clone());
+        let (stream, transport_headers) = match self.send_websocket_request(&transport_body).await {
+            Ok(stream) => stream,
+            Err(err) if transport_selection.fallback_http => {
+                self.activate_http_fallback("websocket_http_fallback");
+                return self
+                    .stream_http_request(
+                        body,
+                        options.include_raw_chunks,
+                        transport_selection.requested,
+                        &options.headers,
+                        warnings,
+                        tool_name_mapping,
+                        approval_request_id_map,
+                        store_for_stream,
+                        logprobs_enabled,
+                    )
+                    .await;
+            }
+            Err(err) => return Err(err),
+        };
+        let response_headers = self.response_headers(
+            transport_headers,
+            transport_selection.requested,
+            ResponseTransportMode::Websocket,
+            None,
+            reused,
+            previous_response_id_used,
+            warmup_response_id_used,
+        );
+        let pipeline = PipelineBuilder::<OpenAIResponsesChunk>::new()
+            .with_provider("openai_official")
+            .include_raw(options.include_raw_chunks)
+            .build(stream);
+        let parts = map_events_to_parts(
+            Box::pin(pipeline),
+            build_stream_mapper_config(
+                warnings,
+                tool_name_mapping,
+                approval_request_id_map,
+                store_for_stream,
+                logprobs_enabled,
+            ),
+        );
+        Ok(StreamResponse {
+            stream: self.wrap_stream_state(parts, session_body, true),
+            request_body: Some(transport_body),
+            response_headers: Some(response_headers),
+        })
+    }
+}
+
+fn request_shape_matches_previous(previous: Option<&Value>, current: &Value) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    request_shape_without_input(previous) == request_shape_without_input(current)
+}
+
+fn request_shape_without_input(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("input");
+        object.remove("previous_response_id");
+        object.remove("generate");
+    }
+    value
+}
+
+fn provider_response_id_from_metadata(metadata: Option<&v2t::ProviderMetadata>) -> Option<String> {
+    metadata
+        .and_then(|outer| outer.get("openai"))
+        .and_then(|inner| inner.get("responseId"))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
 }
 
 fn should_use_codex_oauth_websocket_transport(endpoint_path: &str) -> bool {
@@ -280,15 +903,28 @@ fn to_websocket_url(url: &str) -> Result<String, SdkError> {
     Ok(parsed.into())
 }
 
-fn transport_request_body(body: &Value, transport: ResponseTransportMode) -> Value {
-    if transport == ResponseTransportMode::Websocket {
-        json!({
-            "type": "response.create",
-            "response": body,
-        })
-    } else {
-        body.clone()
+fn transport_request_body(
+    body: &Value,
+    transport: ResponseTransportMode,
+    endpoint_path: &str,
+) -> Value {
+    if transport != ResponseTransportMode::Websocket {
+        return body.clone();
     }
+
+    if should_use_codex_oauth_websocket_transport(endpoint_path) {
+        let mut frame = serde_json::Map::new();
+        frame.insert("type".into(), Value::String("response.create".into()));
+        if let Some(body_obj) = body.as_object() {
+            frame.extend(body_obj.clone());
+            return Value::Object(frame);
+        }
+    }
+
+    json!({
+        "type": "response.create",
+        "response": body,
+    })
 }
 
 async fn prefetch_stream(stream: RawByteStream) -> Result<ByteStream, SdkError> {
@@ -388,6 +1024,10 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
         &self.model_id
     }
 
+    fn new_turn_session(&self) -> crate::ai_sdk_core::BoxedLanguageModelTurnSession<'_> {
+        Box::new(OpenAIResponsesTurnSession::new(self))
+    }
+
     fn supported_urls(&self) -> HashMap<String, Vec<String>> {
         self.config.supported_urls.clone()
     }
@@ -402,15 +1042,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
         let (body, warnings) = build_request_body(&options, &self.model_id, &self.config)?;
         // Use non-streaming JSON call to Responses API
         let url = self.endpoint_url();
-        let mut hdrs: BTreeMap<String, String> = BTreeMap::new();
-        hdrs.insert("content-type".into(), "application/json".into());
-        hdrs.insert("accept".into(), "application/json".into());
-        for (k, v) in &self.config.headers {
-            if crate::ai_sdk_core::options::is_internal_sdk_header(k) {
-                continue;
-            }
-            hdrs.insert(k.to_lowercase(), v.clone());
-        }
+        let hdrs = self.request_headers(&options.headers);
         let headers: Vec<(String, String)> = hdrs
             .into_iter()
             .map(|(k, v)| (Self::canonicalize_header(&k), v))
@@ -528,8 +1160,18 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
             &options.prompt,
             &self.config.provider_scope_name,
         );
+        let request_body = transport_request_body(
+            &body,
+            transport_selection.requested,
+            &self.config.endpoint_path,
+        );
         let (stream, response_headers) = self
-            .stream_with_body(body, options.include_raw_chunks, transport_selection)
+            .stream_with_body(
+                body,
+                options.include_raw_chunks,
+                transport_selection,
+                &options.headers,
+            )
             .await?;
         let parts = map_events_to_parts(
             stream,
@@ -543,7 +1185,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
         );
         Ok(StreamResponse {
             stream: parts,
-            request_body: None,
+            request_body: Some(request_body),
             response_headers: Some(response_headers),
         })
     }
@@ -3550,6 +4192,7 @@ fn get_responses_model_config(model_id: &str) -> ResponsesModelConfig {
 #[derive(Default, Debug, Clone)]
 struct OpenAIProviderOptionsParsed {
     conversation: Option<String>,
+    client_metadata: Option<serde_json::Value>,
     metadata: Option<serde_json::Value>,
     max_tool_calls: Option<u32>,
     parallel_tool_calls: Option<bool>,
@@ -3598,6 +4241,10 @@ fn parse_openai_provider_options(
     };
 
     parsed.conversation = get_str("conversation");
+    parsed.client_metadata = map
+        .get("clientMetadata")
+        .cloned()
+        .or_else(|| map.get("client_metadata").cloned());
     parsed.metadata = map.get("metadata").cloned();
     parsed.max_tool_calls = map
         .get("maxToolCalls")
@@ -4445,6 +5092,9 @@ fn build_request_body(
     if let Some(s) = prov.previous_response_id {
         body["previous_response_id"] = json!(s);
     }
+    if let Some(client_metadata) = prov.client_metadata {
+        body["client_metadata"] = client_metadata;
+    }
     if let Some(b) = store_value {
         body["store"] = json!(b);
     }
@@ -4645,9 +5295,10 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
         body: Value,
         include_raw: bool,
         transport: ResponseTransportSelection,
+        extra_headers: &HashMap<String, String>,
     ) -> Result<(EventStream, v2t::Headers), SdkError> {
         // Build headers for logging
-        let (bytes, response_headers) = match self.send(body, transport).await {
+        let (bytes, response_headers) = match self.send(body, transport, extra_headers).await {
             Ok(ok) => ok,
             Err(e) => {
                 return Err(e);
