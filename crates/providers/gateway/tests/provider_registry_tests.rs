@@ -28,8 +28,12 @@ fn gateway_registry_maps_to_language_model_builder() {
         preserve_model_prefix: true,
     };
 
-    let model = (reg.build)(&def, "openai/gpt-4.1-mini", &Credentials::ApiKey("test-key".into()))
-        .expect("build model");
+    let model = (reg.build)(
+        &def,
+        "openai/gpt-4.1-mini",
+        &Credentials::ApiKey("test-key".into()),
+    )
+    .expect("build model");
     assert_eq!(model.provider_name(), "gateway");
     assert_eq!(model.model_id(), "openai/gpt-4.1-mini");
 }

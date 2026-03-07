@@ -1,6 +1,8 @@
 use crate::ai_sdk_core::error::TransportError;
 use crate::ai_sdk_core::json::without_null_fields;
-use crate::ai_sdk_core::transport::{HttpTransport, MultipartForm, MultipartValue, TransportConfig};
+use crate::ai_sdk_core::transport::{
+    HttpTransport, MultipartForm, MultipartValue, TransportConfig,
+};
 use crate::ai_sdk_core::ImageModel;
 use crate::ai_sdk_providers_openai_compatible::image::image_model::{
     OpenAICompatibleImageConfig, OpenAICompatibleImageModel,

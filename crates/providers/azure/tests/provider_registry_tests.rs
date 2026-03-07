@@ -28,8 +28,12 @@ fn azure_registry_maps_to_responses_builder() {
         preserve_model_prefix: true,
     };
 
-    let model = (reg.build)(&def, "gpt-4.1-mini", &Credentials::ApiKey("test-key".into()))
-        .expect("build model");
+    let model = (reg.build)(
+        &def,
+        "gpt-4.1-mini",
+        &Credentials::ApiKey("test-key".into()),
+    )
+    .expect("build model");
     assert_eq!(model.provider_name(), "OpenAI");
     assert_eq!(model.model_id(), "gpt-4.1-mini");
 }
