@@ -124,6 +124,21 @@ impl Default for TransportConfig {
     }
 }
 
+pub type TransportStream = Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>;
+
+#[async_trait]
+pub trait JsonStreamWebsocketConnection: Send + Sync {
+    async fn send_json_stream(
+        &self,
+        body: &Value,
+        cfg: &TransportConfig,
+    ) -> Result<TransportStream, TransportError>;
+
+    fn response_headers(&self) -> Vec<(String, String)>;
+
+    fn is_closed(&self) -> bool;
+}
+
 #[async_trait]
 pub trait HttpTransport: Send + Sync {
     /// Response for a successful streaming HTTP request.
@@ -131,12 +146,7 @@ pub trait HttpTransport: Send + Sync {
     type StreamResponse: Send;
 
     /// Extract the underlying byte stream from the transport-specific response wrapper.
-    fn into_stream(
-        resp: Self::StreamResponse,
-    ) -> (
-        Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
-        Vec<(String, String)>,
-    );
+    fn into_stream(resp: Self::StreamResponse) -> (TransportStream, Vec<(String, String)>);
 
     async fn post_json_stream(
         &self,
@@ -177,6 +187,17 @@ pub trait HttpTransport: Send + Sync {
     ) -> Result<(Bytes, Vec<(String, String)>), TransportError> {
         Err(TransportError::Other(
             "byte downloads are not supported by this transport".into(),
+        ))
+    }
+
+    async fn connect_json_stream_websocket(
+        &self,
+        _url: &str,
+        _headers: &[(String, String)],
+        _cfg: &TransportConfig,
+    ) -> Result<Box<dyn JsonStreamWebsocketConnection>, TransportError> {
+        Err(TransportError::Other(
+            "persistent websocket streams are not supported by this transport".into(),
         ))
     }
 }

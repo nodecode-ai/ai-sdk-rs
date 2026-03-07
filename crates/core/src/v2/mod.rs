@@ -28,6 +28,49 @@ pub struct StreamResponse {
     pub response_headers: Option<v2t::Headers>,
 }
 
+#[async_trait::async_trait]
+pub trait LanguageModelTurnSession: Send {
+    fn provider_name(&self) -> &'static str;
+    fn model_id(&self) -> &str;
+
+    async fn do_stream(
+        &mut self,
+        options: v2t::CallOptions,
+    ) -> Result<StreamResponse, crate::core::SdkError>;
+}
+
+pub type BoxedLanguageModelTurnSession<'a> = Box<dyn LanguageModelTurnSession + 'a>;
+
+struct StatelessLanguageModelTurnSession<'a, M: LanguageModel + ?Sized> {
+    model: &'a M,
+}
+
+impl<'a, M: LanguageModel + ?Sized> StatelessLanguageModelTurnSession<'a, M> {
+    fn new(model: &'a M) -> Self {
+        Self { model }
+    }
+}
+
+#[async_trait::async_trait]
+impl<M: LanguageModel + ?Sized> LanguageModelTurnSession
+    for StatelessLanguageModelTurnSession<'_, M>
+{
+    fn provider_name(&self) -> &'static str {
+        self.model.provider_name()
+    }
+
+    fn model_id(&self) -> &str {
+        self.model.model_id()
+    }
+
+    async fn do_stream(
+        &mut self,
+        options: v2t::CallOptions,
+    ) -> Result<StreamResponse, crate::core::SdkError> {
+        self.model.do_stream(options).await
+    }
+}
+
 /// Language model interface (Vercel AI SDK parity).
 #[async_trait::async_trait]
 pub trait LanguageModel: Send + Sync {
@@ -52,6 +95,10 @@ pub trait LanguageModel: Send + Sync {
         &self,
         options: v2t::CallOptions,
     ) -> Result<StreamResponse, crate::core::SdkError>;
+
+    fn new_turn_session(&self) -> BoxedLanguageModelTurnSession<'_> {
+        Box::new(StatelessLanguageModelTurnSession::new(self))
+    }
 }
 
 // No adapters or converters: providers implement the v2 surface directly.

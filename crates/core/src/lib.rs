@@ -19,7 +19,10 @@ pub use crate::core::event_mapper::{
 pub use crate::core::image::{ImageModel, ImageResponse, ImageResponseMeta};
 
 // Re-export v2 (Vercel parity) model trait and typed surfaces at the crate root
-pub use crate::core::v2::{GenerateResponse, LanguageModel, PartStream, StreamResponse};
+pub use crate::core::v2::{
+    BoxedLanguageModelTurnSession, GenerateResponse, LanguageModel, LanguageModelTurnSession,
+    PartStream, StreamResponse,
+};
 // Convenience re-exports of common types
 pub use crate::ai_sdk_types::embedding::{EmbedOptions, EmbedUsage, Embedding};
 pub use crate::ai_sdk_types::image::{

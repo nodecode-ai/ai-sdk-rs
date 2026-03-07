@@ -1,25 +1,47 @@
 use crate::ai_sdk_core::error::{display_body_for_error, TransportError};
 use crate::ai_sdk_core::transport::{
-    emit_transport_event, HttpTransport, MultipartForm, MultipartValue, TransportBody,
-    TransportConfig, TransportEvent,
+    emit_transport_event, HttpTransport, JsonStreamWebsocketConnection, MultipartForm,
+    MultipartValue, TransportBody, TransportConfig, TransportEvent, TransportStream,
 };
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use bytes::Bytes;
-use futures_core::Stream;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde_json::Value;
 use std::error::Error as StdError;
-use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio_tungstenite::connect_async;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
+use tokio_tungstenite::{client_async_tls_with_config, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::debug;
+use url::Url;
 
 pub struct ReqwestTransport {
     client: Client,
+}
+
+type ReqwestWebsocketStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedProxy {
+    host: String,
+    port: u16,
+    authorization: Option<String>,
+}
+
+struct ReqwestJsonStreamWebsocketConnection {
+    socket: Arc<Mutex<ReqwestWebsocketStream>>,
+    response_headers: Vec<(String, String)>,
+    closed: Arc<AtomicBool>,
 }
 
 impl ReqwestTransport {
@@ -83,23 +105,38 @@ impl ReqwestTransport {
         url.starts_with("ws://") || url.starts_with("wss://")
     }
 
-    async fn post_json_stream_websocket(
+    async fn connect_websocket_stream(
+        &self,
+        request: http::Request<()>,
+        cfg: &TransportConfig,
+    ) -> Result<(ReqwestWebsocketStream, http::Response<Option<Vec<u8>>>), TransportError> {
+        let request_url = request.uri().to_string();
+        if let Some(proxy) = resolve_proxy_for_websocket_url(&request_url)? {
+            let tunnel = open_http_proxy_tunnel(request.uri(), &proxy, cfg).await?;
+            return client_async_tls_with_config(request, tunnel, None, None)
+                .await
+                .map_err(|err| {
+                    let (mapped, _, _) = map_websocket_connect_error(err);
+                    mapped
+                });
+        }
+
+        connect_async(request).await.map_err(|err| {
+            let (mapped, _, _) = map_websocket_connect_error(err);
+            mapped
+        })
+    }
+
+    async fn open_json_stream_websocket(
         &self,
         url: &str,
         headers: &[(String, String)],
-        cleaned_body: &Value,
         cfg: &TransportConfig,
-    ) -> Result<
-        (
-            Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
-            Vec<(String, String)>,
-        ),
-        TransportError,
-    > {
+    ) -> Result<ReqwestJsonStreamWebsocketConnection, TransportError> {
         let started_at = SystemTime::now();
         let start_instant = Instant::now();
         let request_headers = headers.to_vec();
-        let request_body = Some(TransportBody::Json(cleaned_body.clone()));
+        let request_body = None;
 
         let mut request = url.into_client_request().map_err(|err| {
             TransportError::Other(format!("invalid websocket url '{url}': {err}"))
@@ -117,9 +154,12 @@ impl ReqwestTransport {
             request.headers_mut().insert(header_name, header_value);
         }
 
-        let connect_result =
-            tokio::time::timeout(cfg.connect_timeout, connect_async(request)).await;
-        let (mut socket, response) = match connect_result {
+        let connect_result = tokio::time::timeout(
+            cfg.connect_timeout,
+            self.connect_websocket_stream(request, cfg),
+        )
+        .await;
+        let (socket, response) = match connect_result {
             Err(_) => {
                 let err = TransportError::ConnectTimeout(cfg.connect_timeout);
                 emit_transport_event(TransportEvent {
@@ -139,22 +179,21 @@ impl ReqwestTransport {
                 return Err(err);
             }
             Ok(Err(err)) => {
-                let (mapped, status, response_headers) = map_websocket_connect_error(err);
                 emit_transport_event(TransportEvent {
                     started_at,
                     latency: Some(start_instant.elapsed()),
                     method: "GET".to_string(),
                     url: url.to_string(),
-                    status,
+                    status: err.status(),
                     request_headers,
-                    response_headers,
+                    response_headers: websocket_connect_error_headers(&err),
                     request_body,
                     response_body: None,
                     response_size: None,
-                    error: Some(mapped.to_string()),
+                    error: Some(err.to_string()),
                     is_stream: true,
                 });
-                return Err(mapped);
+                return Err(err);
             }
             Ok(Ok(ok)) => ok,
         };
@@ -175,48 +214,116 @@ impl ReqwestTransport {
             is_stream: true,
         });
 
-        let payload = serde_json::to_string(cleaned_body).map_err(|err| {
+        Ok(ReqwestJsonStreamWebsocketConnection {
+            socket: Arc::new(Mutex::new(socket)),
+            response_headers,
+            closed: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    async fn post_json_stream_websocket(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        cleaned_body: &Value,
+        cfg: &TransportConfig,
+    ) -> Result<(TransportStream, Vec<(String, String)>), TransportError> {
+        let connection = self.open_json_stream_websocket(url, headers, cfg).await?;
+        let response_headers = connection.response_headers();
+        let stream = connection.send_json_stream(cleaned_body, cfg).await?;
+        Ok((stream, response_headers))
+    }
+}
+
+#[async_trait]
+impl JsonStreamWebsocketConnection for ReqwestJsonStreamWebsocketConnection {
+    async fn send_json_stream(
+        &self,
+        body: &Value,
+        cfg: &TransportConfig,
+    ) -> Result<TransportStream, TransportError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(TransportError::StreamClosed);
+        }
+
+        let payload = serde_json::to_string(body).map_err(|err| {
             TransportError::Other(format!("failed to encode websocket payload: {err}"))
         })?;
-        socket
-            .send(WsMessage::Text(payload))
-            .await
-            .map_err(|err| map_websocket_stream_error(err, cfg.idle_read_timeout))?;
-
         let idle = cfg.idle_read_timeout;
-        let s = async_stream::try_stream! {
+        let socket = Arc::clone(&self.socket);
+        let closed = Arc::clone(&self.closed);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, TransportError>>(32);
+
+        tokio::spawn(async move {
+            let mut socket = socket.lock().await;
+            if closed.load(Ordering::SeqCst) {
+                let _ = tx.send(Err(TransportError::StreamClosed)).await;
+                return;
+            }
+
+            if let Err(err) = socket.send(WsMessage::Text(payload)).await {
+                closed.store(true, Ordering::SeqCst);
+                let _ = tx.send(Err(map_websocket_stream_error(err, idle))).await;
+                return;
+            }
+
             loop {
                 let next = tokio::time::timeout(idle, socket.next()).await;
-                match next {
-                    Err(_) => Err(TransportError::IdleReadTimeout(idle))?,
-                    Ok(None) => break,
-                    Ok(Some(Err(err))) => Err(map_websocket_stream_error(err, idle))?,
-                    Ok(Some(Ok(message))) => {
-                        match message {
-                            WsMessage::Text(text) => {
-                                if let Some(chunk) = websocket_text_to_sse_chunk(&text) {
-                                    yield chunk;
-                                }
+                let outcome = match next {
+                    Err(_) => {
+                        closed.store(true, Ordering::SeqCst);
+                        let _ = tx.send(Err(TransportError::IdleReadTimeout(idle))).await;
+                        break;
+                    }
+                    Ok(None) => {
+                        closed.store(true, Ordering::SeqCst);
+                        let _ = tx.send(Err(TransportError::StreamClosed)).await;
+                        break;
+                    }
+                    Ok(Some(Err(err))) => {
+                        closed.store(true, Ordering::SeqCst);
+                        let _ = tx.send(Err(map_websocket_stream_error(err, idle))).await;
+                        break;
+                    }
+                    Ok(Some(Ok(message))) => websocket_message_to_sse_chunk(message),
+                };
+
+                match outcome {
+                    Ok(WebsocketMessageOutcome { chunk, terminal }) => {
+                        if let Some(chunk) = chunk {
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                closed.store(true, Ordering::SeqCst);
+                                break;
                             }
-                            WsMessage::Binary(binary) => {
-                                if binary.is_empty() {
-                                    continue;
-                                }
-                                let text = String::from_utf8_lossy(&binary);
-                                if let Some(chunk) = websocket_text_to_sse_chunk(&text) {
-                                    yield chunk;
-                                }
-                            }
-                            WsMessage::Ping(_) | WsMessage::Pong(_) => {}
-                            WsMessage::Close(_) => break,
-                            _ => {}
                         }
+                        if terminal {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        if matches!(err, TransportError::StreamClosed) {
+                            closed.store(true, Ordering::SeqCst);
+                        }
+                        let _ = tx.send(Err(err)).await;
+                        break;
                     }
                 }
             }
-        };
+        });
 
-        Ok((Box::pin(s), response_headers))
+        Ok(Box::pin(async_stream::stream! {
+            while let Some(item) = rx.recv().await {
+                yield item;
+            }
+        }))
+    }
+
+    fn response_headers(&self) -> Vec<(String, String)> {
+        self.response_headers.clone()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -228,17 +335,9 @@ impl Default for ReqwestTransport {
 
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
-    type StreamResponse = (
-        Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
-        Vec<(String, String)>,
-    );
+    type StreamResponse = (TransportStream, Vec<(String, String)>);
 
-    fn into_stream(
-        resp: Self::StreamResponse,
-    ) -> (
-        Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
-        Vec<(String, String)>,
-    ) {
+    fn into_stream(resp: Self::StreamResponse) -> (TransportStream, Vec<(String, String)>) {
         resp
     }
 
@@ -397,6 +496,17 @@ impl HttpTransport for ReqwestTransport {
             }
         };
         Ok((Box::pin(s), res_headers))
+    }
+
+    async fn connect_json_stream_websocket(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        cfg: &TransportConfig,
+    ) -> Result<Box<dyn JsonStreamWebsocketConnection>, TransportError> {
+        Ok(Box::new(
+            self.open_json_stream_websocket(url, headers, cfg).await?,
+        ))
     }
 
     async fn post_json(
@@ -836,6 +946,13 @@ fn map_websocket_connect_error(
     }
 }
 
+fn websocket_connect_error_headers(err: &TransportError) -> Vec<(String, String)> {
+    match err {
+        TransportError::HttpStatus { headers, .. } => headers.clone(),
+        _ => Vec::new(),
+    }
+}
+
 fn map_websocket_stream_error(err: WsError, idle_timeout: Duration) -> TransportError {
     match err {
         WsError::ConnectionClosed | WsError::AlreadyClosed => TransportError::StreamClosed,
@@ -862,6 +979,12 @@ fn map_websocket_stream_error(err: WsError, idle_timeout: Duration) -> Transport
     }
 }
 
+#[derive(Debug)]
+struct WebsocketMessageOutcome {
+    chunk: Option<Bytes>,
+    terminal: bool,
+}
+
 fn websocket_text_to_sse_chunk(text: &str) -> Option<Bytes> {
     if text.trim().is_empty() {
         return None;
@@ -874,6 +997,39 @@ fn websocket_text_to_sse_chunk(text: &str) -> Option<Bytes> {
     Some(Bytes::from(payload))
 }
 
+fn websocket_message_to_sse_chunk(
+    message: WsMessage,
+) -> Result<WebsocketMessageOutcome, TransportError> {
+    match message {
+        WsMessage::Text(text) => Ok(WebsocketMessageOutcome {
+            chunk: websocket_text_to_sse_chunk(&text),
+            terminal: websocket_text_has_terminal_event(&text),
+        }),
+        WsMessage::Binary(binary) => {
+            if binary.is_empty() {
+                return Ok(WebsocketMessageOutcome {
+                    chunk: None,
+                    terminal: false,
+                });
+            }
+            let text = String::from_utf8_lossy(&binary);
+            Ok(WebsocketMessageOutcome {
+                chunk: websocket_text_to_sse_chunk(&text),
+                terminal: websocket_text_has_terminal_event(&text),
+            })
+        }
+        WsMessage::Ping(_) | WsMessage::Pong(_) => Ok(WebsocketMessageOutcome {
+            chunk: None,
+            terminal: false,
+        }),
+        WsMessage::Close(_) => Err(TransportError::StreamClosed),
+        _ => Ok(WebsocketMessageOutcome {
+            chunk: None,
+            terminal: false,
+        }),
+    }
+}
+
 fn looks_like_sse_payload(text: &str) -> bool {
     text.lines().any(|line| {
         line.starts_with("data:")
@@ -881,6 +1037,27 @@ fn looks_like_sse_payload(text: &str) -> bool {
             || line.starts_with("id:")
             || line.starts_with("retry:")
     })
+}
+
+fn websocket_text_has_terminal_event(text: &str) -> bool {
+    if looks_like_sse_payload(text) {
+        return text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .any(websocket_payload_has_terminal_event);
+    }
+    websocket_payload_has_terminal_event(text.trim())
+}
+
+fn websocket_payload_has_terminal_event(payload: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    matches!(
+        value.get("type").and_then(|value| value.as_str()),
+        Some("response.completed" | "response.incomplete" | "response.failed" | "error")
+    )
 }
 
 fn ensure_sse_terminator(payload: &str) -> String {
@@ -923,6 +1100,208 @@ fn header_pairs(headers: &http::HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+fn resolve_proxy_for_websocket_url(url: &str) -> Result<Option<ResolvedProxy>, TransportError> {
+    let parsed = Url::parse(url)
+        .map_err(|err| TransportError::Other(format!("invalid websocket url '{url}': {err}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| TransportError::Other(format!("websocket url '{url}' is missing host")))?;
+    if is_no_proxy_host(host) {
+        return Ok(None);
+    }
+    let Some(proxy_value) = websocket_proxy_env_value(parsed.scheme()) else {
+        return Ok(None);
+    };
+    let proxy = Url::parse(&proxy_value).map_err(|err| {
+        TransportError::Other(format!("invalid proxy url '{proxy_value}': {err}"))
+    })?;
+    if !proxy.scheme().eq_ignore_ascii_case("http") {
+        return Err(TransportError::Other(format!(
+            "unsupported websocket proxy scheme '{}': only http:// proxies are supported",
+            proxy.scheme()
+        )));
+    }
+    let proxy_host = proxy.host_str().ok_or_else(|| {
+        TransportError::Other(format!("proxy url '{proxy_value}' is missing host"))
+    })?;
+    let port = proxy.port_or_known_default().ok_or_else(|| {
+        TransportError::Other(format!("proxy url '{proxy_value}' is missing port"))
+    })?;
+    let authorization = if proxy.username().is_empty() {
+        None
+    } else {
+        let credentials = format!(
+            "{}:{}",
+            proxy.username(),
+            proxy.password().unwrap_or_default()
+        );
+        Some(format!(
+            "Basic {}",
+            BASE64_STANDARD.encode(credentials.as_bytes())
+        ))
+    };
+    Ok(Some(ResolvedProxy {
+        host: proxy_host.to_string(),
+        port,
+        authorization,
+    }))
+}
+
+fn websocket_proxy_env_value(scheme: &str) -> Option<String> {
+    let keys = if scheme.eq_ignore_ascii_case("wss") {
+        [
+            "WSS_PROXY",
+            "wss_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ]
+    } else {
+        [
+            "WS_PROXY",
+            "ws_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "",
+            "",
+        ]
+    };
+    keys.iter().filter(|key| !key.is_empty()).find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn is_no_proxy_host(host: &str) -> bool {
+    let Some(raw) = std::env::var("NO_PROXY")
+        .ok()
+        .or_else(|| std::env::var("no_proxy").ok())
+    else {
+        return false;
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| no_proxy_entry_matches(host, entry))
+}
+
+fn no_proxy_entry_matches(host: &str, entry: &str) -> bool {
+    if entry == "*" {
+        return true;
+    }
+    let entry = entry
+        .strip_prefix('.')
+        .unwrap_or(entry)
+        .split(':')
+        .next()
+        .unwrap_or(entry);
+    host.eq_ignore_ascii_case(entry)
+        || host
+            .strip_suffix(entry)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+async fn open_http_proxy_tunnel(
+    uri: &http::Uri,
+    proxy: &ResolvedProxy,
+    cfg: &TransportConfig,
+) -> Result<TcpStream, TransportError> {
+    let target_host = uri
+        .host()
+        .ok_or_else(|| TransportError::Other(format!("websocket uri '{uri}' is missing host")))?;
+    let target_port = uri.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        }
+    });
+    let mut socket = TcpStream::connect((proxy.host.as_str(), proxy.port))
+        .await
+        .map_err(|err| TransportError::Network(format!("proxy connect failed: {err}")))?;
+    let authority = format!("{target_host}:{target_port}");
+    let connect_request = build_http_proxy_connect_request(&authority, proxy);
+    tokio::time::timeout(
+        cfg.connect_timeout,
+        socket.write_all(connect_request.as_bytes()),
+    )
+    .await
+    .map_err(|_| TransportError::ConnectTimeout(cfg.connect_timeout))?
+    .map_err(|err| TransportError::Network(format!("proxy connect write failed: {err}")))?;
+    tokio::time::timeout(cfg.connect_timeout, socket.flush())
+        .await
+        .map_err(|_| TransportError::ConnectTimeout(cfg.connect_timeout))?
+        .map_err(|err| TransportError::Network(format!("proxy connect flush failed: {err}")))?;
+
+    let mut response = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 1024];
+        let bytes_read = tokio::time::timeout(cfg.connect_timeout, socket.read(&mut chunk))
+            .await
+            .map_err(|_| TransportError::ConnectTimeout(cfg.connect_timeout))?
+            .map_err(|err| TransportError::Network(format!("proxy connect read failed: {err}")))?;
+        if bytes_read == 0 {
+            return Err(TransportError::Network(
+                "proxy closed the CONNECT tunnel before sending a response".into(),
+            ));
+        }
+        response.extend_from_slice(&chunk[..bytes_read]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if response.len() > 64 * 1024 {
+            return Err(TransportError::Other(
+                "proxy CONNECT response headers exceeded 64KiB".into(),
+            ));
+        }
+    }
+
+    validate_http_proxy_connect_response(&response)
+        .map_err(|err| TransportError::Other(format!("proxy CONNECT failed: {err}")))?;
+    Ok(socket)
+}
+
+fn build_http_proxy_connect_request(authority: &str, proxy: &ResolvedProxy) -> String {
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if let Some(authorization) = proxy.authorization.as_ref() {
+        request.push_str("Proxy-Authorization: ");
+        request.push_str(authorization);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    request
+}
+
+fn validate_http_proxy_connect_response(response: &[u8]) -> Result<(), String> {
+    let text = String::from_utf8_lossy(response);
+    let header_end = text.find("\r\n\r\n").unwrap_or(text.len());
+    let header_text = &text[..header_end];
+    let mut lines = header_text.lines();
+    let status_line = lines
+        .next()
+        .ok_or_else(|| "empty proxy response".to_string())?;
+    let mut parts = status_line.split_whitespace();
+    let _http_version = parts
+        .next()
+        .ok_or_else(|| format!("malformed proxy response status line: {status_line}"))?;
+    let status = parts
+        .next()
+        .ok_or_else(|| format!("malformed proxy response status line: {status_line}"))?
+        .parse::<u16>()
+        .map_err(|_| format!("invalid proxy response status line: {status_line}"))?;
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    Err(format!("http status {status}: {status_line}"))
+}
+
 fn parse_retry_after_ms(s: &str) -> Option<u64> {
     // RFC 7231: either delta-seconds or HTTP date; support simple delta only
     if let Ok(secs) = s.trim().parse::<u64>() {
@@ -945,6 +1324,12 @@ fn format_reqwest_error_chain(err: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn try_new_returns_transport_error_when_client_build_fails() {
@@ -994,11 +1379,84 @@ mod tests {
     }
 
     #[test]
+    fn websocket_close_frame_maps_to_stream_closed_error() {
+        let err = websocket_message_to_sse_chunk(WsMessage::Close(None))
+            .expect_err("close frame should terminate the stream with an error");
+        assert!(matches!(err, TransportError::StreamClosed));
+    }
+
+    #[test]
     fn websocket_header_filter_skips_upgrade_headers() {
         assert!(should_skip_websocket_header("connection"));
         assert!(should_skip_websocket_header("upgrade"));
         assert!(should_skip_websocket_header("sec-websocket-key"));
         assert!(should_skip_websocket_header("content-type"));
         assert!(!should_skip_websocket_header("authorization"));
+    }
+
+    #[test]
+    fn websocket_proxy_resolution_prefers_secure_proxy_for_wss() {
+        let _guard = env_test_lock();
+        std::env::set_var("WSS_PROXY", "");
+        std::env::set_var("HTTPS_PROXY", "http://user:pass@127.0.0.1:8080");
+        std::env::remove_var("ALL_PROXY");
+        std::env::remove_var("NO_PROXY");
+        let proxy =
+            resolve_proxy_for_websocket_url("wss://chatgpt.com/backend-api/codex/responses")
+                .expect("proxy resolution")
+                .expect("proxy configured");
+        assert_eq!(proxy.host, "127.0.0.1");
+        assert_eq!(proxy.port, 8080);
+        assert_eq!(
+            proxy.authorization,
+            Some(format!(
+                "Basic {}",
+                BASE64_STANDARD.encode("user:pass".as_bytes())
+            ))
+        );
+    }
+
+    #[test]
+    fn websocket_proxy_resolution_honors_no_proxy() {
+        let _guard = env_test_lock();
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:8080");
+        std::env::set_var("NO_PROXY", "chatgpt.com,.example.invalid");
+        let proxy =
+            resolve_proxy_for_websocket_url("wss://chatgpt.com/backend-api/codex/responses")
+                .expect("proxy resolution");
+        assert!(proxy.is_none());
+    }
+
+    #[test]
+    fn builds_http_proxy_connect_request_with_basic_auth() {
+        let request = build_http_proxy_connect_request(
+            "chatgpt.com:443",
+            &ResolvedProxy {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                authorization: Some("Basic dXNlcjpwYXNz".to_string()),
+            },
+        );
+        assert!(request.starts_with("CONNECT chatgpt.com:443 HTTP/1.1\r\n"));
+        assert!(request.contains("Host: chatgpt.com:443\r\n"));
+        assert!(request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+        assert!(request.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn proxy_connect_response_accepts_success_status() {
+        assert!(validate_http_proxy_connect_response(
+            b"HTTP/1.1 200 Connection established\r\nProxy-Agent: mitmproxy\r\n\r\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn proxy_connect_response_rejects_non_success_status() {
+        let err = validate_http_proxy_connect_response(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n",
+        )
+        .expect_err("non-success proxy CONNECT should fail");
+        assert!(err.contains("http status 407"));
     }
 }
