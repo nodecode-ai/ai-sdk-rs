@@ -470,11 +470,16 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
         let mut completed_response_id = None;
         while let Some(item) = parts.next().await {
             match item {
+                Ok(v2t::StreamPart::ResponseMetadata { meta }) => {
+                    completed_response_id = meta.id.clone();
+                }
                 Ok(v2t::StreamPart::Finish {
                     provider_metadata, ..
                 }) => {
-                    completed_response_id =
-                        provider_response_id_from_metadata(provider_metadata.as_ref());
+                    completed_response_id = provider_response_id_from_metadata(
+                        provider_metadata.as_ref(),
+                    )
+                    .or(completed_response_id);
                 }
                 Ok(_) => {}
                 Err(err) => return Err(err),
@@ -496,6 +501,12 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
     fn prepared_websocket_body(&self, mut body: Value) -> (Value, Value, bool, bool) {
         let mut previous_response_id_used = false;
         let mut warmup_response_id_used = false;
+        let explicit_previous_response_id = body
+            .get("previous_response_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         let (last_response_id, last_request, last_response_id_from_warmup) = {
             let state = self.state.lock().unwrap();
             (
@@ -504,7 +515,15 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
                 state.last_response_id_from_warmup,
             )
         };
-        if let Some(last_response_id) = last_response_id {
+        if let Some(explicit_previous_response_id) = explicit_previous_response_id {
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "previous_response_id".to_string(),
+                    Value::String(explicit_previous_response_id),
+                );
+                previous_response_id_used = true;
+            }
+        } else if let Some(last_response_id) = last_response_id {
             if request_shape_matches_previous(last_request.as_ref(), &body) {
                 if let Some(object) = body.as_object_mut() {
                     object.insert(
@@ -602,36 +621,49 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
             let mut stream = parts;
             let mut completed_response_id = None;
             let mut completed = false;
+            let mut state_committed = false;
             while let Some(item) = stream.next().await {
                 match &item {
+                    Ok(v2t::StreamPart::ResponseMetadata { meta }) => {
+                        completed_response_id = meta.id.clone();
+                    }
                     Ok(v2t::StreamPart::Finish { provider_metadata, .. }) => {
                         completed = true;
-                        completed_response_id = provider_response_id_from_metadata(provider_metadata.as_ref());
+                        completed_response_id =
+                            provider_response_id_from_metadata(provider_metadata.as_ref())
+                                .or(completed_response_id.clone());
+                        write_turn_session_incremental_state(
+                            &state,
+                            &request_body,
+                            track_incremental_state,
+                            completed_response_id.clone(),
+                        );
+                        state_committed = true;
                     }
                     Err(_) => {
                         completed = false;
                         completed_response_id = None;
+                        write_turn_session_incremental_state(
+                            &state,
+                            &request_body,
+                            track_incremental_state,
+                            None,
+                        );
+                        state_committed = true;
                     }
                     _ => {}
                 }
                 yield item;
             }
 
-            let mut state = state.lock().unwrap();
-            if track_incremental_state {
-                state.last_request = Some(request_body);
-                state.last_response_id_from_warmup = false;
-                state.last_response_id = if completed {
-                    completed_response_id
-                } else {
-                    None
-                };
-            } else {
-                state.last_request = None;
-                state.last_response_id = None;
-                state.last_response_id_from_warmup = false;
+            if !state_committed {
+                write_turn_session_incremental_state(
+                    &state,
+                    &request_body,
+                    track_incremental_state,
+                    if completed { completed_response_id } else { None },
+                );
             }
-            state.last_reset_reason = None;
         })
     }
 
@@ -872,6 +904,24 @@ fn provider_response_id_from_metadata(metadata: Option<&v2t::ProviderMetadata>) 
         .and_then(|inner| inner.get("responseId"))
         .and_then(|value| value.as_str())
         .map(ToString::to_string)
+}
+
+fn write_turn_session_incremental_state(
+    state: &Arc<Mutex<OpenAIResponsesTurnSessionState>>,
+    request_body: &Value,
+    track_incremental_state: bool,
+    response_id: Option<String>,
+) {
+    let mut state = state.lock().unwrap();
+    if track_incremental_state {
+        state.last_request = Some(request_body.clone());
+        state.last_response_id = response_id;
+    } else {
+        state.last_request = None;
+        state.last_response_id = None;
+    }
+    state.last_response_id_from_warmup = false;
+    state.last_reset_reason = None;
 }
 
 fn should_use_codex_oauth_websocket_transport(endpoint_path: &str) -> bool {

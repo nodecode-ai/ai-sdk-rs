@@ -334,6 +334,16 @@ async fn drain_stream_response(response: crate::ai_sdk_core::StreamResponse) {
     }
 }
 
+async fn consume_until_finish_and_drop(response: crate::ai_sdk_core::StreamResponse) {
+    let mut stream = response.stream;
+    while let Some(item) = stream.next().await {
+        let item = item.expect("stream part");
+        if matches!(item, v2t::StreamPart::Finish { .. }) {
+            break;
+        }
+    }
+}
+
 fn request_shape_without_incremental_fields(value: &Value) -> Value {
     let mut value = value.clone();
     if let Some(object) = value.as_object_mut() {
@@ -787,6 +797,219 @@ async fn cold_codex_turn_session_prewarms_then_reuses_same_hot_websocket_session
     assert_eq!(
         second_headers.get("x-codex-turn-state").map(String::as_str),
         Some("ts-1")
+    );
+}
+
+#[tokio::test]
+async fn explicit_previous_response_id_wins_over_cached_warmup_id_on_reused_socket() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new()
+        .with_websocket_response_headers(vec![(
+            "x-codex-turn-state".to_string(),
+            "ts-1".to_string(),
+        )])
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"warm-1\"}}\n\n",
+        ))]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        ))]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\"}}\n\n",
+        ))]));
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let mut session = model.new_turn_session();
+    let first = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "hello".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            tools: vec![v2t::Tool::Function(function_tool_for_strict_passthrough(None))],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([(
+                    "clientMetadata".into(),
+                    json!({
+                        "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+                    }),
+                )]),
+            )]),
+            headers: HashMap::from([(
+                "x-codex-turn-metadata".to_string(),
+                "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}".to_string(),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("first stream response");
+    drain_stream_response(first).await;
+
+    let second = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "second".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            tools: vec![v2t::Tool::Function(function_tool_for_strict_passthrough(None))],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([
+                    (
+                        "clientMetadata".into(),
+                        json!({
+                            "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+                        }),
+                    ),
+                    ("previousResponseId".into(), json!("explicit-final")),
+                ]),
+            )]),
+            headers: HashMap::from([(
+                "x-codex-turn-metadata".to_string(),
+                "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}".to_string(),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("second stream response");
+    drain_stream_response(second).await;
+
+    let request_bodies = transport.websocket_request_bodies();
+    assert_eq!(
+        request_bodies[2]
+            .get("previous_response_id")
+            .and_then(|value| value.as_str()),
+        Some("explicit-final")
+    );
+}
+
+#[tokio::test]
+async fn codex_turn_session_updates_previous_response_id_before_stream_drain() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new()
+        .with_websocket_response_headers(vec![(
+            "x-codex-turn-state".to_string(),
+            "ts-1".to_string(),
+        )])
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"warm-1\"}}\n\n",
+        ))]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        ))]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\"}}\n\n",
+        ))]));
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let mut session = model.new_turn_session();
+    let first = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "hello".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            tools: vec![v2t::Tool::Function(function_tool_for_strict_passthrough(None))],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([(
+                    "clientMetadata".into(),
+                    json!({
+                        "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+                    }),
+                )]),
+            )]),
+            headers: HashMap::from([(
+                "x-codex-turn-metadata".to_string(),
+                "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}".to_string(),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("first stream response");
+    consume_until_finish_and_drop(first).await;
+
+    let second = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "second".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            tools: vec![v2t::Tool::Function(function_tool_for_strict_passthrough(None))],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([(
+                    "clientMetadata".into(),
+                    json!({
+                        "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+                    }),
+                )]),
+            )]),
+            headers: HashMap::from([(
+                "x-codex-turn-metadata".to_string(),
+                "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}".to_string(),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("second stream response");
+    consume_until_finish_and_drop(second).await;
+
+    assert_eq!(
+        transport.websocket_connect_urls(),
+        vec!["wss://chatgpt.com/backend-api/codex/responses".to_string()]
+    );
+    let request_bodies = transport.websocket_request_bodies();
+    assert_eq!(
+        request_bodies[2]
+            .get("previous_response_id")
+            .and_then(|value| value.as_str()),
+        Some("resp-1")
     );
 }
 
