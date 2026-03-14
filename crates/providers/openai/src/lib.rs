@@ -9,6 +9,7 @@ pub mod responses;
 pub mod overrides;
 
 pub use responses::language_model::OpenAIResponsesLanguageModel;
+pub use provider::OpenAIResponsesBuilder;
 
 #[cfg(test)]
 #[path = "../tests/responses_language_model_tests.rs"]

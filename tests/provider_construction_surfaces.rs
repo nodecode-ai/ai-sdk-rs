@@ -7,10 +7,10 @@ use ai_sdk_rs::providers::anthropic::messages::language_model::{
     AnthropicMessagesConfig, AnthropicMessagesLanguageModel,
 };
 use ai_sdk_rs::providers::openai::responses::language_model::OpenAIResponsesLanguageModel;
-use ai_sdk_rs::providers::openai_compatible::build_openai_compatible_embedding;
 use ai_sdk_rs::providers::openai_compatible::embedding::embedding_model::{
     OpenAICompatibleEmbeddingConfig, OpenAICompatibleEmbeddingModel,
 };
+use ai_sdk_rs::providers::openai_compatible::provider::build_openai_compatible_embedding;
 use ai_sdk_rs::transports::reqwest::ReqwestTransport;
 use ai_sdk_rs::types::catalog::{ProviderDefinition, SdkType};
 

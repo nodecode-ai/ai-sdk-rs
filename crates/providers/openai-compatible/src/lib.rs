@@ -28,8 +28,10 @@ pub use chat::language_model::OpenAICompatibleChatLanguageModel;
 pub use completion::language_model::OpenAICompatibleCompletionLanguageModel;
 pub use embedding::embedding_model::OpenAICompatibleEmbeddingModel;
 pub use image::image_model::OpenAICompatibleImageModel;
-pub use provider::build_openai_compatible_embedding;
-pub use provider::build_openai_compatible_image;
+pub use provider::{
+    OpenAICompatibleChatBuilder, OpenAICompatibleCompletionBuilder,
+    OpenAICompatibleEmbeddingBuilder, OpenAICompatibleImageBuilder,
+};
 pub use stream::{build_stream, StreamMode, StreamSettings};
 
 #[cfg(test)]

@@ -1,6 +1,4 @@
-use ai_sdk_rs::core::transport::TransportConfig;
 use ai_sdk_rs::core::{EmbedOptions, EmbeddingModel};
-use ai_sdk_rs::providers::openai_compatible::embedding::embedding_model::OpenAICompatibleEmbeddingConfig;
 use ai_sdk_rs::providers::openai_compatible::OpenAICompatibleEmbeddingModel;
 use anyhow::Result;
 
@@ -47,19 +45,11 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let cfg = OpenAICompatibleEmbeddingConfig {
-        provider_scope_name: "openai-compatible".to_string(),
-        base_url,
-        headers: vec![("authorization".into(), format!("Bearer {}", api_key))],
-        http: ai_sdk_rs::transports::reqwest::ReqwestTransport::default(),
-        transport_cfg: TransportConfig::default(),
-        query_params: vec![],
-        max_embeddings_per_call: None,
-        supports_parallel_calls: true,
-        default_options: None,
-    };
-
-    let provider = OpenAICompatibleEmbeddingModel::new(model, cfg);
+    let provider = OpenAICompatibleEmbeddingModel::builder(model)
+        .with_base_url(base_url)
+        .with_api_key(api_key)
+        .with_max_embeddings_per_call(None)
+        .build()?;
     let options = EmbedOptions::new(vec![input]);
 
     let resp = provider.do_embed(options).await?;

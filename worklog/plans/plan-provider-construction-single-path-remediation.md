@@ -93,7 +93,7 @@
   - no production constructor refactor lands in this slice
 
 - [x] `PC1` Introduce one canonical typed construction surface per capability.
-  Lineage commit: `<fill after landing>`
+  Lineage commit: `69715f6`
   Commit subject: `refactor(api): add canonical provider constructors`
   Lineage parent: `PC0`
   Scope:
@@ -104,8 +104,8 @@
   - representative providers no longer require registry-driven construction in ordinary usage
   - overlapping helper entrypoints are narrowed rather than multiplied
 
-- [ ] `PC2` Move docs and callers to the canonical construction path and demote displaced authorities.
-  Lineage commit: `<pending>`
+- [x] `PC2` Move docs and callers to the canonical construction path and demote displaced authorities.
+  Lineage commit: `<fill after landing>`
   Commit subject: `refactor(api): narrow redundant provider construction paths`
   Lineage parent: `PC1`
   Scope:
