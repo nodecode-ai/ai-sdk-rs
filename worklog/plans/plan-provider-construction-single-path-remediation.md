@@ -118,7 +118,7 @@
   - redundant happy-path helpers are removed or explicitly narrowed in the same slice
 
 - [x] `PC3` Validate the surviving provider construction surface.
-  Lineage commit: `<fill after landing>`
+  Lineage commit: `9de8470`
   Commit subject: `test(api): validate provider construction surface`
   Lineage parent: `PC2`
   Scope:
