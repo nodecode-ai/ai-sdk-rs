@@ -10,12 +10,18 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream;
 use futures_util::stream::BoxStream;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 enum StreamBehavior {
     Chunks(Vec<Result<Bytes, TransportError>>),
@@ -251,6 +257,147 @@ fn websocket_transport_options() -> v2t::ProviderOptions {
             }),
         )]),
     )])
+}
+
+struct TestWebsocketServer {
+    base_url: String,
+    connect_headers: Arc<Mutex<Vec<HashMap<String, String>>>>,
+    request_records: Arc<Mutex<Vec<(usize, Value)>>>,
+    listener_task: JoinHandle<()>,
+    connection_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl TestWebsocketServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let connect_headers = Arc::new(Mutex::new(Vec::new()));
+        let request_records = Arc::new(Mutex::new(Vec::new()));
+        let connection_tasks = Arc::new(Mutex::new(Vec::new()));
+        let next_connection_id = Arc::new(AtomicUsize::new(1));
+        let listener_connect_headers = Arc::clone(&connect_headers);
+        let listener_request_records = Arc::clone(&request_records);
+        let listener_connection_tasks = Arc::clone(&connection_tasks);
+        let listener_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                let connection_id = next_connection_id.fetch_add(1, Ordering::SeqCst);
+                let task_connect_headers = Arc::clone(&listener_connect_headers);
+                let task_request_records = Arc::clone(&listener_request_records);
+                let connection_task = tokio::spawn(async move {
+                    let captured_headers = Arc::new(Mutex::new(None::<HashMap<String, String>>));
+                    let callback_headers = Arc::clone(&captured_headers);
+                    let mut websocket = accept_hdr_async(
+                        stream,
+                        move |request: &Request, response: Response| {
+                            let headers = request
+                                .headers()
+                                .iter()
+                                .map(|(name, value)| {
+                                    (
+                                        name.as_str().to_string(),
+                                        value.to_str().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect::<HashMap<_, _>>();
+                            *callback_headers.lock().unwrap() = Some(headers);
+                            Ok(response)
+                        },
+                    )
+                    .await
+                    .expect("accept websocket");
+                    task_connect_headers
+                        .lock()
+                        .unwrap()
+                        .push(captured_headers.lock().unwrap().take().unwrap_or_default());
+
+                    while let Some(message) = websocket.next().await {
+                        let message = message.expect("websocket message");
+                        let text = match message {
+                            WsMessage::Text(text) => text,
+                            WsMessage::Binary(binary) => {
+                                String::from_utf8(binary.to_vec()).expect("utf8 websocket body")
+                            }
+                            WsMessage::Close(_) => break,
+                            _ => continue,
+                        };
+                        let body: Value =
+                            serde_json::from_str(&text).expect("websocket request body");
+                        task_request_records
+                            .lock()
+                            .unwrap()
+                            .push((connection_id, body));
+                        websocket
+                            .send(WsMessage::Text(
+                                json!({
+                                    "type": "response.completed",
+                                    "response": {
+                                        "id": format!("resp-{connection_id}"),
+                                    },
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .expect("send websocket response");
+                        websocket.close(None).await.expect("close websocket");
+                        break;
+                    }
+                });
+                listener_connection_tasks
+                    .lock()
+                    .unwrap()
+                    .push(connection_task);
+            }
+        });
+
+        Self {
+            base_url: format!("http://{addr}"),
+            connect_headers,
+            request_records,
+            listener_task,
+            connection_tasks,
+        }
+    }
+
+    async fn wait_for_connection_count(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if self.connect_headers.lock().unwrap().len() >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected} websocket connection(s); saw {}",
+                self.connect_headers.lock().unwrap().len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn connect_headers(&self) -> Vec<HashMap<String, String>> {
+        self.connect_headers.lock().unwrap().clone()
+    }
+
+    fn request_records(&self) -> Vec<(usize, Value)> {
+        self.request_records.lock().unwrap().clone()
+    }
+}
+
+impl Drop for TestWebsocketServer {
+    fn drop(&mut self) {
+        self.listener_task.abort();
+        let mut tasks = self.connection_tasks.lock().unwrap();
+        for task in tasks.iter() {
+            task.abort();
+        }
+        tasks.clear();
+    }
 }
 
 fn item_reference_fixture() -> Value {
@@ -757,11 +904,12 @@ async fn codex_websocket_http_fallback_drops_explicit_previous_response_id_after
         None
     );
     assert_eq!(
+        transport.websocket_connect_urls(),
+        vec!["wss://chatgpt.com/backend-api/codex/responses".to_string()]
+    );
+    assert_eq!(
         transport.stream_urls(),
-        vec![
-            "wss://chatgpt.com/backend-api/codex/responses".to_string(),
-            "https://chatgpt.com/backend-api/codex/responses".to_string()
-        ]
+        vec!["https://chatgpt.com/backend-api/codex/responses".to_string()]
     );
 }
 
@@ -961,7 +1109,7 @@ async fn cold_codex_turn_session_skips_prewarm_when_first_request_succeeds() {
         second_real
             .get("previous_response_id")
             .and_then(|value| value.as_str()),
-        Some("resp-1")
+        Some("warm-1")
     );
     assert_eq!(second_real.get("generate"), None);
     assert_eq!(
@@ -1355,7 +1503,78 @@ async fn codex_turn_session_updates_previous_response_id_before_stream_drain() {
         request_bodies[1]
             .get("previous_response_id")
             .and_then(|value| value.as_str()),
-        Some("resp-1")
+        Some("warm-1")
+    );
+}
+
+#[tokio::test]
+async fn codex_first_request_with_upgrade_headers_skips_headerless_preconnect() {
+    let server = TestWebsocketServer::start().await;
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: server.base_url.clone(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport_cfg = TransportConfig::default();
+    let transport = crate::reqwest_transport::ReqwestTransport::new(&transport_cfg);
+    let mut model =
+        OpenAIResponsesLanguageModel::new("gpt-5.3-codex", cfg, transport, transport_cfg);
+    model.start_codex_websocket_preconnect();
+    server.wait_for_connection_count(1).await;
+
+    let mut session = model.new_turn_session();
+    let response = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "hello".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([(
+                    "clientMetadata".into(),
+                    json!({
+                        "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
+                    }),
+                )]),
+            )]),
+            headers: HashMap::from([(
+                "x-codex-turn-metadata".to_string(),
+                "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}".to_string(),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("stream response");
+    drain_stream_response(response).await;
+
+    let connect_headers = server.connect_headers();
+    assert_eq!(connect_headers.len(), 2, "expected preconnect and fresh request socket");
+    assert!(
+        !connect_headers[0].contains_key("x-codex-turn-metadata"),
+        "preconnect should remain headerless"
+    );
+    assert_eq!(
+        connect_headers[1]
+            .get("x-codex-turn-metadata")
+            .map(String::as_str),
+        Some("{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}")
+    );
+    let request_records = server.request_records();
+    assert_eq!(request_records.len(), 1, "expected a single first-request frame");
+    assert_eq!(
+        request_records[0].0, 2,
+        "the first request must use the fresh header-bearing connection"
     );
 }
 
