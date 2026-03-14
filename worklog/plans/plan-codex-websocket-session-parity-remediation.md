@@ -88,7 +88,7 @@
 - [x] `CW1` Make Codex websocket preconnect selection header-aware.
   Lineage commit: `285d098`
   Commit subject: `fix(openai): preserve codex websocket upgrade headers`
-  Lineage parent: `22d6b68`
+  Lineage parent: `CW0`
   Scope:
   - `crates/providers/openai/src/responses/language_model.rs`
   - directly affected Codex websocket tests only
@@ -101,7 +101,7 @@
 - [x] `CW2` Validate the surviving Codex websocket path.
   Lineage commit: `8a1fab6`
   Commit subject: `test(openai): validate codex websocket session path`
-  Lineage parent: `285d098`
+  Lineage parent: `CW1`
   Scope:
   - targeted `cargo test -p ai-sdk-rs` coverage for Codex websocket session cases
   - `worklog/plans/plan-codex-websocket-session-parity-remediation.md`
