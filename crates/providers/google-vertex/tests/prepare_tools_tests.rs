@@ -1,5 +1,8 @@
+use crate::ai_sdk_core::error::TransportError;
 use crate::ai_sdk_providers_google_vertex::prepare_tools::prepare_tools;
 use crate::ai_sdk_types::v2 as v2t;
+use crate::provider_google::error::map_transport_error_to_sdk_error as map_google_error;
+use crate::provider_google_vertex::error::map_transport_error_to_sdk_error as map_vertex_error;
 use serde_json::json;
 
 fn provider_tool(id: &str, args: serde_json::Value) -> v2t::Tool {
@@ -58,4 +61,31 @@ fn provider_enterprise_search_requires_gemini2() {
         }
         other => panic!("unexpected warning: {other:?}"),
     }
+}
+
+fn http_status(body: &str) -> TransportError {
+    TransportError::HttpStatus {
+        status: 403,
+        body: body.to_string(),
+        retry_after_ms: None,
+        sanitized: "redacted".to_string(),
+        headers: Vec::new(),
+    }
+}
+
+#[test]
+fn error_mapping_path_parity_between_google_and_vertex() {
+    let google = map_google_error(http_status(
+        r#"{"error":{"code":403,"message":"permission denied","status":"PERMISSION_DENIED"}}"#,
+    ));
+    let vertex = map_vertex_error(http_status(
+        r#"{"error":{"code":403,"message":"permission denied","status":"PERMISSION_DENIED"}}"#,
+    ));
+
+    let google_debug = format!("{google:?}");
+    let vertex_debug = format!("{vertex:?}");
+
+    assert_eq!(google_debug, vertex_debug);
+    assert!(google_debug.contains("permission denied"));
+    assert!(google_debug.contains("status: 403"));
 }
