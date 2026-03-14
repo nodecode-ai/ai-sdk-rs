@@ -97,6 +97,7 @@ struct OpenAIResponsesTurnSessionTelemetry {
 
 #[derive(Default)]
 struct WebsocketPreconnectState {
+    headers: Vec<(String, String)>,
     ready: Option<Box<dyn JsonStreamWebsocketConnection>>,
     pending: Option<JoinHandle<Result<Box<dyn JsonStreamWebsocketConnection>, SdkError>>>,
 }
@@ -176,6 +177,7 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
         let pending = {
             let mut state = self.websocket_preconnect.lock().unwrap();
             if let Some(connection) = state.ready.take() {
+                state.headers.clear();
                 return Some(connection);
             }
             state.pending.take()
@@ -184,16 +186,38 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             return None;
         };
         match handle.await {
-            Ok(Ok(connection)) => Some(connection),
+            Ok(Ok(connection)) => {
+                self.websocket_preconnect.lock().unwrap().headers.clear();
+                Some(connection)
+            }
             Ok(Err(err)) => {
+                self.websocket_preconnect.lock().unwrap().headers.clear();
                 tracing::debug!(error = %err, "openai websocket preconnect failed");
                 None
             }
             Err(err) => {
+                self.websocket_preconnect.lock().unwrap().headers.clear();
                 tracing::debug!(error = %err, "openai websocket preconnect task cancelled");
                 None
             }
         }
+    }
+
+    fn preconnected_websocket_headers_match(&self, headers: &[(String, String)]) -> Option<bool> {
+        let state = self.websocket_preconnect.lock().unwrap();
+        if state.ready.is_none() && state.pending.is_none() {
+            return None;
+        }
+        Some(state.headers == headers)
+    }
+
+    fn discard_preconnected_websocket(&self) {
+        let mut state = self.websocket_preconnect.lock().unwrap();
+        if let Some(handle) = state.pending.take() {
+            handle.abort();
+        }
+        state.ready = None;
+        state.headers.clear();
     }
 
     fn canonicalize_header(lc: &str) -> String {
@@ -368,13 +392,15 @@ impl OpenAIResponsesLanguageModel<crate::reqwest_transport::ReqwestTransport> {
         };
         let http = self.http.clone();
         let transport_cfg = self.transport_cfg.clone();
+        let task_headers = headers.clone();
         let task = runtime.spawn(async move {
-            http.connect_json_stream_websocket(&url, &headers, &transport_cfg)
+            http.connect_json_stream_websocket(&url, &task_headers, &transport_cfg)
                 .await
                 .map_err(map_transport_error)
         });
         let mut state = self.websocket_preconnect.lock().unwrap();
         if state.ready.is_none() && state.pending.is_none() {
+            state.headers = headers;
             state.pending = Some(task);
         }
     }
@@ -452,13 +478,19 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
             self.websocket = None;
         }
 
-        if let Some(connection) = self.model.take_preconnected_websocket().await {
-            {
-                let mut state = self.state.lock().unwrap();
-                state.connection_count = state.connection_count.saturating_add(1);
+        match self.model.preconnected_websocket_headers_match(headers) {
+            Some(true) => {
+                if let Some(connection) = self.model.take_preconnected_websocket().await {
+                    {
+                        let mut state = self.state.lock().unwrap();
+                        state.connection_count = state.connection_count.saturating_add(1);
+                    }
+                    self.websocket = Some(connection);
+                    return Ok(false);
+                }
             }
-            self.websocket = Some(connection);
-            return Ok(false);
+            Some(false) => self.model.discard_preconnected_websocket(),
+            None => {}
         }
 
         let url = to_websocket_url(&self.model.endpoint_url())?;

@@ -73,7 +73,7 @@
 ## Atomic Slices
 
 - [x] `CW0` Lock Codex websocket session expectations.
-  Lineage commit: `<fill after landing>`
+  Lineage commit: `22d6b68`
   Commit subject: `test(openai): lock codex websocket session parity`
   Lineage parent: `HEAD`
   Scope:
@@ -85,10 +85,10 @@
   - a focused regression proves a first request with per-call websocket upgrade headers does not consume a headerless preconnect
   - no production changes land in this slice
 
-- [ ] `CW1` Make Codex websocket preconnect selection header-aware.
-  Lineage commit: `<pending>`
+- [x] `CW1` Make Codex websocket preconnect selection header-aware.
+  Lineage commit: `<fill after landing>`
   Commit subject: `fix(openai): preserve codex websocket upgrade headers`
-  Lineage parent: `CW0`
+  Lineage parent: `22d6b68`
   Scope:
   - `crates/providers/openai/src/responses/language_model.rs`
   - directly affected Codex websocket tests only
