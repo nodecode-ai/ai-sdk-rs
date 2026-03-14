@@ -136,10 +136,7 @@ fn build_anthropic(
         headers.push((orig, value));
     }
 
-    let mut transport_cfg = build_provider_transport_config(def, Some(DEFAULT_IDLE_READ_TIMEOUT));
-    // Anthropic request bodies are assembled without null fields, so skip the
-    // transport's extra prune-and-clone pass on the hot path.
-    transport_cfg.strip_null_fields = false;
+    let transport_cfg = build_provider_transport_config(def, Some(DEFAULT_IDLE_READ_TIMEOUT));
 
     let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;

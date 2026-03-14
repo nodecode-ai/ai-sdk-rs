@@ -73,7 +73,7 @@
 ## Atomic Slices
 
 - [x] `AN0` Lock Anthropic builder-versus-wire null behavior.
-  Lineage commit: `<fill after landing>`
+  Lineage commit: `3ecef89`
   Commit subject: `test(anthropic): lock null sanitization seam`
   Lineage parent: `HEAD`
   Scope:
@@ -84,8 +84,8 @@
   - focused coverage proves the registry/provider path is expected to keep object nulls off the wire
   - no production changes land in this slice
 
-- [ ] `AN1` Restore transport-owned Anthropic null pruning.
-  Lineage commit: `<pending>`
+- [x] `AN1` Restore transport-owned Anthropic null pruning.
+  Lineage commit: `<fill after landing>`
   Commit subject: `fix(anthropic): restore transport null pruning`
   Lineage parent: `AN0`
   Scope:

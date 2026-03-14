@@ -1,9 +1,14 @@
 use crate::ai_sdk_core::error::TransportError;
 use crate::ai_sdk_core::json::without_null_fields;
-use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
-use crate::ai_sdk_core::LanguageModel;
+use crate::ai_sdk_core::transport::{
+    set_transport_observer, HttpTransport, TransportBody, TransportConfig, TransportEvent,
+    TransportObserver,
+};
+use crate::ai_sdk_core::{LanguageModel, SdkError};
+use crate::ai_sdk_provider::{registry, Credentials};
 use crate::ai_sdk_providers_anthropic::messages::language_model::AnthropicMessagesConfig;
 use crate::ai_sdk_providers_anthropic::AnthropicMessagesLanguageModel;
+use crate::ai_sdk_types::catalog::{ModelInfo, ProviderDefinition, SdkType};
 use crate::ai_sdk_types::v2 as v2t;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,8 +16,52 @@ use futures_core::Stream;
 use futures_util::stream;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::net::TcpListener;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[derive(Default)]
+struct RecordingObserver {
+    events: Mutex<Vec<TransportEvent>>,
+}
+
+impl RecordingObserver {
+    fn clear(&self) {
+        self.events.lock().unwrap().clear();
+    }
+
+    fn request_json_for_url(&self, url: &str) -> Option<serde_json::Value> {
+        self.events.lock().unwrap().iter().rev().find_map(|event| {
+            if event.url != url {
+                return None;
+            }
+            match event.request_body.clone() {
+                Some(TransportBody::Json(body)) => Some(body),
+                _ => None,
+            }
+        })
+    }
+}
+
+impl TransportObserver for RecordingObserver {
+    fn on_event(&self, event: TransportEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+fn transport_observer() -> Arc<RecordingObserver> {
+    static OBSERVER: OnceLock<Arc<RecordingObserver>> = OnceLock::new();
+    OBSERVER
+        .get_or_init(|| {
+            let observer = Arc::new(RecordingObserver::default());
+            assert!(
+                set_transport_observer(observer.clone()),
+                "transport observer was already installed before Anthropic null-path tests ran"
+            );
+            observer
+        })
+        .clone()
+}
 
 #[derive(Clone, Default)]
 struct TestTransport {
@@ -137,6 +186,32 @@ fn build_model(transport: TestTransport) -> AnthropicMessagesLanguageModel<TestT
         default_options: None,
     };
     AnthropicMessagesLanguageModel::new("claude-3-5-sonnet-20241022".into(), cfg)
+}
+
+fn anthropic_provider_definition(base_url: String) -> ProviderDefinition {
+    ProviderDefinition {
+        name: "anthropic".into(),
+        display_name: "Anthropic".into(),
+        sdk_type: SdkType::Anthropic,
+        base_url,
+        env: None,
+        npm: None,
+        doc: None,
+        endpoint_path: "/messages".into(),
+        headers: HashMap::new(),
+        query_params: HashMap::new(),
+        stream_idle_timeout_ms: None,
+        auth_type: "api-key".into(),
+        models: HashMap::<String, ModelInfo>::new(),
+        preserve_model_prefix: true,
+    }
+}
+
+fn unused_local_base_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().expect("listener addr").port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}")
 }
 
 fn contains_object_null(value: &serde_json::Value) -> bool {
@@ -360,5 +435,52 @@ async fn transport_prunes_object_nulls_from_stream_payload_when_enabled() {
     assert!(
         !contains_object_null(&wire_body),
         "transport should strip object nulls before sending the Anthropic stream payload: {wire_body}"
+    );
+}
+
+#[tokio::test]
+async fn registry_built_anthropic_stream_payload_is_null_free_on_wire() {
+    let observer = transport_observer();
+    observer.clear();
+
+    let base_url = unused_local_base_url();
+    let wire_url = format!("{base_url}/messages");
+    let definition = anthropic_provider_definition(base_url);
+    let registration = registry::iter()
+        .into_iter()
+        .find(|entry| entry.id.eq_ignore_ascii_case("anthropic"))
+        .expect("anthropic registration");
+    let model = (registration.build)(
+        &definition,
+        "claude-3-5-sonnet-20241022",
+        &Credentials::ApiKey("test-key".into()),
+    )
+    .expect("build anthropic model");
+
+    let mut options = v2t::CallOptions::new(basic_prompt());
+    options.tools = vec![provider_tool(
+        "anthropic.web_fetch_20250910",
+        json!({
+            "maxUses": 1,
+            "allowedDomains": ["example.com"],
+            "citations": {"enabled": true}
+        }),
+    )];
+
+    let err = match model.do_stream(options).await {
+        Ok(_) => panic!("closed localhost port should fail"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        SdkError::Transport(TransportError::Network(_))
+    ));
+
+    let wire_body = observer
+        .request_json_for_url(&wire_url)
+        .expect("captured Anthropic wire request");
+    assert!(
+        !contains_object_null(&wire_body),
+        "registry-built Anthropic transport should keep object nulls off the wire: {wire_body}"
     );
 }
