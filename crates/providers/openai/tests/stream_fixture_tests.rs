@@ -1,9 +1,9 @@
-use crate::core::error::TransportError;
-use crate::core::transport::{HttpTransport, TransportConfig};
-use crate::core::LanguageModel;
-use crate::providers::openai::config::OpenAIConfig;
-use crate::providers::openai::responses::language_model::OpenAIResponsesLanguageModel;
-use crate::types::v2 as v2t;
+use crate::ai_sdk_core::error::TransportError;
+use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
+use crate::ai_sdk_core::LanguageModel;
+use crate::ai_sdk_providers_openai::config::OpenAIConfig;
+use crate::ai_sdk_providers_openai::responses::language_model::OpenAIResponsesLanguageModel;
+use crate::ai_sdk_types::v2 as v2t;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;

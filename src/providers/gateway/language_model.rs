@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
-use crate::core::request_builder::defaults::{build_call_options, request_overrides_from_json};
-use crate::core::transport::{HttpTransport, TransportConfig};
-use crate::core::{GenerateResponse, LanguageModel, PartStream, SdkError, StreamResponse};
-use crate::streaming_sse::SseDecoder;
-use crate::types::v2 as v2t;
+use crate::ai_sdk_core::request_builder::defaults::{
+    build_call_options, request_overrides_from_json,
+};
+use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
+use crate::ai_sdk_core::{
+    GenerateResponse, LanguageModel, PartStream, SdkError, StreamNormalizationState, StreamResponse,
+};
+use crate::ai_sdk_streaming_sse::SseDecoder;
+use crate::ai_sdk_types::v2 as v2t;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -15,20 +19,20 @@ use futures_util::StreamExt;
 use serde_json::Value as JsonValue;
 use tracing::instrument;
 
-use crate::providers::gateway::config::GatewayConfig;
-use crate::providers::gateway::error::map_transport_error;
+use crate::provider_gateway::config::GatewayConfig;
+use crate::provider_gateway::error::map_transport_error;
 
 const SPEC_VERSION_HEADER: &str = "ai-language-model-specification-version";
 const MODEL_ID_HEADER: &str = "ai-language-model-id";
 const STREAMING_HEADER: &str = "ai-language-model-streaming";
 
-pub struct GatewayLanguageModel<T: HttpTransport = crate::transport_reqwest::ReqwestTransport> {
+pub struct GatewayLanguageModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport> {
     pub model_id: String,
     pub config: GatewayConfig,
     pub http: T,
 }
 
-impl Default for GatewayLanguageModel<crate::transport_reqwest::ReqwestTransport> {
+impl Default for GatewayLanguageModel<crate::reqwest_transport::ReqwestTransport> {
     fn default() -> Self {
         let transport_cfg = TransportConfig::default();
         Self {
@@ -46,7 +50,7 @@ impl Default for GatewayLanguageModel<crate::transport_reqwest::ReqwestTransport
                 request_defaults: None,
                 auth: None,
             },
-            http: crate::transport_reqwest::ReqwestTransport::new(&transport_cfg),
+            http: crate::reqwest_transport::ReqwestTransport::new(&transport_cfg),
         }
     }
 }
@@ -263,7 +267,9 @@ where
                 request_overrides_from_json(&self.config.provider_scope_name, defaults)
             {
                 let disallow = ["model", "prompt", "stream", "tools", "input"];
-                crate::core::options::merge_options_with_disallow(&mut body, &overrides, &disallow);
+                crate::ai_sdk_core::options::merge_options_with_disallow(
+                    &mut body, &overrides, &disallow,
+                );
             }
         }
 
@@ -326,7 +332,9 @@ where
                 request_overrides_from_json(&self.config.provider_scope_name, defaults)
             {
                 let disallow = ["model", "prompt", "stream", "tools", "input"];
-                crate::core::options::merge_options_with_disallow(&mut body, &overrides, &disallow);
+                crate::ai_sdk_core::options::merge_options_with_disallow(
+                    &mut body, &overrides, &disallow,
+                );
             }
         }
         let headers = self.merge_headers(&options.headers, true);
@@ -419,16 +427,30 @@ where
     })
 }
 
-#[derive(Default)]
 struct GatewayStreamState {
     stream_started: bool,
+    normalizer: StreamNormalizationState<()>,
+    pending_tool_end_metadata: HashMap<String, Option<v2t::ProviderMetadata>>,
     text_counter: usize,
     current_text_id: Option<String>,
-    active_text: HashSet<String>,
     reasoning_counter: usize,
     current_reasoning_id: Option<String>,
-    active_reasoning: HashSet<String>,
     finished_emitted: bool,
+}
+
+impl Default for GatewayStreamState {
+    fn default() -> Self {
+        Self {
+            stream_started: false,
+            normalizer: StreamNormalizationState::new(()),
+            pending_tool_end_metadata: HashMap::new(),
+            text_counter: 0,
+            current_text_id: None,
+            reasoning_counter: 0,
+            current_reasoning_id: None,
+            finished_emitted: false,
+        }
+    }
 }
 
 impl GatewayStreamState {
@@ -453,12 +475,9 @@ impl GatewayStreamState {
         match chunk_type {
             "text-start" => {
                 let id = self.ensure_text_id(value.get("id").and_then(|v| v.as_str()));
-                if self.active_text.insert(id.clone()) {
+                if self.normalizer.text_open.as_ref() != Some(&id) {
                     let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                    parts.push(v2t::StreamPart::TextStart {
-                        id,
-                        provider_metadata: metadata,
-                    });
+                    parts.extend(self.normalizer.open_text(id, metadata));
                 }
             }
             "text-delta" => {
@@ -472,39 +491,35 @@ impl GatewayStreamState {
                     return parts;
                 }
                 let id = self.ensure_text_id(value.get("id").and_then(|v| v.as_str()));
-                if self.active_text.insert(id.clone()) {
-                    let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                    parts.push(v2t::StreamPart::TextStart {
-                        id: id.clone(),
-                        provider_metadata: metadata,
-                    });
-                }
                 let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                parts.push(v2t::StreamPart::TextDelta {
-                    id,
+                let start_metadata = if self.normalizer.text_open.as_ref() != Some(&id) {
+                    metadata.clone()
+                } else {
+                    None
+                };
+                parts.extend(self.normalizer.push_text_delta(
+                    Some(id),
+                    "text-1",
                     delta,
-                    provider_metadata: metadata,
-                });
+                    start_metadata,
+                    metadata,
+                ));
             }
             "text-end" => {
                 let id = self.ensure_text_id(value.get("id").and_then(|v| v.as_str()));
-                if self.active_text.remove(&id) {
+                if self.normalizer.text_open.as_deref() == Some(id.as_str()) {
                     let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                    parts.push(v2t::StreamPart::TextEnd {
-                        id,
-                        provider_metadata: metadata,
-                    });
+                    if let Some(part) = self.normalizer.close_text(metadata) {
+                        parts.push(part);
+                    }
                 }
                 self.current_text_id = None;
             }
             "reasoning-start" => {
                 let id = self.ensure_reasoning_id(value.get("id").and_then(|v| v.as_str()));
-                if self.active_reasoning.insert(id.clone()) {
+                if self.normalizer.reasoning_open.as_ref() != Some(&id) {
                     let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                    parts.push(v2t::StreamPart::ReasoningStart {
-                        id,
-                        provider_metadata: metadata,
-                    });
+                    parts.extend(self.normalizer.open_reasoning(id, metadata));
                 }
             }
             "reasoning-delta" => {
@@ -518,28 +533,23 @@ impl GatewayStreamState {
                     return parts;
                 }
                 let id = self.ensure_reasoning_id(value.get("id").and_then(|v| v.as_str()));
-                if self.active_reasoning.insert(id.clone()) {
-                    let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                    parts.push(v2t::StreamPart::ReasoningStart {
-                        id: id.clone(),
-                        provider_metadata: metadata,
-                    });
-                }
                 let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                parts.push(v2t::StreamPart::ReasoningDelta {
-                    id,
-                    delta,
-                    provider_metadata: metadata,
-                });
+                if self.normalizer.reasoning_open.as_ref() != Some(&id) {
+                    parts.extend(self.normalizer.open_reasoning(id.clone(), metadata.clone()));
+                }
+                let _ = id;
+                parts.push(
+                    self.normalizer
+                        .push_reasoning_delta("reasoning-1", delta, metadata),
+                );
             }
             "reasoning-end" => {
                 let id = self.ensure_reasoning_id(value.get("id").and_then(|v| v.as_str()));
-                if self.active_reasoning.remove(&id) {
+                if self.normalizer.reasoning_open.as_deref() == Some(id.as_str()) {
                     let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                    parts.push(v2t::StreamPart::ReasoningEnd {
-                        id,
-                        provider_metadata: metadata,
-                    });
+                    if let Some(part) = self.normalizer.close_reasoning(metadata) {
+                        parts.push(part);
+                    }
                 }
                 self.current_reasoning_id = None;
             }
@@ -555,12 +565,12 @@ impl GatewayStreamState {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                    parts.push(v2t::StreamPart::ToolInputStart {
-                        id: id.to_string(),
+                    parts.push(self.normalizer.start_tool_call(
+                        id.to_string(),
                         tool_name,
                         provider_executed,
-                        provider_metadata: metadata,
-                    });
+                        metadata,
+                    ));
                 }
             }
             "tool-input-delta" => {
@@ -578,26 +588,19 @@ impl GatewayStreamState {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                    parts.push(v2t::StreamPart::ToolInputDelta {
-                        id: id.to_string(),
+                    parts.push(self.normalizer.push_tool_call_delta(
+                        id.to_string(),
                         delta,
                         provider_executed,
-                        provider_metadata: metadata,
-                    });
+                        metadata,
+                    ));
                 }
             }
             "tool-input-end" => {
                 if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
-                    let provider_executed = value
-                        .get("providerExecuted")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
                     let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                    parts.push(v2t::StreamPart::ToolInputEnd {
-                        id: id.to_string(),
-                        provider_executed,
-                        provider_metadata: metadata,
-                    });
+                    self.pending_tool_end_metadata
+                        .insert(id.to_string(), metadata);
                 }
             }
             "tool-call" => {
@@ -616,15 +619,27 @@ impl GatewayStreamState {
                         .get("providerExecuted")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    parts.push(v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                        tool_call_id: tool_call_id.to_string(),
-                        tool_name,
-                        input: input_json,
+                    let tool_call_id = tool_call_id.to_string();
+                    if !self.normalizer.tool_names.contains_key(&tool_call_id) {
+                        self.normalizer
+                            .tool_names
+                            .insert(tool_call_id.clone(), tool_name.clone());
+                    }
+                    self.normalizer
+                        .tool_args
+                        .insert(tool_call_id.clone(), input_json);
+                    let end_metadata = self
+                        .pending_tool_end_metadata
+                        .remove(&tool_call_id)
+                        .unwrap_or(None);
+                    parts.extend(self.normalizer.finish_tool_call(
+                        tool_call_id,
                         provider_executed,
-                        provider_metadata: None,
-                        dynamic: false,
-                        provider_options: None,
-                    }));
+                        end_metadata,
+                        None,
+                        false,
+                        None,
+                    ));
                 }
             }
             "tool-result" => {
@@ -708,11 +723,8 @@ impl GatewayStreamState {
                         .or_else(|| value.get("finish_reason")),
                 );
                 let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                parts.push(v2t::StreamPart::Finish {
-                    usage,
-                    finish_reason,
-                    provider_metadata: metadata,
-                });
+                self.normalizer.usage = usage;
+                parts.push(self.normalizer.finish_part(finish_reason, metadata));
                 self.finished_emitted = true;
             }
             "error" => {
@@ -912,8 +924,8 @@ fn content_from_value(value: Option<&JsonValue>) -> Result<Vec<v2t::Content>, Sd
 #[cfg(test)]
 mod tests {
     use super::decode_gateway_stream;
-    use crate::core::SdkError;
-    use crate::types::v2 as v2t;
+    use crate::ai_sdk_core::SdkError;
+    use crate::ai_sdk_types::v2 as v2t;
     use bytes::Bytes;
     use futures_util::{stream, TryStreamExt};
     use serde_json::json;

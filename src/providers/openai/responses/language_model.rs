@@ -3,17 +3,19 @@ use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use crate::core::error::{SdkError, TransportError};
-use crate::core::options::merge_options_with_disallow;
-use crate::core::request_builder::defaults::request_overrides_from_json;
-use crate::core::transport::{HttpTransport, JsonStreamWebsocketConnection, TransportConfig};
-use crate::core::{
+use crate::ai_sdk_core::error::{SdkError, TransportError};
+use crate::ai_sdk_core::options::merge_options_with_disallow;
+use crate::ai_sdk_core::request_builder::defaults::request_overrides_from_json;
+use crate::ai_sdk_core::transport::{
+    HttpTransport, JsonStreamWebsocketConnection, TransportConfig,
+};
+use crate::ai_sdk_core::{
     map_events_to_parts, EventMapperConfig, EventMapperHooks, EventMapperState, GenerateResponse,
     LanguageModel, LanguageModelTurnSession, StreamResponse,
 };
-use crate::streaming_sse::{PipelineBuilder, ProviderChunk, SseEvent};
-use crate::types::v2 as v2t;
-use crate::types::{Event, TokenUsage};
+use crate::ai_sdk_streaming_sse::{PipelineBuilder, ProviderChunk, SseEvent};
+use crate::ai_sdk_types::v2 as v2t;
+use crate::ai_sdk_types::{Event, TokenUsage};
 use base64::Engine;
 use futures_core::Stream;
 use futures_util::{stream, StreamExt};
@@ -25,8 +27,8 @@ use tokio::task::JoinHandle;
 use url::Url;
 use uuid::Uuid;
 
-use crate::providers::openai::config::OpenAIConfig;
-use crate::providers::openai::error::map_transport_error;
+use crate::provider_openai::config::OpenAIConfig;
+use crate::provider_openai::error::map_transport_error;
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, SdkError>> + Send>>;
 type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, SdkError>> + Send>>;
@@ -107,7 +109,7 @@ struct OpenAIResponsesTurnSession<'a, T: HttpTransport> {
 }
 
 pub struct OpenAIResponsesLanguageModel<
-    T: HttpTransport = crate::transport_reqwest::ReqwestTransport,
+    T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
 > {
     pub model_id: String,
     pub config: OpenAIConfig,
@@ -117,7 +119,7 @@ pub struct OpenAIResponsesLanguageModel<
     websocket_preconnect: Arc<Mutex<WebsocketPreconnectState>>,
 }
 
-impl Default for OpenAIResponsesLanguageModel<crate::transport_reqwest::ReqwestTransport> {
+impl Default for OpenAIResponsesLanguageModel<crate::reqwest_transport::ReqwestTransport> {
     fn default() -> Self {
         let cfg = TransportConfig::default();
         Self {
@@ -134,7 +136,7 @@ impl Default for OpenAIResponsesLanguageModel<crate::transport_reqwest::ReqwestT
                 default_options: None,
                 request_defaults: None,
             },
-            http: crate::transport_reqwest::ReqwestTransport::new(&cfg),
+            http: crate::reqwest_transport::ReqwestTransport::new(&cfg),
             transport_cfg: cfg,
             limiter: None,
             websocket_preconnect: Arc::new(Mutex::new(WebsocketPreconnectState::default())),
@@ -241,13 +243,13 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
         hdrs.insert("content-type".into(), "application/json".into());
         hdrs.insert("accept".into(), "application/json".into());
         for (k, v) in &self.config.headers {
-            if crate::core::options::is_internal_sdk_header(k) {
+            if crate::ai_sdk_core::options::is_internal_sdk_header(k) {
                 continue;
             }
             hdrs.insert(k.to_lowercase(), v.clone());
         }
         for (k, v) in extra {
-            if crate::core::options::is_internal_sdk_header(k) {
+            if crate::ai_sdk_core::options::is_internal_sdk_header(k) {
                 continue;
             }
             hdrs.insert(k.to_lowercase(), v.clone());
@@ -365,7 +367,7 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
     }
 }
 
-impl OpenAIResponsesLanguageModel<crate::transport_reqwest::ReqwestTransport> {
+impl OpenAIResponsesLanguageModel<crate::reqwest_transport::ReqwestTransport> {
     pub fn start_codex_websocket_preconnect(&mut self) {
         if !should_use_codex_oauth_websocket_transport(&self.config.endpoint_path) {
             return;
@@ -754,10 +756,10 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
 
     fn wrap_stream_state(
         &self,
-        parts: crate::core::PartStream,
+        parts: crate::ai_sdk_core::PartStream,
         request_body: Value,
         track_incremental_state: bool,
-    ) -> crate::core::PartStream {
+    ) -> crate::ai_sdk_core::PartStream {
         let state = Arc::clone(&self.state);
         Box::pin(async_stream::stream! {
             let mut stream = parts;
@@ -881,7 +883,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
     }
 
     async fn do_stream(&mut self, options: v2t::CallOptions) -> Result<StreamResponse, SdkError> {
-        let options = crate::core::request_builder::defaults::build_call_options(
+        let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
             options,
             &self.model.config.provider_scope_name,
             self.model.config.default_options.as_ref(),
@@ -1248,11 +1250,11 @@ fn response_headers_with_transport(
 }
 
 // Convenience constructor for default reqwest transport
-impl OpenAIResponsesLanguageModel<crate::transport_reqwest::ReqwestTransport> {
+impl OpenAIResponsesLanguageModel<crate::reqwest_transport::ReqwestTransport> {
     pub fn builder(
         model_id: impl Into<String>,
-    ) -> crate::providers::openai::provider::OpenAIResponsesBuilder {
-        crate::providers::openai::provider::OpenAIResponsesBuilder::new(model_id)
+    ) -> crate::provider_openai::provider::OpenAIResponsesBuilder {
+        crate::provider_openai::provider::OpenAIResponsesBuilder::new(model_id)
     }
 
     pub fn create_simple(
@@ -1282,7 +1284,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
         &self.model_id
     }
 
-    fn new_turn_session(&self) -> crate::core::BoxedLanguageModelTurnSession<'_> {
+    fn new_turn_session(&self) -> crate::ai_sdk_core::BoxedLanguageModelTurnSession<'_> {
         Box::new(OpenAIResponsesTurnSession::new(self))
     }
 
@@ -1291,7 +1293,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
     }
 
     async fn do_generate(&self, options: v2t::CallOptions) -> Result<GenerateResponse, SdkError> {
-        let options = crate::core::request_builder::defaults::build_call_options(
+        let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
             options,
             &self.config.provider_scope_name,
             self.config.default_options.as_ref(),
@@ -1398,7 +1400,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
     }
 
     async fn do_stream(&self, options: v2t::CallOptions) -> Result<StreamResponse, SdkError> {
-        let options = crate::core::request_builder::defaults::build_call_options(
+        let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
             options,
             &self.config.provider_scope_name,
             self.config.default_options.as_ref(),
@@ -3342,7 +3344,6 @@ struct OpenAIStreamExtras {
     logprobs: Vec<serde_json::Value>,
     message_annotations: HashMap<String, Vec<serde_json::Value>>,
     active_reasoning: HashMap<String, OpenAIReasoningState>,
-    open_text_ids: HashSet<String>,
     open_tool_inputs: HashSet<String>,
     tool_item_ids: HashMap<String, String>, // call_id -> item_id
     approval_request_id_map: HashMap<String, String>,
@@ -3425,12 +3426,13 @@ fn build_stream_mapper_config(
                     .extra
                     .message_annotations
                     .insert(item_id.to_string(), Vec::new());
-                if state.extra.open_text_ids.insert(item_id.to_string()) {
-                    let md = openai_item_metadata(item_id, []);
-                    return Some(vec![v2t::StreamPart::TextStart {
-                        id: item_id.to_string(),
-                        provider_metadata: Some(md),
-                    }]);
+                if state.text_open.as_deref() != Some(item_id) {
+                    return Some(
+                        state.open_text(
+                            item_id.to_string(),
+                            Some(openai_item_metadata(item_id, [])),
+                        ),
+                    );
                 }
             } else if key == "openai.text_delta" {
                 let item_id = value.get("item_id").and_then(|v| v.as_str())?;
@@ -3438,30 +3440,28 @@ fn build_stream_mapper_config(
                 if delta.is_empty() {
                     return None;
                 }
-                let mut out = Vec::new();
-                if !state.extra.open_text_ids.contains(item_id) {
-                    state.extra.open_text_ids.insert(item_id.to_string());
+                let start_metadata = if state.text_open.as_deref() != Some(item_id) {
                     state
                         .extra
                         .message_annotations
                         .entry(item_id.to_string())
                         .or_default();
-                    out.push(v2t::StreamPart::TextStart {
-                        id: item_id.to_string(),
-                        provider_metadata: Some(openai_item_metadata(item_id, [])),
-                    });
-                }
+                    Some(openai_item_metadata(item_id, []))
+                } else {
+                    None
+                };
                 if state.extra.logprobs_enabled {
                     if let Some(logprobs) = value.get("logprobs").filter(|v| !v.is_null()) {
                         state.extra.logprobs.push(logprobs.clone());
                     }
                 }
-                out.push(v2t::StreamPart::TextDelta {
-                    id: item_id.to_string(),
-                    delta: delta.to_string(),
-                    provider_metadata: None,
-                });
-                return Some(out);
+                return Some(state.push_text_delta(
+                    Some(item_id.to_string()),
+                    item_id,
+                    delta.to_string(),
+                    start_metadata,
+                    None,
+                ));
             } else if key == "openai.text_annotation" {
                 let item_id = value.get("item_id").and_then(|v| v.as_str())?;
                 let annotation = value.get("annotation")?.clone();
@@ -3564,7 +3564,6 @@ fn build_stream_mapper_config(
                     .message_annotations
                     .remove(item_id)
                     .unwrap_or_default();
-                state.extra.open_text_ids.remove(item_id);
                 let md = if annotations.is_empty() {
                     openai_item_metadata(item_id, [])
                 } else {
@@ -3573,10 +3572,10 @@ fn build_stream_mapper_config(
                         [("annotations".into(), serde_json::Value::Array(annotations))],
                     )
                 };
-                return Some(vec![v2t::StreamPart::TextEnd {
-                    id: item_id.to_string(),
-                    provider_metadata: Some(md),
-                }]);
+                if state.text_open.as_deref() == Some(item_id) {
+                    return state.close_text(Some(md)).map(|part| vec![part]);
+                }
+                return Some(vec![state.text_end_part(item_id.to_string(), Some(md))]);
             } else if key == "openai.error" {
                 state.extra.finish_hint = Some("error".into());
                 return Some(vec![v2t::StreamPart::Error {
@@ -3599,44 +3598,60 @@ fn build_stream_mapper_config(
                     .extra
                     .active_reasoning
                     .insert(item_id.to_string(), state_entry);
-                return Some(vec![v2t::StreamPart::ReasoningStart {
-                    id: format!("{item_id}:0"),
-                    provider_metadata: Some(openai_item_metadata(
+                return Some(state.open_reasoning(
+                    format!("{item_id}:0"),
+                    Some(openai_item_metadata(
                         item_id,
                         [("reasoningEncryptedContent".into(), enc)],
                     )),
-                }]);
+                ));
             } else if key == "openai.reasoning_summary_added" {
                 let item_id = value.get("item_id").and_then(|v| v.as_str())?;
                 let summary_index = value.get("summary_index").and_then(|v| v.as_u64())?;
                 if summary_index == 0 {
                     return None;
                 }
-                let reasoning_state = state.extra.active_reasoning.get_mut(item_id)?;
+                let (concluded_ids, enc) = {
+                    let reasoning_state = state.extra.active_reasoning.get_mut(item_id)?;
+                    let mut concluded_ids = Vec::new();
+                    for (idx, status) in reasoning_state.summary_parts.iter_mut() {
+                        if matches!(status, ReasoningSummaryStatus::CanConclude) {
+                            concluded_ids.push(*idx);
+                            *status = ReasoningSummaryStatus::Concluded;
+                        }
+                    }
+                    reasoning_state
+                        .summary_parts
+                        .insert(summary_index as u32, ReasoningSummaryStatus::Active);
+                    let enc = reasoning_state
+                        .encrypted_content
+                        .clone()
+                        .unwrap_or(serde_json::Value::Null);
+                    (concluded_ids, enc)
+                };
                 let mut out = Vec::new();
-                for (idx, status) in reasoning_state.summary_parts.iter_mut() {
-                    if matches!(status, ReasoningSummaryStatus::CanConclude) {
-                        out.push(v2t::StreamPart::ReasoningEnd {
-                            id: format!("{item_id}:{idx}"),
-                            provider_metadata: Some(openai_item_metadata(item_id, [])),
-                        });
-                        *status = ReasoningSummaryStatus::Concluded;
+                for idx in concluded_ids {
+                    let reasoning_id = format!("{item_id}:{idx}");
+                    if state.reasoning_open.as_deref() == Some(reasoning_id.as_str()) {
+                        if let Some(part) =
+                            state.close_reasoning(Some(openai_item_metadata(item_id, [])))
+                        {
+                            out.push(part);
+                        }
+                    } else {
+                        out.push(state.reasoning_end_part(
+                            reasoning_id,
+                            Some(openai_item_metadata(item_id, [])),
+                        ));
                     }
                 }
-                reasoning_state
-                    .summary_parts
-                    .insert(summary_index as u32, ReasoningSummaryStatus::Active);
-                let enc = reasoning_state
-                    .encrypted_content
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null);
-                out.push(v2t::StreamPart::ReasoningStart {
-                    id: format!("{item_id}:{summary_index}"),
-                    provider_metadata: Some(openai_item_metadata(
+                out.extend(state.open_reasoning(
+                    format!("{item_id}:{summary_index}"),
+                    Some(openai_item_metadata(
                         item_id,
                         [("reasoningEncryptedContent".into(), enc)],
                     )),
-                });
+                ));
                 return Some(out);
             } else if key == "openai.reasoning_summary_delta" {
                 let item_id = value.get("item_id").and_then(|v| v.as_str())?;
@@ -3645,27 +3660,40 @@ fn build_stream_mapper_config(
                 if delta.is_empty() {
                     return None;
                 }
-                return Some(vec![v2t::StreamPart::ReasoningDelta {
-                    id: format!("{item_id}:{summary_index}"),
-                    delta: delta.to_string(),
-                    provider_metadata: Some(openai_item_metadata(item_id, [])),
-                }]);
+                return Some(vec![state.push_reasoning_delta(
+                    &format!("{item_id}:{summary_index}"),
+                    delta.to_string(),
+                    Some(openai_item_metadata(item_id, [])),
+                )]);
             } else if key == "openai.reasoning_summary_done" {
                 let item_id = value.get("item_id").and_then(|v| v.as_str())?;
                 let summary_index = value.get("summary_index").and_then(|v| v.as_u64())?;
-                if let Some(reasoning_state) = state.extra.active_reasoning.get_mut(item_id) {
-                    if state.extra.store {
-                        reasoning_state
-                            .summary_parts
-                            .insert(summary_index as u32, ReasoningSummaryStatus::Concluded);
-                        return Some(vec![v2t::StreamPart::ReasoningEnd {
-                            id: format!("{item_id}:{summary_index}"),
-                            provider_metadata: Some(openai_item_metadata(item_id, [])),
-                        }]);
+                let should_close =
+                    if let Some(reasoning_state) = state.extra.active_reasoning.get_mut(item_id) {
+                        if state.extra.store {
+                            reasoning_state
+                                .summary_parts
+                                .insert(summary_index as u32, ReasoningSummaryStatus::Concluded);
+                            Some(format!("{item_id}:{summary_index}"))
+                        } else {
+                            reasoning_state
+                                .summary_parts
+                                .insert(summary_index as u32, ReasoningSummaryStatus::CanConclude);
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(reasoning_id) = should_close {
+                    if state.reasoning_open.as_deref() == Some(reasoning_id.as_str()) {
+                        return state
+                            .close_reasoning(Some(openai_item_metadata(item_id, [])))
+                            .map(|part| vec![part]);
                     }
-                    reasoning_state
-                        .summary_parts
-                        .insert(summary_index as u32, ReasoningSummaryStatus::CanConclude);
+                    return Some(vec![state.reasoning_end_part(
+                        reasoning_id,
+                        Some(openai_item_metadata(item_id, [])),
+                    )]);
                 }
             } else if key == "openai.reasoning_done" {
                 let item_id = value.get("item_id").and_then(|v| v.as_str())?;
@@ -3682,10 +3710,14 @@ fn build_stream_mapper_config(
                             status,
                             ReasoningSummaryStatus::Active | ReasoningSummaryStatus::CanConclude
                         ) {
-                            out.push(v2t::StreamPart::ReasoningEnd {
-                                id: format!("{item_id}:{idx}"),
-                                provider_metadata: Some(md.clone()),
-                            });
+                            let reasoning_id = format!("{item_id}:{idx}");
+                            if state.reasoning_open.as_deref() == Some(reasoning_id.as_str()) {
+                                if let Some(part) = state.close_reasoning(Some(md.clone())) {
+                                    out.push(part);
+                                }
+                            } else {
+                                out.push(state.reasoning_end_part(reasoning_id, Some(md.clone())));
+                            }
                         }
                     }
                     if !out.is_empty() {
@@ -3711,28 +3743,12 @@ fn build_stream_mapper_config(
                     .extra
                     .emitted_tool_calls
                     .insert(tool_call_id.to_string());
-                return Some(vec![
-                    v2t::StreamPart::ToolInputStart {
-                        id: tool_call_id.to_string(),
-                        tool_name: tool_name.clone(),
-                        provider_executed: true,
-                        provider_metadata: None,
-                    },
-                    v2t::StreamPart::ToolInputEnd {
-                        id: tool_call_id.to_string(),
-                        provider_executed: true,
-                        provider_metadata: None,
-                    },
-                    v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                        tool_call_id: tool_call_id.to_string(),
-                        tool_name,
-                        input: "{}".into(),
-                        provider_executed: true,
-                        provider_metadata: None,
-                        dynamic: false,
-                        provider_options: None,
-                    }),
-                ]);
+                let tool_call_id = tool_call_id.to_string();
+                let mut out =
+                    vec![state.start_tool_call(tool_call_id.clone(), tool_name, true, None)];
+                state.tool_args.insert(tool_call_id.clone(), "{}".into());
+                out.extend(state.finish_tool_call(tool_call_id, true, None, None, false, None));
+                return Some(out);
             } else if key == "openai.file_search_call.added" {
                 let tool_call_id = value.get("tool_call_id").and_then(|v| v.as_str())?;
                 let tool_name = state
@@ -3745,15 +3761,15 @@ fn build_stream_mapper_config(
                     .extra
                     .emitted_tool_calls
                     .insert(tool_call_id.to_string());
-                return Some(vec![v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                    tool_call_id: tool_call_id.to_string(),
+                return Some(vec![state.tool_call_part(
+                    tool_call_id.to_string(),
                     tool_name,
-                    input: "{}".into(),
-                    provider_executed: true,
-                    provider_metadata: None,
-                    dynamic: false,
-                    provider_options: None,
-                })]);
+                    "{}".into(),
+                    true,
+                    None,
+                    false,
+                    None,
+                )]);
             } else if key == "openai.image_generation_call.added" {
                 let tool_call_id = value.get("tool_call_id").and_then(|v| v.as_str())?;
                 let tool_name = state
@@ -3766,15 +3782,15 @@ fn build_stream_mapper_config(
                     .extra
                     .emitted_tool_calls
                     .insert(tool_call_id.to_string());
-                return Some(vec![v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                    tool_call_id: tool_call_id.to_string(),
+                return Some(vec![state.tool_call_part(
+                    tool_call_id.to_string(),
                     tool_name,
-                    input: "{}".into(),
-                    provider_executed: true,
-                    provider_metadata: None,
-                    dynamic: false,
-                    provider_options: None,
-                })]);
+                    "{}".into(),
+                    true,
+                    None,
+                    false,
+                    None,
+                )]);
             } else if key == "openai.image_generation_call.partial" {
                 let tool_call_id = value.get("tool_call_id").and_then(|v| v.as_str())?;
                 let partial = value.get("partial_image_b64").and_then(|v| v.as_str())?;
@@ -3813,21 +3829,16 @@ fn build_stream_mapper_config(
                     .to_string();
                 let cid = container_id.unwrap_or_default();
                 return Some(vec![
-                    v2t::StreamPart::ToolInputStart {
-                        id: tool_call_id.to_string(),
-                        tool_name,
-                        provider_executed: true,
-                        provider_metadata: None,
-                    },
-                    v2t::StreamPart::ToolInputDelta {
-                        id: tool_call_id.to_string(),
-                        delta: format!(
+                    state.start_tool_call(tool_call_id.to_string(), tool_name, true, None),
+                    state.push_tool_call_delta(
+                        tool_call_id.to_string(),
+                        format!(
                             "{{\"containerId\":\"{}\",\"code\":\"",
                             escape_json_delta(&cid)
                         ),
-                        provider_executed: true,
-                        provider_metadata: None,
-                    },
+                        true,
+                        None,
+                    ),
                 ]);
             } else if key == "openai.code_interpreter_call.code_delta" {
                 let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
@@ -3836,47 +3847,30 @@ fn build_stream_mapper_config(
                     return None;
                 }
                 if let Some(call_state) = state.extra.code_interpreter_calls.get(&output_index) {
-                    return Some(vec![v2t::StreamPart::ToolInputDelta {
-                        id: call_state.tool_call_id.clone(),
-                        delta: escape_json_delta(delta),
-                        provider_executed: true,
-                        provider_metadata: None,
-                    }]);
+                    return Some(vec![state.push_tool_call_delta(
+                        call_state.tool_call_id.clone(),
+                        escape_json_delta(delta),
+                        true,
+                        None,
+                    )]);
                 }
             } else if key == "openai.code_interpreter_call.code_done" {
                 let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
-                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("");
                 if let Some(call_state) = state.extra.code_interpreter_calls.remove(&output_index) {
-                    let mut out = Vec::new();
-                    out.push(v2t::StreamPart::ToolInputDelta {
-                        id: call_state.tool_call_id.clone(),
-                        delta: "\"}".into(),
-                        provider_executed: true,
-                        provider_metadata: None,
-                    });
-                    out.push(v2t::StreamPart::ToolInputEnd {
-                        id: call_state.tool_call_id.clone(),
-                        provider_executed: true,
-                        provider_metadata: None,
-                    });
-                    let input = json!({
-                        "code": code,
-                        "containerId": call_state.container_id,
-                    })
-                    .to_string();
-                    out.push(v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                        tool_call_id: call_state.tool_call_id.clone(),
-                        tool_name: state
-                            .extra
-                            .tool_name_mapping
-                            .to_custom_tool_name("code_interpreter")
-                            .to_string(),
-                        input,
-                        provider_executed: true,
-                        provider_metadata: None,
-                        dynamic: false,
-                        provider_options: None,
-                    }));
+                    let mut out = vec![state.push_tool_call_delta(
+                        call_state.tool_call_id.clone(),
+                        "\"}".into(),
+                        true,
+                        None,
+                    )];
+                    out.extend(state.finish_tool_call(
+                        call_state.tool_call_id.clone(),
+                        true,
+                        None,
+                        None,
+                        false,
+                        None,
+                    ));
                     state
                         .extra
                         .emitted_tool_calls
@@ -3890,16 +3884,16 @@ fn build_stream_mapper_config(
                     .open_tool_inputs
                     .insert(tool_call_id.to_string());
                 state.has_tool_calls = true;
-                return Some(vec![v2t::StreamPart::ToolInputStart {
-                    id: tool_call_id.to_string(),
-                    tool_name: state
+                return Some(vec![state.start_tool_call(
+                    tool_call_id.to_string(),
+                    state
                         .extra
                         .tool_name_mapping
                         .to_custom_tool_name("computer_use")
                         .to_string(),
-                    provider_executed: true,
-                    provider_metadata: None,
-                }]);
+                    true,
+                    None,
+                )]);
             } else if key == "openai.apply_patch_call.added" {
                 let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
                 let call_id = value.get("call_id").and_then(|v| v.as_str())?;
@@ -3926,29 +3920,16 @@ fn build_stream_mapper_config(
                     has_diff: false,
                     end_emitted: false,
                 };
-                let mut out = vec![v2t::StreamPart::ToolInputStart {
-                    id: call_id.to_string(),
-                    tool_name,
-                    provider_executed: false,
-                    provider_metadata: None,
-                }];
+                let mut out =
+                    vec![state.start_tool_call(call_id.to_string(), tool_name, false, None)];
                 if operation_type == "delete_file" {
                     let input = json!({
                         "callId": call_id,
                         "operation": operation,
                     })
                     .to_string();
-                    out.push(v2t::StreamPart::ToolInputDelta {
-                        id: call_id.to_string(),
-                        delta: input,
-                        provider_executed: false,
-                        provider_metadata: None,
-                    });
-                    out.push(v2t::StreamPart::ToolInputEnd {
-                        id: call_id.to_string(),
-                        provider_executed: false,
-                        provider_metadata: None,
-                    });
+                    out.push(state.push_tool_call_delta(call_id.to_string(), input, false, None));
+                    out.push(state.tool_input_end_part(call_id.to_string(), false, None));
                     call_state.has_diff = true;
                     call_state.end_emitted = true;
                 } else {
@@ -3959,12 +3940,7 @@ fn build_stream_mapper_config(
                         escape_json_delta(operation_type),
                         escape_json_delta(path)
                     );
-                    out.push(v2t::StreamPart::ToolInputDelta {
-                        id: call_id.to_string(),
-                        delta,
-                        provider_executed: false,
-                        provider_metadata: None,
-                    });
+                    out.push(state.push_tool_call_delta(call_id.to_string(), delta, false, None));
                 }
                 state.has_tool_calls = true;
                 state
@@ -3981,43 +3957,50 @@ fn build_stream_mapper_config(
                     }
                     if !delta.is_empty() {
                         call_state.has_diff = true;
-                        return Some(vec![v2t::StreamPart::ToolInputDelta {
-                            id: call_state.tool_call_id.clone(),
-                            delta: escape_json_delta(delta),
-                            provider_executed: false,
-                            provider_metadata: None,
-                        }]);
+                        let tool_call_id = call_state.tool_call_id.clone();
+                        return Some(vec![state.push_tool_call_delta(
+                            tool_call_id,
+                            escape_json_delta(delta),
+                            false,
+                            None,
+                        )]);
                     }
                 }
             } else if key == "openai.apply_patch_call.diff.done" {
                 let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
                 let diff = value.get("diff").and_then(|v| v.as_str()).unwrap_or("");
-                if let Some(call_state) = state.extra.apply_patch_calls.get_mut(&output_index) {
-                    if call_state.end_emitted {
-                        return None;
-                    }
+                if let Some((tool_call_id, should_emit_diff)) = state
+                    .extra
+                    .apply_patch_calls
+                    .get_mut(&output_index)
+                    .and_then(|call_state| {
+                        if call_state.end_emitted {
+                            return None;
+                        }
+                        let should_emit_diff = !call_state.has_diff;
+                        if should_emit_diff {
+                            call_state.has_diff = true;
+                        }
+                        call_state.end_emitted = true;
+                        Some((call_state.tool_call_id.clone(), should_emit_diff))
+                    })
+                {
                     let mut out = Vec::new();
-                    if !call_state.has_diff {
-                        call_state.has_diff = true;
-                        out.push(v2t::StreamPart::ToolInputDelta {
-                            id: call_state.tool_call_id.clone(),
-                            delta: escape_json_delta(diff),
-                            provider_executed: false,
-                            provider_metadata: None,
-                        });
+                    if should_emit_diff {
+                        out.push(state.push_tool_call_delta(
+                            tool_call_id.clone(),
+                            escape_json_delta(diff),
+                            false,
+                            None,
+                        ));
                     }
-                    out.push(v2t::StreamPart::ToolInputDelta {
-                        id: call_state.tool_call_id.clone(),
-                        delta: "\"}}".into(),
-                        provider_executed: false,
-                        provider_metadata: None,
-                    });
-                    out.push(v2t::StreamPart::ToolInputEnd {
-                        id: call_state.tool_call_id.clone(),
-                        provider_executed: false,
-                        provider_metadata: None,
-                    });
-                    call_state.end_emitted = true;
+                    out.push(state.push_tool_call_delta(
+                        tool_call_id.clone(),
+                        "\"}}".into(),
+                        false,
+                        None,
+                    ));
+                    out.push(state.tool_input_end_part(tool_call_id, false, None));
                     return Some(out);
                 }
             } else if key == "openai.apply_patch_call.done" {
@@ -4034,24 +4017,24 @@ fn build_stream_mapper_config(
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         call_state.has_diff = true;
-                        out.push(v2t::StreamPart::ToolInputDelta {
-                            id: call_state.tool_call_id.clone(),
-                            delta: escape_json_delta(diff),
-                            provider_executed: false,
-                            provider_metadata: None,
-                        });
+                        out.push(state.push_tool_call_delta(
+                            call_state.tool_call_id.clone(),
+                            escape_json_delta(diff),
+                            false,
+                            None,
+                        ));
                     }
-                    out.push(v2t::StreamPart::ToolInputDelta {
-                        id: call_state.tool_call_id.clone(),
-                        delta: "\"}}".into(),
-                        provider_executed: false,
-                        provider_metadata: None,
-                    });
-                    out.push(v2t::StreamPart::ToolInputEnd {
-                        id: call_state.tool_call_id.clone(),
-                        provider_executed: false,
-                        provider_metadata: None,
-                    });
+                    out.push(state.push_tool_call_delta(
+                        call_state.tool_call_id.clone(),
+                        "\"}}".into(),
+                        false,
+                        None,
+                    ));
+                    out.push(state.tool_input_end_part(
+                        call_state.tool_call_id.clone(),
+                        false,
+                        None,
+                    ));
                     call_state.end_emitted = true;
                     return Some(out);
                 }
@@ -4072,15 +4055,15 @@ fn build_stream_mapper_config(
                             .approval_request_id_map
                             .insert(approval_id.clone(), tool_call_id.clone());
                         return Some(vec![
-                            v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                                tool_call_id: tool_call_id.clone(),
-                                tool_name: parts.tool_name,
-                                input: parts.input,
-                                provider_executed: parts.provider_executed,
-                                provider_metadata: None,
-                                dynamic: parts.dynamic,
-                                provider_options: None,
-                            }),
+                            state.tool_call_part(
+                                tool_call_id.clone(),
+                                parts.tool_name,
+                                parts.input,
+                                parts.provider_executed,
+                                None,
+                                parts.dynamic,
+                                None,
+                            ),
                             v2t::StreamPart::ToolApprovalRequest {
                                 approval_id,
                                 tool_call_id,
@@ -4106,11 +4089,7 @@ fn build_stream_mapper_config(
                     let mut out = Vec::new();
                     if tool_type == "computer_use" {
                         if state.extra.open_tool_inputs.remove(&tool_call_id) {
-                            out.push(v2t::StreamPart::ToolInputEnd {
-                                id: tool_call_id.clone(),
-                                provider_executed: true,
-                                provider_metadata: None,
-                            });
+                            out.push(state.tool_input_end_part(tool_call_id.clone(), true, None));
                         }
                     }
                     let skip_tool_call =
@@ -4119,15 +4098,15 @@ fn build_stream_mapper_config(
                             "web_search" | "file_search" | "image_generation" | "code_interpreter"
                         ) && state.extra.emitted_tool_calls.contains(&tool_call_id);
                     if !skip_tool_call {
-                        out.push(v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                            tool_call_id: tool_call_id.clone(),
-                            tool_name: parts.tool_name.clone(),
-                            input: parts.input,
-                            provider_executed: parts.provider_executed,
-                            provider_metadata: tool_call_metadata,
-                            dynamic: parts.dynamic,
-                            provider_options: None,
-                        }));
+                        out.push(state.tool_call_part(
+                            tool_call_id.clone(),
+                            parts.tool_name.clone(),
+                            parts.input,
+                            parts.provider_executed,
+                            tool_call_metadata,
+                            parts.dynamic,
+                            None,
+                        ));
                     }
                     if let Some(result) = parts.result.take() {
                         out.push(v2t::StreamPart::ToolResult {

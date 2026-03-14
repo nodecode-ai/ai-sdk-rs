@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::types::v2 as v2t;
-use crate::types::Event as ProviderEvent;
+use crate::ai_sdk_types::v2 as v2t;
+use crate::ai_sdk_types::Event as ProviderEvent;
 use async_stream::try_stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -11,22 +11,37 @@ use crate::core::v2::PartStream;
 
 pub type ProviderMetadata = HashMap<String, HashMap<String, serde_json::Value>>;
 
+pub struct StreamNormalizationState<Extra> {
+    pub text_open: Option<String>,
+    pub reasoning_open: Option<String>,
+    pub tool_args: HashMap<String, String>,
+    pub tool_names: HashMap<String, String>,
+    pub usage: v2t::Usage,
+    pub has_tool_calls: bool,
+    pub extra: Extra,
+}
+
+pub type EventMapperState<Extra> = StreamNormalizationState<Extra>;
+
 type MetaFn<Extra> =
-    Box<dyn FnMut(&mut EventMapperState<Extra>) -> Option<ProviderMetadata> + Send>;
-type ToolMetaFn<Extra> =
-    Box<dyn FnMut(&mut EventMapperState<Extra>, &str, &str) -> Option<ProviderMetadata> + Send>;
+    Box<dyn FnMut(&mut StreamNormalizationState<Extra>) -> Option<ProviderMetadata> + Send>;
+type ToolMetaFn<Extra> = Box<
+    dyn FnMut(&mut StreamNormalizationState<Extra>, &str, &str) -> Option<ProviderMetadata> + Send,
+>;
 type ToolEndMetaFn<Extra> =
-    Box<dyn FnMut(&mut EventMapperState<Extra>, &str) -> Option<ProviderMetadata> + Send>;
+    Box<dyn FnMut(&mut StreamNormalizationState<Extra>, &str) -> Option<ProviderMetadata> + Send>;
 type DataFn<Extra> = Box<
     dyn FnMut(
-            &mut EventMapperState<Extra>,
+            &mut StreamNormalizationState<Extra>,
             &str,
             &serde_json::Value,
         ) -> Option<Vec<v2t::StreamPart>>
         + Send,
 >;
-type FinishFn<Extra> =
-    Box<dyn Fn(&EventMapperState<Extra>) -> (v2t::FinishReason, Option<ProviderMetadata>) + Send>;
+type FinishFn<Extra> = Box<
+    dyn Fn(&StreamNormalizationState<Extra>) -> (v2t::FinishReason, Option<ProviderMetadata>)
+        + Send,
+>;
 
 /// Hooks for provider-specific stream handling.
 #[derive(Default)]
@@ -48,18 +63,8 @@ pub struct EventMapperConfig<Extra> {
     pub hooks: EventMapperHooks<Extra>,
 }
 
-pub struct EventMapperState<Extra> {
-    pub text_open: Option<String>,
-    pub reasoning_open: Option<String>,
-    pub tool_args: HashMap<String, String>,
-    pub tool_names: HashMap<String, String>,
-    pub usage: v2t::Usage,
-    pub has_tool_calls: bool,
-    pub extra: Extra,
-}
-
-impl<Extra> EventMapperState<Extra> {
-    fn new(extra: Extra) -> Self {
+impl<Extra> StreamNormalizationState<Extra> {
+    pub fn new(extra: Extra) -> Self {
         Self {
             text_open: None,
             reasoning_open: None,
@@ -68,6 +73,262 @@ impl<Extra> EventMapperState<Extra> {
             usage: v2t::Usage::default(),
             has_tool_calls: false,
             extra,
+        }
+    }
+
+    pub fn open_text(
+        &mut self,
+        id: String,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> Vec<v2t::StreamPart> {
+        let mut parts = Vec::new();
+        if self.text_open.as_ref() != Some(&id) {
+            if let Some(open_id) = self.text_open.replace(id.clone()) {
+                parts.push(v2t::StreamPart::TextEnd {
+                    id: open_id,
+                    provider_metadata: None,
+                });
+            }
+            parts.push(v2t::StreamPart::TextStart {
+                id,
+                provider_metadata,
+            });
+        }
+        parts
+    }
+
+    pub fn push_text_delta(
+        &mut self,
+        id: Option<String>,
+        default_text_id: &str,
+        delta: String,
+        start_metadata: Option<ProviderMetadata>,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> Vec<v2t::StreamPart> {
+        let id = id
+            .or_else(|| self.text_open.clone())
+            .unwrap_or_else(|| default_text_id.to_string());
+        let mut parts = Vec::new();
+        parts.extend(self.open_text(id.clone(), start_metadata));
+        parts.push(v2t::StreamPart::TextDelta {
+            id,
+            delta,
+            provider_metadata,
+        });
+        parts
+    }
+
+    pub fn close_text(
+        &mut self,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> Option<v2t::StreamPart> {
+        self.text_open
+            .take()
+            .map(|id| self.text_end_part(id, provider_metadata))
+    }
+
+    pub fn text_end_part(
+        &self,
+        id: String,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> v2t::StreamPart {
+        v2t::StreamPart::TextEnd {
+            id,
+            provider_metadata,
+        }
+    }
+
+    pub fn open_reasoning(
+        &mut self,
+        id: String,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> Vec<v2t::StreamPart> {
+        let mut parts = Vec::new();
+        if self.reasoning_open.as_ref() != Some(&id) {
+            if let Some(open_id) = self.reasoning_open.replace(id.clone()) {
+                parts.push(v2t::StreamPart::ReasoningEnd {
+                    id: open_id,
+                    provider_metadata: None,
+                });
+            }
+            parts.push(v2t::StreamPart::ReasoningStart {
+                id,
+                provider_metadata,
+            });
+        }
+        parts
+    }
+
+    pub fn push_reasoning_delta(
+        &mut self,
+        default_reasoning_id: &str,
+        delta: String,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> v2t::StreamPart {
+        let id = self
+            .reasoning_open
+            .clone()
+            .unwrap_or_else(|| default_reasoning_id.to_string());
+        v2t::StreamPart::ReasoningDelta {
+            id,
+            delta,
+            provider_metadata,
+        }
+    }
+
+    pub fn close_reasoning(
+        &mut self,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> Option<v2t::StreamPart> {
+        self.reasoning_open
+            .take()
+            .map(|id| self.reasoning_end_part(id, provider_metadata))
+    }
+
+    pub fn reasoning_end_part(
+        &self,
+        id: String,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> v2t::StreamPart {
+        v2t::StreamPart::ReasoningEnd {
+            id,
+            provider_metadata,
+        }
+    }
+
+    pub fn start_tool_call(
+        &mut self,
+        id: String,
+        name: String,
+        provider_executed: bool,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> v2t::StreamPart {
+        self.has_tool_calls = true;
+        self.tool_names.insert(id.clone(), name.clone());
+        v2t::StreamPart::ToolInputStart {
+            id,
+            tool_name: name,
+            provider_executed,
+            provider_metadata,
+        }
+    }
+
+    pub fn push_tool_call_delta(
+        &mut self,
+        id: String,
+        args_json: String,
+        provider_executed: bool,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> v2t::StreamPart {
+        self.tool_args
+            .entry(id.clone())
+            .or_default()
+            .push_str(&args_json);
+        v2t::StreamPart::ToolInputDelta {
+            id,
+            delta: args_json,
+            provider_executed,
+            provider_metadata,
+        }
+    }
+
+    pub fn finish_tool_call(
+        &mut self,
+        id: String,
+        provider_executed: bool,
+        input_end_metadata: Option<ProviderMetadata>,
+        call_metadata: Option<ProviderMetadata>,
+        dynamic: bool,
+        provider_options: Option<v2t::ProviderOptions>,
+    ) -> Vec<v2t::StreamPart> {
+        let mut parts =
+            vec![self.tool_input_end_part(id.clone(), provider_executed, input_end_metadata)];
+        let name = self.tool_names.remove(&id).unwrap_or_default();
+        if let Some(args) = self.tool_args.remove(&id) {
+            parts.push(self.tool_call_part(
+                id,
+                name,
+                args,
+                provider_executed,
+                call_metadata,
+                dynamic,
+                provider_options,
+            ));
+        }
+        parts
+    }
+
+    pub fn tool_input_end_part(
+        &self,
+        id: String,
+        provider_executed: bool,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> v2t::StreamPart {
+        v2t::StreamPart::ToolInputEnd {
+            id,
+            provider_executed,
+            provider_metadata,
+        }
+    }
+
+    pub fn tool_call_part(
+        &self,
+        tool_call_id: String,
+        tool_name: String,
+        input: String,
+        provider_executed: bool,
+        provider_metadata: Option<ProviderMetadata>,
+        dynamic: bool,
+        provider_options: Option<v2t::ProviderOptions>,
+    ) -> v2t::StreamPart {
+        v2t::StreamPart::ToolCall(v2t::ToolCallPart {
+            tool_call_id,
+            tool_name,
+            input,
+            provider_executed,
+            provider_metadata,
+            dynamic,
+            provider_options,
+        })
+    }
+
+    pub fn apply_usage(&mut self, usage: &crate::ai_sdk_types::TokenUsage) {
+        self.usage.input_tokens = Some(usage.input_tokens as u64);
+        self.usage.output_tokens = Some(usage.output_tokens as u64);
+        self.usage.total_tokens = Some(usage.total_tokens as u64);
+        self.usage.cached_input_tokens = usage.cache_read_tokens.map(|v| v as u64);
+    }
+
+    pub fn finish_stream(
+        &mut self,
+        finish: Option<(v2t::FinishReason, Option<ProviderMetadata>)>,
+        finish_reason_fallback: v2t::FinishReason,
+    ) -> Vec<v2t::StreamPart> {
+        let mut parts = Vec::new();
+        if let Some(part) = self.close_text(None) {
+            parts.push(part);
+        }
+        if let Some(part) = self.close_reasoning(None) {
+            parts.push(part);
+        }
+        let (finish_reason, provider_metadata) = match finish {
+            Some(finish) => finish,
+            None if self.has_tool_calls => (v2t::FinishReason::ToolCalls, None),
+            None => (finish_reason_fallback, None),
+        };
+        parts.push(self.finish_part(finish_reason, provider_metadata));
+        parts
+    }
+
+    pub fn finish_part(
+        &self,
+        finish_reason: v2t::FinishReason,
+        provider_metadata: Option<ProviderMetadata>,
+    ) -> v2t::StreamPart {
+        v2t::StreamPart::Finish {
+            usage: self.usage.clone(),
+            finish_reason,
+            provider_metadata,
         }
     }
 }
@@ -80,87 +341,86 @@ where
     S: Stream<Item = Result<ProviderEvent, SdkError>> + Send + 'static,
 {
     Box::pin(try_stream! {
-        let mut state = EventMapperState::new(cfg.initial_extra);
+        let mut state = StreamNormalizationState::new(cfg.initial_extra);
         yield v2t::StreamPart::StreamStart { warnings: cfg.warnings };
 
         futures_util::pin_mut!(stream);
         while let Some(evt) = stream.next().await {
             match evt? {
                 ProviderEvent::TextDelta { delta } => {
-                    let id = if let Some(id) = &state.text_open {
-                        id.clone()
-                    } else {
-                        let id = cfg.default_text_id.to_string();
+                    let start_metadata = if state.text_open.is_none() {
                         if let Some(f) = cfg.hooks.text_start_metadata.as_mut() {
-                            let md = f(&mut state);
-                            yield v2t::StreamPart::TextStart { id: id.clone(), provider_metadata: md };
+                            f(&mut state)
                         } else {
-                            yield v2t::StreamPart::TextStart { id: id.clone(), provider_metadata: None };
+                            None
                         }
-                        state.text_open = Some(id.clone());
-                        id
+                    } else {
+                        None
                     };
-                    yield v2t::StreamPart::TextDelta { id, delta, provider_metadata: None };
+                    for part in state.push_text_delta(
+                        None,
+                        cfg.default_text_id,
+                        delta,
+                        start_metadata,
+                        None,
+                    ) {
+                        yield part;
+                    }
                 }
                 ProviderEvent::ReasoningStart { id } => {
-                    state.reasoning_open = Some(id.clone());
                     let md = if let Some(f) = cfg.hooks.reasoning_start_metadata.as_mut() {
                         f(&mut state)
                     } else {
                         None
                     };
-                    yield v2t::StreamPart::ReasoningStart { id, provider_metadata: md };
+                    for part in state.open_reasoning(id, md) {
+                        yield part;
+                    }
                 }
                 ProviderEvent::ReasoningDelta { delta } => {
-                    let id = state.reasoning_open.clone().unwrap_or_else(|| "reasoning-1".into());
-                    yield v2t::StreamPart::ReasoningDelta { id, delta, provider_metadata: None };
+                    yield state.push_reasoning_delta("reasoning-1", delta, None);
                 }
                 ProviderEvent::ReasoningEnd => {
-                    if let Some(id) = state.reasoning_open.take() {
-                        yield v2t::StreamPart::ReasoningEnd { id, provider_metadata: None };
+                    if let Some(part) = state.close_reasoning(None) {
+                        yield part;
                     }
                 }
                 ProviderEvent::ToolCallStart { id, name } => {
-                    state.has_tool_calls = true;
                     let treat_as_text = cfg.treat_tool_names_as_text.contains(&name);
-                    state.tool_names.insert(id.clone(), name.clone());
                     if treat_as_text {
+                        state.tool_names.insert(id.clone(), name.clone());
                         let md = if let Some(f) = cfg.hooks.text_start_metadata.as_mut() {
                             f(&mut state)
                         } else {
                             None
                         };
-                        yield v2t::StreamPart::TextStart { id, provider_metadata: md };
+                        yield v2t::StreamPart::TextStart {
+                            id,
+                            provider_metadata: md,
+                        };
                     } else {
                         let md = if let Some(f) = cfg.hooks.tool_start_metadata.as_mut() {
                             f(&mut state, &id, &name)
                         } else {
                             None
                         };
-                        yield v2t::StreamPart::ToolInputStart {
-                            id,
-                            tool_name: name,
-                            provider_executed: false,
-                            provider_metadata: md,
-                        };
+                        yield state.start_tool_call(id, name, false, md);
                     }
                 }
                 ProviderEvent::ToolCallDelta { id, args_json } => {
-                    let _ = state.tool_args.entry(id.clone()).or_insert_with(String::new).push_str(&args_json);
                     let treat_as_text = state
                         .tool_names
                         .get(&id)
                         .map(|n| cfg.treat_tool_names_as_text.contains(n))
                         .unwrap_or(false);
                     if treat_as_text {
-                        yield v2t::StreamPart::TextDelta { id, delta: args_json, provider_metadata: None };
-                    } else {
-                        yield v2t::StreamPart::ToolInputDelta {
+                        yield v2t::StreamPart::TextDelta {
                             id,
                             delta: args_json,
-                            provider_executed: false,
                             provider_metadata: None,
                         };
+                    } else {
+                        yield state.push_tool_call_delta(id, args_json, false, None);
                     }
                 }
                 ProviderEvent::ToolCallEnd { id } => {
@@ -170,37 +430,23 @@ where
                         .map(|n| cfg.treat_tool_names_as_text.contains(n))
                         .unwrap_or(false);
                     if treat_as_text {
-                        yield v2t::StreamPart::TextEnd { id, provider_metadata: None };
-                    } else {
-                        yield v2t::StreamPart::ToolInputEnd {
-                            id: id.clone(),
-                            provider_executed: false,
+                        yield v2t::StreamPart::TextEnd {
+                            id,
                             provider_metadata: None,
                         };
+                    } else {
                         let md = if let Some(f) = cfg.hooks.tool_end_metadata.as_mut() {
                             f(&mut state, &id)
                         } else {
                             None
                         };
-                        if let Some(args) = state.tool_args.remove(&id) {
-                            let name = state.tool_names.remove(&id).unwrap_or_default();
-                            yield v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                                tool_call_id: id,
-                                tool_name: name,
-                                input: args,
-                                provider_executed: false,
-                                provider_metadata: md,
-                                dynamic: false,
-                                provider_options: None,
-                            });
+                        for part in state.finish_tool_call(id, false, None, md, false, None) {
+                            yield part;
                         }
                     }
                 }
                 ProviderEvent::Usage { usage } => {
-                    state.usage.input_tokens = Some(usage.input_tokens as u64);
-                    state.usage.output_tokens = Some(usage.output_tokens as u64);
-                    state.usage.total_tokens = Some(usage.total_tokens as u64);
-                    state.usage.cached_input_tokens = usage.cache_read_tokens.map(|v| v as u64);
+                    state.apply_usage(&usage);
                 }
                 ProviderEvent::Raw { raw_value } => {
                     yield v2t::StreamPart::Raw { raw_value };
@@ -216,29 +462,119 @@ where
                 }
                 ProviderEvent::Retrying { .. } => {}
                 ProviderEvent::Error { message } => {
-                    yield v2t::StreamPart::Error { error: serde_json::json!({"message": message}) };
+                    yield v2t::StreamPart::Error {
+                        error: serde_json::json!({"message": message}),
+                    };
                 }
                 ProviderEvent::Done => {
-                    if let Some(id) = state.text_open.take() {
-                        yield v2t::StreamPart::TextEnd { id, provider_metadata: None };
+                    let finish = cfg.hooks.finish.as_ref().map(|f| f(&state));
+                    for part in state.finish_stream(finish, cfg.finish_reason_fallback.clone()) {
+                        yield part;
                     }
-                    if let Some(id) = state.reasoning_open.take() {
-                        yield v2t::StreamPart::ReasoningEnd { id, provider_metadata: None };
-                    }
-                    let (finish_reason, provider_metadata) = if let Some(f) = cfg.hooks.finish.as_ref() {
-                        f(&state)
-                    } else if state.has_tool_calls {
-                        (v2t::FinishReason::ToolCalls, None)
-                    } else {
-                        (cfg.finish_reason_fallback.clone(), None)
-                    };
-                    yield v2t::StreamPart::Finish {
-                        usage: state.usage.clone(),
-                        finish_reason,
-                        provider_metadata,
-                    };
                 }
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_events_to_parts, EventMapperConfig, EventMapperHooks};
+    use crate::ai_sdk_types::v2 as v2t;
+    use crate::ai_sdk_types::{Event, TokenUsage};
+    use futures_util::{stream, TryStreamExt};
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn extracted_state_machine_preserves_basic_stream_lifecycle() {
+        let stream = stream::iter(vec![
+            Ok(Event::TextDelta {
+                delta: "hello".into(),
+            }),
+            Ok(Event::Usage {
+                usage: TokenUsage {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    total_tokens: 5,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            }),
+            Ok(Event::ToolCallStart {
+                id: "tool-1".into(),
+                name: "weather".into(),
+            }),
+            Ok(Event::ToolCallDelta {
+                id: "tool-1".into(),
+                args_json: "{\"city\":\"SF\"}".into(),
+            }),
+            Ok(Event::ToolCallEnd {
+                id: "tool-1".into(),
+            }),
+            Ok(Event::Done),
+        ]);
+
+        let parts: Vec<v2t::StreamPart> = map_events_to_parts(
+            stream,
+            EventMapperConfig {
+                warnings: vec![],
+                treat_tool_names_as_text: HashSet::new(),
+                default_text_id: "text-1",
+                finish_reason_fallback: v2t::FinishReason::Stop,
+                initial_extra: (),
+                hooks: EventMapperHooks::default(),
+            },
+        )
+        .try_collect()
+        .await
+        .expect("stream parts");
+
+        assert!(
+            matches!(&parts[0], v2t::StreamPart::StreamStart { warnings } if warnings.is_empty())
+        );
+        assert!(matches!(
+            &parts[1],
+            v2t::StreamPart::TextStart { id, .. } if id == "text-1"
+        ));
+        assert!(matches!(
+            &parts[2],
+            v2t::StreamPart::TextDelta { id, delta, .. }
+                if id == "text-1" && delta == "hello"
+        ));
+        assert!(matches!(
+            &parts[3],
+            v2t::StreamPart::ToolInputStart { id, tool_name, provider_executed, .. }
+                if id == "tool-1" && tool_name == "weather" && !provider_executed
+        ));
+        assert!(matches!(
+            &parts[4],
+            v2t::StreamPart::ToolInputDelta { id, delta, provider_executed, .. }
+                if id == "tool-1" && delta == "{\"city\":\"SF\"}" && !provider_executed
+        ));
+        assert!(matches!(
+            &parts[5],
+            v2t::StreamPart::ToolInputEnd { id, provider_executed, .. }
+                if id == "tool-1" && !provider_executed
+        ));
+        assert!(matches!(
+            &parts[6],
+            v2t::StreamPart::ToolCall(call)
+                if call.tool_call_id == "tool-1"
+                    && call.tool_name == "weather"
+                    && call.input == "{\"city\":\"SF\"}"
+                    && !call.provider_executed
+        ));
+        assert!(matches!(
+            &parts[7],
+            v2t::StreamPart::TextEnd { id, .. } if id == "text-1"
+        ));
+        assert!(matches!(
+            &parts[8],
+            v2t::StreamPart::Finish { usage, finish_reason, .. }
+                if usage.input_tokens == Some(2)
+                    && usage.output_tokens == Some(3)
+                    && usage.total_tokens == Some(5)
+                    && matches!(finish_reason, v2t::FinishReason::ToolCalls)
+        ));
+    }
 }

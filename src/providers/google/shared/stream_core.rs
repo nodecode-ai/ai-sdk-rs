@@ -6,10 +6,10 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::Value as JsonValue;
 
-use crate::core::error::TransportError;
-use crate::core::PartStream;
-use crate::streaming_sse::SseDecoder;
-use crate::types::v2 as v2t;
+use crate::ai_sdk_core::error::TransportError;
+use crate::ai_sdk_core::{PartStream, StreamNormalizationState};
+use crate::ai_sdk_streaming_sse::SseDecoder;
+use crate::ai_sdk_types::v2 as v2t;
 
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>;
 
@@ -23,14 +23,11 @@ pub fn build_google_stream_part_stream(
         use serde_json::json;
         yield v2t::StreamPart::StreamStart { warnings };
         let mut decoder = SseDecoder::new();
-        let mut current_text_id: Option<String> = None;
-        let mut current_reasoning_id: Option<String> = None;
+        let mut normalizer = StreamNormalizationState::new(());
         let mut last_code_tool_id: Option<String> = None;
         let mut emitted_source_urls: HashSet<String> = HashSet::new();
-        let mut usage: v2t::Usage = v2t::Usage::default();
         let mut finish_reason: v2t::FinishReason = v2t::FinishReason::Unknown;
         let mut provider_metadata: Option<v2t::ProviderMetadata> = None;
-        let mut has_tool_calls: bool = false;
         let mut block_counter: u64 = 0;
 
         macro_rules! handle_sse_event {
@@ -51,7 +48,7 @@ pub fn build_google_stream_part_stream(
                 }
 
                 if let Some(u) = parsed.get("usageMetadata") {
-                    usage = v2t::Usage {
+                    normalizer.usage = v2t::Usage {
                         input_tokens: u.get("promptTokenCount").and_then(|v| v.as_u64()),
                         output_tokens: u.get("candidatesTokenCount").and_then(|v| v.as_u64()),
                         total_tokens: u.get("totalTokenCount").and_then(|v| v.as_u64()),
@@ -69,21 +66,29 @@ pub fn build_google_stream_part_stream(
                                     if ec.get("code").and_then(|v| v.as_str()).is_some() {
                                         let id = uuid::Uuid::new_v4().to_string();
                                         last_code_tool_id = Some(id.clone());
-                                        yield v2t::StreamPart::ToolInputStart { id: id.clone(), tool_name: "code_execution".into(), provider_executed: true, provider_metadata: None };
+                                        yield normalizer.start_tool_call(
+                                            id.clone(),
+                                            "code_execution".into(),
+                                            true,
+                                            None,
+                                        );
                                         let delta = serde_json::to_string(ec).unwrap_or("{}".into());
-                                        yield v2t::StreamPart::ToolInputDelta {
-                                            id: id.clone(),
+                                        yield normalizer.push_tool_call_delta(
+                                            id.clone(),
                                             delta,
-                                            provider_executed: true,
-                                            provider_metadata: None,
-                                        };
-                                        yield v2t::StreamPart::ToolInputEnd {
-                                            id: id.clone(),
-                                            provider_executed: true,
-                                            provider_metadata: None,
-                                        };
-                                        yield v2t::StreamPart::ToolCall(v2t::ToolCallPart { tool_call_id: id, tool_name: "code_execution".into(), input: serde_json::to_string(ec).unwrap_or("{}".into()), provider_executed: true, provider_metadata: None, dynamic: false, provider_options: None });
-                                        has_tool_calls = true;
+                                            true,
+                                            None,
+                                        );
+                                        for part in normalizer.finish_tool_call(
+                                            id,
+                                            true,
+                                            None,
+                                            None,
+                                            false,
+                                            None,
+                                        ) {
+                                            yield part;
+                                        }
                                         continue;
                                     }
                                 }
@@ -105,49 +110,44 @@ pub fn build_google_stream_part_stream(
                                             outer
                                         });
                                         if is_thought {
-                                            if let Some(id) = current_text_id.take() {
-                                                yield v2t::StreamPart::TextEnd {
-                                                    id,
-                                                    provider_metadata: None,
-                                                };
+                                            if let Some(part) = normalizer.close_text(None) {
+                                                yield part;
                                             }
-                                            if current_reasoning_id.is_none() {
+                                            if normalizer.reasoning_open.is_none() {
                                                 let id = format!("r-{}", block_counter);
                                                 block_counter += 1;
-                                                current_reasoning_id = Some(id.clone());
-                                                yield v2t::StreamPart::ReasoningStart {
-                                                    id,
-                                                    provider_metadata: pm.clone(),
-                                                };
+                                                for part in normalizer.open_reasoning(id, pm.clone()) {
+                                                    yield part;
+                                                }
                                             }
-                                            let id = current_reasoning_id.clone().unwrap();
-                                            yield v2t::StreamPart::ReasoningDelta {
-                                                id,
-                                                delta: txt.to_string(),
-                                                provider_metadata: pm,
-                                            };
+                                            yield normalizer.push_reasoning_delta(
+                                                "reasoning-1",
+                                                txt.to_string(),
+                                                pm,
+                                            );
                                         } else {
-                                            if let Some(id) = current_reasoning_id.take() {
-                                                yield v2t::StreamPart::ReasoningEnd {
-                                                    id,
-                                                    provider_metadata: None,
-                                                };
+                                            if let Some(part) = normalizer.close_reasoning(None) {
+                                                yield part;
                                             }
-                                            if current_text_id.is_none() {
+                                            let start_metadata = if normalizer.text_open.is_none() {
+                                                pm.clone()
+                                            } else {
+                                                None
+                                            };
+                                            let id = normalizer.text_open.clone().unwrap_or_else(|| {
                                                 let id = format!("t-{}", block_counter);
                                                 block_counter += 1;
-                                                current_text_id = Some(id.clone());
-                                                yield v2t::StreamPart::TextStart {
-                                                    id,
-                                                    provider_metadata: pm.clone(),
-                                                };
+                                                id
+                                            });
+                                            for part in normalizer.push_text_delta(
+                                                Some(id),
+                                                "t-0",
+                                                txt.to_string(),
+                                                start_metadata,
+                                                pm,
+                                            ) {
+                                                yield part;
                                             }
-                                            let id = current_text_id.clone().unwrap();
-                                            yield v2t::StreamPart::TextDelta {
-                                                id,
-                                                delta: txt.to_string(),
-                                                provider_metadata: pm,
-                                            };
                                         }
                                         continue;
                                     }
@@ -170,20 +170,28 @@ pub fn build_google_stream_part_stream(
                                         outer
                                     });
                                     let id = uuid::Uuid::new_v4().to_string();
-                                    yield v2t::StreamPart::ToolInputStart { id: id.clone(), tool_name: name.clone(), provider_executed: false, provider_metadata: None };
-                                    yield v2t::StreamPart::ToolInputDelta {
-                                        id: id.clone(),
-                                        delta: args.clone(),
-                                        provider_executed: false,
-                                        provider_metadata: None,
-                                    };
-                                    yield v2t::StreamPart::ToolInputEnd {
-                                        id: id.clone(),
-                                        provider_executed: false,
-                                        provider_metadata: None,
-                                    };
-                                    yield v2t::StreamPart::ToolCall(v2t::ToolCallPart { tool_call_id: id, tool_name: name, input: args, provider_executed: false, provider_metadata: None, dynamic: false, provider_options });
-                                    has_tool_calls = true;
+                                    yield normalizer.start_tool_call(
+                                        id.clone(),
+                                        name,
+                                        false,
+                                        None,
+                                    );
+                                    yield normalizer.push_tool_call_delta(
+                                        id.clone(),
+                                        args,
+                                        false,
+                                        None,
+                                    );
+                                    for part in normalizer.finish_tool_call(
+                                        id,
+                                        false,
+                                        None,
+                                        None,
+                                        false,
+                                        provider_options,
+                                    ) {
+                                        yield part;
+                                    }
                                     continue;
                                 }
                             }
@@ -208,7 +216,7 @@ pub fn build_google_stream_part_stream(
 
                         if let Some(fr) = cand.get("finishReason").and_then(|v| v.as_str()) {
                             finish_reason = match fr {
-                                "STOP" => if has_tool_calls { v2t::FinishReason::ToolCalls } else { v2t::FinishReason::Stop },
+                                "STOP" => if normalizer.has_tool_calls { v2t::FinishReason::ToolCalls } else { v2t::FinishReason::Stop },
                                 "MAX_TOKENS" => v2t::FinishReason::Length,
                                 "IMAGE_SAFETY" | "RECITATION" | "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => v2t::FinishReason::ContentFilter,
                                 "FINISH_REASON_UNSPECIFIED" | "OTHER" => v2t::FinishReason::Other,
@@ -219,18 +227,18 @@ pub fn build_google_stream_part_stream(
                             inner_map.insert("groundingMetadata".into(), cand.get("groundingMetadata").cloned().unwrap_or(JsonValue::Null));
                             inner_map.insert("urlContextMetadata".into(), cand.get("urlContextMetadata").cloned().unwrap_or(JsonValue::Null));
                             inner_map.insert("safetyRatings".into(), cand.get("safetyRatings").cloned().unwrap_or(JsonValue::Null));
-                            let usage_has = usage.input_tokens.is_some()
-                                || usage.output_tokens.is_some()
-                                || usage.total_tokens.is_some()
-                                || usage.reasoning_tokens.is_some()
-                                || usage.cached_input_tokens.is_some();
+                            let usage_has = normalizer.usage.input_tokens.is_some()
+                                || normalizer.usage.output_tokens.is_some()
+                                || normalizer.usage.total_tokens.is_some()
+                                || normalizer.usage.reasoning_tokens.is_some()
+                                || normalizer.usage.cached_input_tokens.is_some();
                             if usage_has {
                                 inner_map.insert("usageMetadata".into(), json!({
-                                    "promptTokenCount": usage.input_tokens,
-                                    "candidatesTokenCount": usage.output_tokens,
-                                    "totalTokenCount": usage.total_tokens,
-                                    "thoughtsTokenCount": usage.reasoning_tokens,
-                                    "cachedContentTokenCount": usage.cached_input_tokens,
+                                    "promptTokenCount": normalizer.usage.input_tokens,
+                                    "candidatesTokenCount": normalizer.usage.output_tokens,
+                                    "totalTokenCount": normalizer.usage.total_tokens,
+                                    "thoughtsTokenCount": normalizer.usage.reasoning_tokens,
+                                    "cachedContentTokenCount": normalizer.usage.cached_input_tokens,
                                 }));
                             }
                             let mut outer = HashMap::new();
@@ -250,7 +258,7 @@ pub fn build_google_stream_part_stream(
                     }
                 }
                 Err(te) => {
-                    let e = crate::providers::google::shared::error::map_transport_error_to_sdk_error(te);
+                    let e = crate::provider_google::shared::error::map_transport_error_to_sdk_error(te);
                     yield v2t::StreamPart::Error { error: serde_json::json!({"message": e.to_string()}) };
                     break;
                 }
@@ -261,23 +269,11 @@ pub fn build_google_stream_part_stream(
             handle_sse_event!(ev);
         }
 
-        if let Some(id) = current_text_id.take() {
-            yield v2t::StreamPart::TextEnd {
-                id,
-                provider_metadata: None,
-            };
+        for part in normalizer.finish_stream(
+            Some((finish_reason, provider_metadata)),
+            v2t::FinishReason::Unknown,
+        ) {
+            yield part;
         }
-        if let Some(id) = current_reasoning_id.take() {
-            yield v2t::StreamPart::ReasoningEnd {
-                id,
-                provider_metadata: None,
-            };
-        }
-
-        yield v2t::StreamPart::Finish {
-            usage,
-            finish_reason,
-            provider_metadata,
-        };
     })
 }

@@ -6,16 +6,16 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::json;
 
-use crate::core::error::{SdkError, TransportError};
-use crate::types::v2 as v2t;
-use crate::providers::google::shared::options::{
+use crate::ai_sdk_core::error::{SdkError, TransportError};
+use crate::ai_sdk_types::v2 as v2t;
+use crate::provider_google::shared::options::{
     parse_google_provider_options_for_scopes, GoogleProviderOptions,
 };
-use crate::providers::google::shared::prepare_tools::prepare_tools as prepare_google_family_tools;
-use crate::providers::google::shared::prompt::{
+use crate::provider_google::shared::prepare_tools::prepare_tools as prepare_google_family_tools;
+use crate::provider_google::shared::prompt::{
     convert_to_google_prompt_with_scopes, GoogleContent, GoogleContentPart, GooglePrompt,
 };
-use crate::providers::google::shared::stream_core::build_google_stream_part_stream;
+use crate::provider_google::shared::stream_core::build_google_stream_part_stream;
 
 const GOOGLE_SCOPES: &[&str] = &["google"];
 const GOOGLE_VERTEX_SCOPES: &[&str] = &["google-vertex", "google"];

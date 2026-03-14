@@ -65,7 +65,7 @@
 ## Lineage Chain
 
 - Planned linear commit lineage:
-- `HEAD -> SN0 -> SN1 -> SN2 -> SN3 -> SN4`
+- `HEAD -> SN0 -> SN1 -> SN2 -> SN3 -> SN3A -> SN3B -> SN4`
 
 ## Execution Order
 
@@ -77,7 +77,7 @@
 ## Atomic Slices
 
 - [x] `SN0` Lock representative cross-provider stream parity.
-  Lineage commit: `<self; backfill after landing SN0>`
+  Lineage commit: `e74b41e`
   Commit subject: `test(stream): lock normalized stream parity seams`
   Lineage parent: `HEAD`
   Scope:
@@ -88,8 +88,8 @@
   - tests cover text, reasoning, tool, raw, and finish transitions on representative providers
   - no production normalization refactor lands in this slice
 
-- [ ] `SN1` Extract the shared stream normalization owner.
-  Lineage commit: `<pending>`
+- [x] `SN1` Extract the shared stream normalization owner.
+  Lineage commit: `d86ae2a`
   Commit subject: `refactor(stream): extract shared part normalization core`
   Lineage parent: `SN0`
   Scope:
@@ -102,8 +102,8 @@
   - provider-specific code no longer needs to define its own generic text or tool state machine primitives
   - no provider behavior changes land beyond what parity tests require
 
-- [ ] `SN2` Move the duplicated provider-local stream engines onto the shared owner.
-  Lineage commit: `<pending>`
+- [x] `SN2` Move the duplicated provider-local stream engines onto the shared owner.
+  Lineage commit: `bb6eaf3`
   Commit subject: `refactor(stream): migrate duplicated provider stream engines`
   Lineage parent: `SN1`
   Scope:
@@ -117,8 +117,8 @@
   - the shared owner now emits generic text, reasoning, tool, and finish transitions for these providers
   - provider parity remains intact
 
-- [ ] `SN3` Thin OpenAI Responses onto the same shared normalization path.
-  Lineage commit: `<pending>`
+- [x] `SN3` Thin OpenAI Responses onto the same shared normalization path.
+  Lineage commit: `e3fdc8a`
   Commit subject: `refactor(stream): thin openai responses normalization`
   Lineage parent: `SN2`
   Scope:
@@ -130,10 +130,42 @@
   - provider-local code is reduced to request shaping, transport selection, and provider event adaptation
   - the largest stream adapter file is materially narrowed without changing normalized output
 
-- [ ] `SN4` Validate the surviving single-path stream normalizer.
-  Lineage commit: `<pending>`
-  Commit subject: `test(stream): validate single normalization path`
+- [x] `SN3A` Route remaining shared lifecycle scaffolding onto the shared owner.
+  Lineage commit: `2bf0241`
+  Commit subject: `refactor(stream): route remaining shared lifecycle scaffolding`
   Lineage parent: `SN3`
+  Scope:
+  - `worklog/plans/plan-stream-part-normalization-single-path-remediation.md`
+  - `src/core/event_mapper.rs`
+  - `crates/providers/openai-compatible/src/stream.rs`
+  - `crates/providers/gateway/src/language_model.rs`
+  - `crates/providers/openai/src/responses/language_model.rs`
+  - directly affected stream tests only
+  Gate:
+  - shared text-open and generic tool lifecycle helpers own more of the remaining provider runtime scaffolding
+  - provider-local code is further reduced without changing representative stream parity
+  - the final validation slice can check the resulting ownership shape honestly
+
+- [x] `SN3B` Centralize the remaining generic part constructors behind the shared owner.
+  Lineage commit: `eaaf8f9`
+  Commit subject: `refactor(stream): centralize remaining generic part constructors`
+  Lineage parent: `SN3A`
+  Scope:
+  - `src/core/event_mapper.rs`
+  - `crates/providers/openai-compatible/src/stream.rs`
+  - `crates/providers/gateway/src/language_model.rs`
+  - `crates/providers/openai/src/responses/language_model.rs`
+  - `worklog/plans/plan-stream-part-normalization-single-path-remediation.md`
+  - directly affected stream tests only
+  Gate:
+  - provider runtime files no longer directly instantiate generic text, reasoning, tool-input, tool-call, or finish parts
+  - shared helper methods in the surviving owner define the remaining generic part-construction rules
+  - representative provider parity remains intact
+
+- [x] `SN4` Validate the surviving single-path stream normalizer.
+  Lineage commit: `<self; backfill after landing SN4>`
+  Commit subject: `test(stream): validate single normalization path`
+  Lineage parent: `SN3B`
   Scope:
   - targeted `cargo test` coverage for representative provider streaming suites
   - `worklog/plans/plan-stream-part-normalization-single-path-remediation.md`

@@ -1,8 +1,8 @@
-use crate::core::transport::{HttpTransport, TransportConfig};
-use crate::core::{SdkError, StreamResponse};
-use crate::streaming_sse::SseDecoder;
-use crate::types::json::parse_json_loose;
-use crate::types::v2 as v2t;
+use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
+use crate::ai_sdk_core::{SdkError, StreamNormalizationState, StreamResponse};
+use crate::ai_sdk_streaming_sse::SseDecoder;
+use crate::ai_sdk_types::json::parse_json_loose;
+use crate::ai_sdk_types::v2 as v2t;
 use async_stream::try_stream;
 use bytes::Bytes;
 use futures_core::Stream;
@@ -10,8 +10,8 @@ use futures_util::StreamExt;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
-use crate::providers::openai_compatible::completion::finish_reason::map_openai_compatible_finish_reason;
-use crate::providers::openai_compatible::error::map_transport_error_to_sdk_error;
+use crate::provider_openai_compatible::completion::finish_reason::map_openai_compatible_finish_reason;
+use crate::provider_openai_compatible::error::map_transport_error_to_sdk_error;
 
 #[derive(Clone, Copy)]
 pub enum StreamMode {
@@ -30,23 +30,29 @@ pub struct StreamSettings {
 struct ToolCallState {
     id: Option<String>,
     name: Option<String>,
-    args: String,
     finished: bool,
     started: bool,
 }
 
-#[derive(Default)]
 struct ChatState {
-    is_active_text: bool,
-    is_active_reasoning: bool,
+    normalizer: StreamNormalizationState<()>,
     tool_calls: Vec<ToolCallState>,
+}
+
+impl Default for ChatState {
+    fn default() -> Self {
+        Self {
+            normalizer: StreamNormalizationState::new(()),
+            tool_calls: Vec::new(),
+        }
+    }
 }
 
 pub fn build_stream<S>(
     bytes_stream: S,
     settings: StreamSettings,
     mode: StreamMode,
-) -> crate::core::PartStream
+) -> crate::ai_sdk_core::PartStream
 where
     S: Stream<Item = Result<Bytes, SdkError>> + Send + 'static,
 {
@@ -57,6 +63,7 @@ where
         let mut finish_reason = v2t::FinishReason::Unknown;
         let mut first_chunk = true;
         let mut chat_state = ChatState::default();
+        let mut completion_state = StreamNormalizationState::new(());
         let mut completion_started = false;
         let mut provider_metadata: Option<v2t::ProviderMetadata> = None;
 
@@ -66,7 +73,8 @@ where
                 if ev.data.as_ref() == b"[DONE]" {
                     for part in emit_finish(
                         mode,
-                        &chat_state,
+                        &mut chat_state,
+                        &mut completion_state,
                         completion_started,
                         usage.clone(),
                         finish_reason,
@@ -97,10 +105,9 @@ where
                         meta: response_metadata_from_chunk(&val),
                     };
                     if matches!(mode, StreamMode::Completion) {
-                        yield v2t::StreamPart::TextStart {
-                            id: "0".into(),
-                            provider_metadata: None,
-                        };
+                        for part in completion_state.open_text("0".into(), None) {
+                            yield part;
+                        }
                         completion_started = true;
                     }
                 }
@@ -121,7 +128,9 @@ where
                             return;
                         }
                     },
-                    StreamMode::Completion => handle_completion_delta(&val, &mut finish_reason),
+                    StreamMode::Completion => {
+                        handle_completion_delta(&val, &mut completion_state, &mut finish_reason)
+                    }
                 };
                 for part in parts {
                     yield part;
@@ -150,7 +159,8 @@ where
 
         for part in emit_finish(
             mode,
-            &chat_state,
+            &mut chat_state,
+            &mut completion_state,
             completion_started,
             usage,
             finish_reason,
@@ -163,7 +173,8 @@ where
 
 fn emit_finish(
     mode: StreamMode,
-    state: &ChatState,
+    state: &mut ChatState,
+    completion_state: &mut StreamNormalizationState<()>,
     completion_started: bool,
     usage: v2t::Usage,
     finish_reason: v2t::FinishReason,
@@ -172,55 +183,46 @@ fn emit_finish(
     let mut parts = Vec::new();
     match mode {
         StreamMode::Chat => {
-            if state.is_active_reasoning {
-                parts.push(v2t::StreamPart::ReasoningEnd {
-                    id: "reasoning-0".into(),
-                    provider_metadata: None,
-                });
-            }
-            if state.is_active_text {
-                parts.push(v2t::StreamPart::TextEnd {
-                    id: "txt-0".into(),
-                    provider_metadata: None,
-                });
-            }
+            state.normalizer.usage = usage;
             for tool_call in state
                 .tool_calls
-                .iter()
+                .iter_mut()
                 .filter(|tc| tc.started && !tc.finished)
             {
-                if let (Some(id), Some(name)) = (&tool_call.id, &tool_call.name) {
-                    parts.push(v2t::StreamPart::ToolInputEnd {
-                        id: id.clone(),
-                        provider_executed: false,
-                        provider_metadata: None,
-                    });
-                    parts.push(v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                        tool_call_id: id.clone(),
-                        tool_name: name.clone(),
-                        input: tool_call.args.clone(),
-                        provider_executed: false,
-                        provider_metadata: None,
-                        dynamic: false,
-                        provider_options: None,
-                    }));
+                if let Some(id) = &tool_call.id {
+                    parts.extend(state.normalizer.finish_tool_call(
+                        id.clone(),
+                        false,
+                        None,
+                        None,
+                        false,
+                        None,
+                    ));
+                    tool_call.finished = true;
                 }
             }
+            if let Some(part) = state.normalizer.close_reasoning(None) {
+                parts.push(part);
+            }
+            if let Some(part) = state.normalizer.close_text(None) {
+                parts.push(part);
+            }
+            parts.push(
+                state
+                    .normalizer
+                    .finish_part(finish_reason, provider_metadata),
+            );
         }
         StreamMode::Completion => {
             if completion_started {
-                parts.push(v2t::StreamPart::TextEnd {
-                    id: "0".into(),
-                    provider_metadata: None,
-                });
+                completion_state.usage = usage;
+                parts.extend(completion_state.finish_stream(
+                    Some((finish_reason, provider_metadata)),
+                    v2t::FinishReason::Unknown,
+                ));
             }
         }
     }
-    parts.push(v2t::StreamPart::Finish {
-        usage,
-        finish_reason,
-        provider_metadata,
-    });
     parts
 }
 
@@ -279,7 +281,7 @@ fn update_usage(
         return;
     }
     if let Some(u) = val.get("usage") {
-        if let Some(u2) = crate::types::usage::from_openai(u) {
+        if let Some(u2) = crate::ai_sdk_types::usage::from_openai(u) {
             usage.input_tokens = Some(u2.input_tokens as u64);
             usage.output_tokens = Some(u2.output_tokens as u64);
             usage.total_tokens = Some(u2.total_tokens as u64);
@@ -346,6 +348,7 @@ fn set_provider_metadata_value(
 
 fn handle_completion_delta(
     val: &JsonValue,
+    state: &mut StreamNormalizationState<()>,
     finish_reason: &mut v2t::FinishReason,
 ) -> Vec<v2t::StreamPart> {
     let mut parts = Vec::new();
@@ -359,11 +362,13 @@ fn handle_completion_delta(
         }
         if let Some(text) = choice0.get("text").and_then(|v| v.as_str()) {
             if !text.is_empty() {
-                parts.push(v2t::StreamPart::TextDelta {
-                    id: "0".into(),
-                    delta: text.to_string(),
-                    provider_metadata: None,
-                });
+                parts.extend(state.push_text_delta(
+                    Some("0".into()),
+                    "0",
+                    text.to_string(),
+                    None,
+                    None,
+                ));
             }
         }
     }
@@ -397,36 +402,31 @@ fn handle_chat_delta(
         .or_else(|| delta.get("reasoning"))
         .and_then(|v| v.as_str())
     {
-        if !state.is_active_reasoning {
-            state.is_active_reasoning = true;
-            parts.push(v2t::StreamPart::ReasoningStart {
-                id: "reasoning-0".into(),
-                provider_metadata: None,
-            });
+        if state.normalizer.reasoning_open.is_none() {
+            parts.extend(state.normalizer.open_reasoning("reasoning-0".into(), None));
         }
         if !reasoning.is_empty() {
-            parts.push(v2t::StreamPart::ReasoningDelta {
-                id: "reasoning-0".into(),
-                delta: reasoning.to_string(),
-                provider_metadata: None,
-            });
+            parts.push(state.normalizer.push_reasoning_delta(
+                "reasoning-0",
+                reasoning.to_string(),
+                None,
+            ));
         }
     }
 
     if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-        if !state.is_active_text {
-            state.is_active_text = true;
-            parts.push(v2t::StreamPart::TextStart {
-                id: "txt-0".into(),
-                provider_metadata: None,
-            });
+        let text_id = "txt-0".to_string();
+        if state.normalizer.text_open.is_none() {
+            parts.extend(state.normalizer.open_text(text_id.clone(), None));
         }
         if !text.is_empty() {
-            parts.push(v2t::StreamPart::TextDelta {
-                id: "txt-0".into(),
-                delta: text.to_string(),
-                provider_metadata: None,
-            });
+            parts.extend(state.normalizer.push_text_delta(
+                Some(text_id),
+                "txt-0",
+                text.to_string(),
+                None,
+                None,
+            ));
         }
     }
 
@@ -462,40 +462,57 @@ fn handle_chat_delta(
                 slot.name = Some(name.to_string());
                 slot.started = true;
 
-                parts.push(v2t::StreamPart::ToolInputStart {
-                    id: id.to_string(),
-                    tool_name: name.to_string(),
-                    provider_executed: false,
-                    provider_metadata: None,
-                });
+                parts.push(state.normalizer.start_tool_call(
+                    id.to_string(),
+                    name.to_string(),
+                    false,
+                    None,
+                ));
 
                 if let Some(fragment) = args_fragment {
-                    if !fragment.is_empty() {
-                        parts.push(v2t::StreamPart::ToolInputDelta {
-                            id: id.to_string(),
-                            delta: fragment.to_string(),
-                            provider_executed: false,
-                            provider_metadata: None,
-                        });
+                    if fragment.is_empty() {
+                        let normalized_args = state
+                            .normalizer
+                            .tool_args
+                            .get(id)
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        if !slot.finished && parse_json_loose(normalized_args).is_some() {
+                            parts.extend(state.normalizer.finish_tool_call(
+                                id.to_string(),
+                                false,
+                                None,
+                                None,
+                                false,
+                                None,
+                            ));
+                            slot.finished = true;
+                        }
+                        continue;
                     }
-                    slot.args.push_str(fragment);
+                    parts.push(state.normalizer.push_tool_call_delta(
+                        id.to_string(),
+                        fragment.to_string(),
+                        false,
+                        None,
+                    ));
                 }
 
-                if !slot.finished && parse_json_loose(&slot.args).is_some() {
-                    parts.push(v2t::StreamPart::ToolInputEnd {
-                        id: id.to_string(),
-                        provider_executed: false,
-                        provider_metadata: None,
-                    });
-                    parts.push(v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                        tool_call_id: id.to_string(),
-                        tool_name: name.to_string(),
-                        input: slot.args.clone(),
-                        provider_executed: false,
-                        provider_metadata: None,
-                        dynamic: false,
-                        provider_options: None,
-                    }));
+                let normalized_args = state
+                    .normalizer
+                    .tool_args
+                    .get(id)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if !slot.finished && parse_json_loose(normalized_args).is_some() {
+                    parts.extend(state.normalizer.finish_tool_call(
+                        id.to_string(),
+                        false,
+                        None,
+                        None,
+                        false,
+                        None,
+                    ));
                     slot.finished = true;
                 }
                 continue;
@@ -509,31 +526,25 @@ fn handle_chat_delta(
                 .name
                 .clone()
                 .ok_or_else(|| ToolDeltaError::new("Expected 'function.name' to be a string."))?;
-            if let Some(fragment) = args_fragment {
-                slot.args.push_str(fragment);
-            }
-
-            parts.push(v2t::StreamPart::ToolInputDelta {
-                id: id.clone(),
-                delta: args_fragment.unwrap_or("").to_string(),
-                provider_executed: false,
-                provider_metadata: None,
-            });
-            if !slot.finished && parse_json_loose(&slot.args).is_some() {
-                parts.push(v2t::StreamPart::ToolInputEnd {
-                    id: id.clone(),
-                    provider_executed: false,
-                    provider_metadata: None,
-                });
-                parts.push(v2t::StreamPart::ToolCall(v2t::ToolCallPart {
-                    tool_call_id: id,
-                    tool_name: name,
-                    input: slot.args.clone(),
-                    provider_executed: false,
-                    provider_metadata: None,
-                    dynamic: false,
-                    provider_options: None,
-                }));
+            parts.push(state.normalizer.push_tool_call_delta(
+                id.clone(),
+                args_fragment.unwrap_or("").to_string(),
+                false,
+                None,
+            ));
+            let normalized_args = state
+                .normalizer
+                .tool_args
+                .get(&id)
+                .map(String::as_str)
+                .unwrap_or("");
+            if !slot.finished && parse_json_loose(normalized_args).is_some() {
+                let _ = name;
+                parts.extend(
+                    state
+                        .normalizer
+                        .finish_tool_call(id, false, None, None, false, None),
+                );
                 slot.finished = true;
             }
         }

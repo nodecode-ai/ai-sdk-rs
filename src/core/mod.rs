@@ -15,6 +15,7 @@ pub use crate::core::embedding::{EmbedResponse, EmbeddingModel};
 pub use crate::core::error::{SdkError, TransportError};
 pub use crate::core::event_mapper::{
     map_events_to_parts, EventMapperConfig, EventMapperHooks, EventMapperState, ProviderMetadata,
+    StreamNormalizationState,
 };
 pub use crate::core::image::{ImageModel, ImageResponse, ImageResponseMeta};
 
