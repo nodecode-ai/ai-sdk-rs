@@ -85,7 +85,7 @@
   - no production changes land in this slice
 
 - [x] `AN1` Restore transport-owned Anthropic null pruning.
-  Lineage commit: `<fill after landing>`
+  Lineage commit: `ea3dc76`
   Commit subject: `fix(anthropic): restore transport null pruning`
   Lineage parent: `AN0`
   Scope:
@@ -96,8 +96,8 @@
   - streamed Anthropic requests remain null-free on the wire even while builder cleanup stays out of scope
   - no unrelated Anthropic request-shaping refactor lands in this slice
 
-- [ ] `AN2` Validate the surviving Anthropic null-sanitized path.
-  Lineage commit: `<pending>`
+- [x] `AN2` Validate the surviving Anthropic null-sanitized path.
+  Lineage commit: `<self-referential final plan-update commit>`
   Commit subject: `test(anthropic): validate null-sanitized transport path`
   Lineage parent: `AN1`
   Scope:
