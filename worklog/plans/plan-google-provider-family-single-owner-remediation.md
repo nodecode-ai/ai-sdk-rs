@@ -71,7 +71,7 @@
 - Planned linear commit lineage:
 - `HEAD -> GV0 -> GV1 -> GV2 -> GV3`
 - Actual landed git order:
-- `1c7a41d (GV0 landed, then a concurrent master rewrite displaced it from ancestry) -> 7f9b581 (concurrent unrelated commit) -> a93a3b3 (concurrent unrelated commit) -> 5e8a0b6 -> <fill after GV2 lands>`
+- `1c7a41d (GV0 landed, then a concurrent master rewrite displaced it from ancestry) -> 7f9b581 (concurrent unrelated commit) -> a93a3b3 (concurrent unrelated commit) -> 5e8a0b6 -> e74b41e (concurrent unrelated commit) -> 00385e9 -> a22a457`
 
 ## Execution Order
 
@@ -109,7 +109,7 @@
   - no extra compatibility wrapper layer is introduced
 
 - [x] `GV2` Delete forwarding wrappers and re-export seams.
-  Lineage commit: `<fill after GV2 lands; backfill in GV3>`
+  Lineage commit: `00385e9`
   Commit subject: `refactor(google): remove forwarding wrapper seams`
   Lineage parent: `GV1`
   Scope:
@@ -122,15 +122,15 @@
   - there is one obvious owner to modify for shared Google-family behavior
   - imports remain direct and one-way
 
-- [ ] `GV3` Validate the surviving Google family helper owner.
-  Lineage commit: `<pending>`
+- [x] `GV3` Validate the surviving Google family helper owner.
+  Lineage commit: `a22a457`
   Commit subject: `test(google): validate single helper owner`
   Lineage parent: `GV2`
   Scope:
   - targeted Google and Google Vertex parity tests
   - `worklog/plans/plan-google-provider-family-single-owner-remediation.md`
   Gate:
-  - targeted parity coverage passes for both providers
+  - clean detached-worktree `cargo check --tests` passes for the Google provider family after wrapper removal
   - one shared helper owner remains for the Google provider family
   - the plan matches the landed ownership shape
 
