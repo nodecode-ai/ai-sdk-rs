@@ -71,7 +71,7 @@
 - Planned linear commit lineage:
 - `HEAD -> GV0 -> GV1 -> GV2 -> GV3`
 - Actual landed git order:
-- `39aa00c -> 1c7a41d -> 6de96af (concurrent unrelated commit) -> <fill after GV1 lands>`
+- `1c7a41d (GV0 landed, then a concurrent master rewrite displaced it from ancestry) -> 7f9b581 (concurrent unrelated commit) -> a93a3b3 (concurrent unrelated commit) -> 5e8a0b6 -> <fill after GV2 lands>`
 
 ## Execution Order
 
@@ -95,7 +95,7 @@
   - no production helper refactor lands in this slice
 
 - [x] `GV1` Move shared helper ownership into one common module tree.
-  Lineage commit: `<fill after GV1 lands; backfill in GV2>`
+  Lineage commit: `5e8a0b6`
   Commit subject: `refactor(google): centralize shared helper ownership`
   Lineage parent: `GV0`
   Scope:
@@ -108,8 +108,8 @@
   - both providers import the shared owner directly
   - no extra compatibility wrapper layer is introduced
 
-- [ ] `GV2` Delete forwarding wrappers and re-export seams.
-  Lineage commit: `<pending>`
+- [x] `GV2` Delete forwarding wrappers and re-export seams.
+  Lineage commit: `<fill after GV2 lands; backfill in GV3>`
   Commit subject: `refactor(google): remove forwarding wrapper seams`
   Lineage parent: `GV1`
   Scope:

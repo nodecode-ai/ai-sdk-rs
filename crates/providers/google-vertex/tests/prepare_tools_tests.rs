@@ -1,8 +1,7 @@
 use crate::ai_sdk_core::error::TransportError;
-use crate::ai_sdk_providers_google_vertex::prepare_tools::prepare_tools;
 use crate::ai_sdk_types::v2 as v2t;
-use crate::provider_google::error::map_transport_error_to_sdk_error as map_google_error;
-use crate::provider_google_vertex::error::map_transport_error_to_sdk_error as map_vertex_error;
+use crate::provider_google::shared::error::map_transport_error_to_sdk_error;
+use crate::provider_google::shared::prepare_tools::prepare_tools;
 use serde_json::json;
 
 fn provider_tool(id: &str, args: serde_json::Value) -> v2t::Tool {
@@ -75,10 +74,10 @@ fn http_status(body: &str) -> TransportError {
 
 #[test]
 fn error_mapping_path_parity_between_google_and_vertex() {
-    let google = map_google_error(http_status(
+    let google = map_transport_error_to_sdk_error(http_status(
         r#"{"error":{"code":403,"message":"permission denied","status":"PERMISSION_DENIED"}}"#,
     ));
-    let vertex = map_vertex_error(http_status(
+    let vertex = map_transport_error_to_sdk_error(http_status(
         r#"{"error":{"code":403,"message":"permission denied","status":"PERMISSION_DENIED"}}"#,
     ));
 
