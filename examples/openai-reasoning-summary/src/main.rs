@@ -1,6 +1,6 @@
 use ai_sdk_rs::core::types as v2t;
 use ai_sdk_rs::core::LanguageModel;
-use ai_sdk_rs::providers::openai::responses::language_model::OpenAIResponsesLanguageModel;
+use ai_sdk_rs::providers::openai::OpenAIResponsesLanguageModel;
 use anyhow::Result;
 use futures_util::StreamExt;
 
@@ -22,7 +22,11 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let lm = OpenAIResponsesLanguageModel::create_simple(model, base_url, api_key);
+    let mut builder = OpenAIResponsesLanguageModel::builder(model);
+    if let Some(base_url) = base_url {
+        builder = builder.with_base_url(base_url);
+    }
+    let lm = builder.with_api_key(api_key).build()?;
 
     // Provider options: request reasoning summary and low effort
     let mut provider_options: v2t::ProviderOptions = std::collections::HashMap::new();

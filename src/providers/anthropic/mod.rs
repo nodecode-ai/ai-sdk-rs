@@ -17,6 +17,7 @@ pub mod provider;
 
 // Re-exports for convenience
 pub use messages::language_model::AnthropicMessagesLanguageModel;
+pub use provider::AnthropicMessagesBuilder;
 
 #[cfg(test)]
 #[path = "../../../crates/providers/anthropic/tests/messages_options_tests.rs"]

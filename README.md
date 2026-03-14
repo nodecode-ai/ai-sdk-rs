@@ -73,42 +73,19 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ```rust
-use ai_sdk_rs::core::types as v2t;
-use ai_sdk_rs::provider::{registry, Credentials};
-use ai_sdk_rs::providers::anthropic as _;
-use ai_sdk_rs::types::catalog::{ProviderDefinition, SdkType};
+use ai_sdk_rs::core::{types as v2t, LanguageModel};
+use ai_sdk_rs::providers::anthropic::AnthropicMessagesLanguageModel;
 use futures_util::StreamExt;
 use serde_json::json;
-use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")?;
     let model = std::env::var("MODEL").unwrap_or_else(|_| "claude-sonnet-4-5-20250929".into());
 
-    let reg = registry::iter()
-        .into_iter()
-        .find(|entry| entry.id.eq_ignore_ascii_case("anthropic"))
-        .expect("anthropic provider registration not found");
-
-    let def = ProviderDefinition {
-        name: "anthropic".into(),
-        display_name: "Anthropic".into(),
-        sdk_type: SdkType::Anthropic,
-        base_url: "https://api.anthropic.com/v1".into(),
-        env: Some("ANTHROPIC_API_KEY".into()),
-        npm: None,
-        doc: None,
-        endpoint_path: "".into(),
-        headers: HashMap::new(),
-        query_params: HashMap::new(),
-        stream_idle_timeout_ms: None,
-        auth_type: "api-key".into(),
-        models: HashMap::new(),
-        preserve_model_prefix: true,
-    };
-
-    let lm = (reg.build)(&def, &model, &Credentials::ApiKey(api_key))?;
+    let lm = AnthropicMessagesLanguageModel::builder(model)
+        .with_api_key(api_key)
+        .build()?;
 
     let mut options = v2t::CallOptions::new(vec![
         v2t::PromptMessage::System {

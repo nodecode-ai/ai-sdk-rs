@@ -80,7 +80,7 @@
 ## Atomic Slices
 
 - [x] `PC0` Lock representative construction surfaces with focused compile coverage.
-  Lineage commit: `435ec33`
+  Lineage commit: `d2af584`
   Commit subject: `test(api): lock provider construction happy paths`
   Lineage parent: `HEAD`
   Scope:
@@ -92,8 +92,8 @@
   - tests distinguish happy-path construction from advanced registry construction
   - no production constructor refactor lands in this slice
 
-- [ ] `PC1` Introduce one canonical typed construction surface per capability.
-  Lineage commit: `<pending>`
+- [x] `PC1` Introduce one canonical typed construction surface per capability.
+  Lineage commit: `69715f6`
   Commit subject: `refactor(api): add canonical provider constructors`
   Lineage parent: `PC0`
   Scope:
@@ -104,8 +104,8 @@
   - representative providers no longer require registry-driven construction in ordinary usage
   - overlapping helper entrypoints are narrowed rather than multiplied
 
-- [ ] `PC2` Move docs and callers to the canonical construction path and demote displaced authorities.
-  Lineage commit: `<pending>`
+- [x] `PC2` Move docs and callers to the canonical construction path and demote displaced authorities.
+  Lineage commit: `7b270d9`
   Commit subject: `refactor(api): narrow redundant provider construction paths`
   Lineage parent: `PC1`
   Scope:
@@ -117,8 +117,8 @@
   - registry use is clearly advanced-only rather than the default public story
   - redundant happy-path helpers are removed or explicitly narrowed in the same slice
 
-- [ ] `PC3` Validate the surviving provider construction surface.
-  Lineage commit: `<pending>`
+- [x] `PC3` Validate the surviving provider construction surface.
+  Lineage commit: `9de8470`
   Commit subject: `test(api): validate provider construction surface`
   Lineage parent: `PC2`
   Scope:
