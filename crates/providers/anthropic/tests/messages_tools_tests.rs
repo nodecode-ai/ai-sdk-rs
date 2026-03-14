@@ -1,4 +1,5 @@
 use crate::ai_sdk_core::error::TransportError;
+use crate::ai_sdk_core::json::without_null_fields;
 use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
 use crate::ai_sdk_core::LanguageModel;
 use crate::ai_sdk_providers_anthropic::messages::language_model::AnthropicMessagesConfig;
@@ -15,10 +16,15 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Default)]
 struct TestTransport {
+    last_body: Arc<Mutex<Option<serde_json::Value>>>,
     last_headers: Arc<Mutex<Option<Vec<(String, String)>>>>,
 }
 
 impl TestTransport {
+    fn last_body(&self) -> Option<serde_json::Value> {
+        self.last_body.lock().unwrap().clone()
+    }
+
     fn last_headers(&self) -> Option<Vec<(String, String)>> {
         self.last_headers.lock().unwrap().clone()
     }
@@ -46,9 +52,15 @@ impl HttpTransport for TestTransport {
         &self,
         _url: &str,
         headers: &[(String, String)],
-        _body: &serde_json::Value,
-        _cfg: &TransportConfig,
+        body: &serde_json::Value,
+        cfg: &TransportConfig,
     ) -> Result<Self::StreamResponse, TransportError> {
+        let sent_body = if cfg.strip_null_fields {
+            without_null_fields(body)
+        } else {
+            body.clone()
+        };
+        *self.last_body.lock().unwrap() = Some(sent_body);
         *self.last_headers.lock().unwrap() = Some(headers.to_vec());
         Ok(TestStreamResponse {
             headers: vec![],
@@ -274,7 +286,7 @@ async fn adjacent_system_text_entries_with_matching_cache_policy_are_collapsed()
 }
 
 #[tokio::test]
-async fn request_body_contains_no_object_nulls() {
+async fn request_body_can_still_contain_object_nulls_before_transport_pruning() {
     let transport = TestTransport::default();
     let model = build_model(transport);
 
@@ -304,7 +316,49 @@ async fn request_body_contains_no_object_nulls() {
     let response = model.do_stream(options).await.expect("stream response");
     let body = response.request_body.expect("request body");
     assert!(
-        !contains_object_null(&body),
-        "anthropic request body should not require transport null pruning: {body}"
+        contains_object_null(&body),
+        "anthropic builder output should continue documenting object nulls until a later cleanup lineage removes them: {body}"
+    );
+}
+
+#[tokio::test]
+async fn transport_prunes_object_nulls_from_stream_payload_when_enabled() {
+    let transport = TestTransport::default();
+    let model = build_model(transport.clone());
+
+    let prompt = vec![
+        v2t::PromptMessage::System {
+            content: "system".into(),
+            provider_options: anthropic_cache_control_options(),
+        },
+        v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "hi".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        },
+    ];
+    let mut options = v2t::CallOptions::new(prompt);
+    options.tools = vec![provider_tool(
+        "anthropic.web_fetch_20250910",
+        json!({
+            "maxUses": 1,
+            "allowedDomains": ["example.com"],
+            "citations": {"enabled": true}
+        }),
+    )];
+
+    let response = model.do_stream(options).await.expect("stream response");
+    let builder_body = response.request_body.expect("builder request body");
+    assert!(
+        contains_object_null(&builder_body),
+        "builder request body should still show the pre-transport null evidence: {builder_body}"
+    );
+
+    let wire_body = transport.last_body().expect("wire request body");
+    assert!(
+        !contains_object_null(&wire_body),
+        "transport should strip object nulls before sending the Anthropic stream payload: {wire_body}"
     );
 }
