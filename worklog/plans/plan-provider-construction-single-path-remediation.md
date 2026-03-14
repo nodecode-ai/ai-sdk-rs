@@ -80,7 +80,7 @@
 ## Atomic Slices
 
 - [x] `PC0` Lock representative construction surfaces with focused compile coverage.
-  Lineage commit: `<fill after landing>`
+  Lineage commit: `d2af584`
   Commit subject: `test(api): lock provider construction happy paths`
   Lineage parent: `HEAD`
   Scope:
@@ -92,8 +92,8 @@
   - tests distinguish happy-path construction from advanced registry construction
   - no production constructor refactor lands in this slice
 
-- [ ] `PC1` Introduce one canonical typed construction surface per capability.
-  Lineage commit: `<pending>`
+- [x] `PC1` Introduce one canonical typed construction surface per capability.
+  Lineage commit: `<fill after landing>`
   Commit subject: `refactor(api): add canonical provider constructors`
   Lineage parent: `PC0`
   Scope:

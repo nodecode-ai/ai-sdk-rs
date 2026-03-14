@@ -149,6 +149,16 @@ impl<T: HttpTransport> OpenAICompatibleEmbeddingModel<T> {
     }
 }
 
+impl OpenAICompatibleEmbeddingModel<crate::reqwest_transport::ReqwestTransport> {
+    pub fn builder(
+        model_id: impl Into<String>,
+    ) -> crate::provider_openai_compatible::provider::OpenAICompatibleEmbeddingBuilder {
+        crate::provider_openai_compatible::provider::OpenAICompatibleEmbeddingBuilder::new(
+            model_id,
+        )
+    }
+}
+
 #[async_trait::async_trait]
 impl<T: HttpTransport + Send + Sync> EmbeddingModel for OpenAICompatibleEmbeddingModel<T> {
     fn provider_name(&self) -> &'static str {

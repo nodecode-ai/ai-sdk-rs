@@ -67,8 +67,8 @@ fn apply_user_agent_suffix(headers: &mut BTreeMap<String, String>) {
     headers.insert("user-agent".into(), value);
 }
 
-fn build_headers(
-    def: &ProviderDefinition,
+fn build_headers_from_pairs(
+    header_pairs: &[(String, String)],
     api_key: Option<String>,
     bearer: Option<String>,
 ) -> Vec<(String, String)> {
@@ -76,7 +76,7 @@ fn build_headers(
     for (k, v) in default_headers_from_creds(api_key, bearer) {
         headers.insert(k.to_ascii_lowercase(), v);
     }
-    for (k, v) in def.headers.iter() {
+    for (k, v) in header_pairs.iter() {
         let kl = k.to_ascii_lowercase();
         if kl == "content-type" || kl == "accept" || kl == "authorization" || kl == "x-api-key" {
             continue;
@@ -99,43 +99,416 @@ struct BaseConfig {
     default_options: Option<v2t::ProviderOptions>,
 }
 
-fn build_base_config(
-    def: &ProviderDefinition,
-    creds: &Credentials,
+fn build_base_config_from_parts(
+    provider_scope_name: &str,
+    base_url: String,
+    header_pairs: Vec<(String, String)>,
+    api_key: Option<String>,
+    bearer: Option<String>,
+    transport_cfg: TransportConfig,
+    query_params: Vec<(String, String)>,
+    default_options: Option<v2t::ProviderOptions>,
 ) -> Result<BaseConfig, SdkError> {
-    let api_key = creds.as_api_key();
-    let bearer = creds.as_bearer();
-    let base_url = def.base_url.trim().to_string();
+    let base_url = base_url.trim().to_string();
     if base_url.is_empty() {
         return Err(SdkError::InvalidArgument {
             message: format!(
                 "openai-compatible provider '{}' requires base_url",
-                def.name
+                provider_scope_name
             ),
         });
     }
-    let default_options = extract_default_options(def);
-    let headers = build_headers(def, api_key, bearer);
-
-    tracing::info!(
-        "[PROVOPTS]: openai-compatible headers {:?}",
-        def.headers.keys().collect::<Vec<_>>()
-    );
-
-    let cfg = build_provider_transport_config(def, None);
-    let http =
-        crate::reqwest_transport::ReqwestTransport::try_new(&cfg).map_err(SdkError::Transport)?;
-    let query_params = collect_query_params(def);
+    let headers = build_headers_from_pairs(&header_pairs, api_key, bearer);
+    let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
+        .map_err(SdkError::Transport)?;
 
     Ok(BaseConfig {
         base_url,
         headers,
         http,
-        transport_cfg: cfg,
+        transport_cfg,
         query_params,
         default_options,
     })
 }
+
+#[derive(Clone, Debug)]
+struct OpenAICompatibleBuilderBase {
+    model_id: String,
+    provider_scope_name: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    bearer: Option<String>,
+    headers: Vec<(String, String)>,
+    query_params: Vec<(String, String)>,
+    transport_cfg: TransportConfig,
+    default_options: Option<v2t::ProviderOptions>,
+}
+
+impl OpenAICompatibleBuilderBase {
+    fn new(model_id: impl Into<String>) -> Self {
+        Self {
+            model_id: model_id.into(),
+            provider_scope_name: "openai-compatible".into(),
+            base_url: None,
+            api_key: None,
+            bearer: None,
+            headers: Vec::new(),
+            query_params: Vec::new(),
+            transport_cfg: TransportConfig::default(),
+            default_options: None,
+        }
+    }
+
+    fn with_provider_scope_name(mut self, provider_scope_name: impl Into<String>) -> Self {
+        self.provider_scope_name = provider_scope_name.into();
+        self
+    }
+
+    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
+    fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    fn with_bearer(mut self, bearer: impl Into<String>) -> Self {
+        self.bearer = Some(bearer.into());
+        self
+    }
+
+    fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((key.into(), value.into()));
+        self
+    }
+
+    fn with_headers<I, K, V>(mut self, headers: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.headers
+            .extend(headers.into_iter().map(|(key, value)| (key.into(), value.into())));
+        self
+    }
+
+    fn with_query_param(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.query_params.push((key.into(), value.into()));
+        self
+    }
+
+    fn with_query_params<I, K, V>(mut self, query_params: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.query_params.extend(
+            query_params
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
+        self
+    }
+
+    fn with_transport_config(mut self, transport_cfg: TransportConfig) -> Self {
+        self.transport_cfg = transport_cfg;
+        self
+    }
+
+    fn with_default_options(mut self, default_options: v2t::ProviderOptions) -> Self {
+        self.default_options = Some(default_options);
+        self
+    }
+
+    fn build(
+        self,
+    ) -> Result<(String, String, BaseConfig), SdkError> {
+        let provider_scope_name = self.provider_scope_name;
+        let model_id = self.model_id;
+        let base = build_base_config_from_parts(
+            &provider_scope_name,
+            self.base_url.unwrap_or_default(),
+            self.headers,
+            self.api_key,
+            self.bearer,
+            self.transport_cfg,
+            self.query_params,
+            self.default_options,
+        )?;
+        Ok((model_id, provider_scope_name, base))
+    }
+}
+
+macro_rules! impl_openai_compatible_builder_common {
+    ($name:ident) => {
+        impl $name {
+            pub fn with_provider_scope_name(
+                mut self,
+                provider_scope_name: impl Into<String>,
+            ) -> Self {
+                self.base = self.base.with_provider_scope_name(provider_scope_name);
+                self
+            }
+
+            pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+                self.base = self.base.with_base_url(base_url);
+                self
+            }
+
+            pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+                self.base = self.base.with_api_key(api_key);
+                self
+            }
+
+            pub fn with_bearer(mut self, bearer: impl Into<String>) -> Self {
+                self.base = self.base.with_bearer(bearer);
+                self
+            }
+
+            pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+                self.base = self.base.with_header(key, value);
+                self
+            }
+
+            pub fn with_headers<I, K, V>(mut self, headers: I) -> Self
+            where
+                I: IntoIterator<Item = (K, V)>,
+                K: Into<String>,
+                V: Into<String>,
+            {
+                self.base = self.base.with_headers(headers);
+                self
+            }
+
+            pub fn with_query_param(
+                mut self,
+                key: impl Into<String>,
+                value: impl Into<String>,
+            ) -> Self {
+                self.base = self.base.with_query_param(key, value);
+                self
+            }
+
+            pub fn with_query_params<I, K, V>(mut self, query_params: I) -> Self
+            where
+                I: IntoIterator<Item = (K, V)>,
+                K: Into<String>,
+                V: Into<String>,
+            {
+                self.base = self.base.with_query_params(query_params);
+                self
+            }
+
+            pub fn with_transport_config(mut self, transport_cfg: TransportConfig) -> Self {
+                self.base = self.base.with_transport_config(transport_cfg);
+                self
+            }
+
+            pub fn with_default_options(
+                mut self,
+                default_options: v2t::ProviderOptions,
+            ) -> Self {
+                self.base = self.base.with_default_options(default_options);
+                self
+            }
+        }
+    };
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenAICompatibleChatBuilder {
+    base: OpenAICompatibleBuilderBase,
+    include_usage: bool,
+    supports_structured_outputs: bool,
+}
+
+impl OpenAICompatibleChatBuilder {
+    pub fn new(model_id: impl Into<String>) -> Self {
+        Self {
+            base: OpenAICompatibleBuilderBase::new(model_id),
+            include_usage: true,
+            supports_structured_outputs: false,
+        }
+    }
+
+    pub fn with_include_usage(mut self, include_usage: bool) -> Self {
+        self.include_usage = include_usage;
+        self
+    }
+
+    pub fn with_structured_outputs(mut self, supports_structured_outputs: bool) -> Self {
+        self.supports_structured_outputs = supports_structured_outputs;
+        self
+    }
+
+    pub fn build(
+        self,
+    ) -> Result<OpenAICompatibleChatLanguageModel<crate::reqwest_transport::ReqwestTransport>, SdkError>
+    {
+        let (model_id, provider_scope_name, base) = self.base.build()?;
+        Ok(OpenAICompatibleChatLanguageModel::new(
+            model_id,
+            OpenAICompatibleChatConfig {
+                provider_scope_name,
+                base_url: base.base_url,
+                headers: base.headers,
+                http: base.http,
+                transport_cfg: base.transport_cfg,
+                include_usage: self.include_usage,
+                supported_urls: HashMap::from([(
+                    "text/*".to_string(),
+                    vec![r"^https?://.*/v1/chat/completions$".to_string()],
+                )]),
+                query_params: base.query_params,
+                supports_structured_outputs: self.supports_structured_outputs,
+                default_options: base.default_options,
+            },
+        ))
+    }
+}
+
+impl_openai_compatible_builder_common!(OpenAICompatibleChatBuilder);
+
+#[derive(Clone, Debug)]
+pub struct OpenAICompatibleCompletionBuilder {
+    base: OpenAICompatibleBuilderBase,
+    include_usage: bool,
+}
+
+impl OpenAICompatibleCompletionBuilder {
+    pub fn new(model_id: impl Into<String>) -> Self {
+        Self {
+            base: OpenAICompatibleBuilderBase::new(model_id),
+            include_usage: true,
+        }
+    }
+
+    pub fn with_include_usage(mut self, include_usage: bool) -> Self {
+        self.include_usage = include_usage;
+        self
+    }
+
+    pub fn build(
+        self,
+    ) -> Result<OpenAICompatibleCompletionLanguageModel<crate::reqwest_transport::ReqwestTransport>, SdkError>
+    {
+        let (model_id, provider_scope_name, base) = self.base.build()?;
+        Ok(OpenAICompatibleCompletionLanguageModel::new(
+            model_id,
+            OpenAICompatibleCompletionConfig {
+                provider_scope_name,
+                base_url: base.base_url,
+                headers: base.headers,
+                http: base.http,
+                transport_cfg: base.transport_cfg,
+                include_usage: self.include_usage,
+                supported_urls: HashMap::from([(
+                    "text/*".to_string(),
+                    vec![
+                        r"^https?://.*/v1/completions$".to_string(),
+                        r"^https?://.*/v1/chat/completions$".to_string(),
+                    ],
+                )]),
+                query_params: base.query_params,
+                default_options: base.default_options,
+            },
+        ))
+    }
+}
+
+impl_openai_compatible_builder_common!(OpenAICompatibleCompletionBuilder);
+
+#[derive(Clone, Debug)]
+pub struct OpenAICompatibleEmbeddingBuilder {
+    base: OpenAICompatibleBuilderBase,
+    max_embeddings_per_call: Option<usize>,
+    supports_parallel_calls: bool,
+}
+
+impl OpenAICompatibleEmbeddingBuilder {
+    pub fn new(model_id: impl Into<String>) -> Self {
+        Self {
+            base: OpenAICompatibleBuilderBase::new(model_id),
+            max_embeddings_per_call: Some(DEFAULT_MAX_EMBEDDINGS_PER_CALL),
+            supports_parallel_calls: true,
+        }
+    }
+
+    pub fn with_max_embeddings_per_call(
+        mut self,
+        max_embeddings_per_call: Option<usize>,
+    ) -> Self {
+        self.max_embeddings_per_call = max_embeddings_per_call;
+        self
+    }
+
+    pub fn with_supports_parallel_calls(mut self, supports_parallel_calls: bool) -> Self {
+        self.supports_parallel_calls = supports_parallel_calls;
+        self
+    }
+
+    pub fn build(
+        self,
+    ) -> Result<OpenAICompatibleEmbeddingModel<crate::reqwest_transport::ReqwestTransport>, SdkError>
+    {
+        let (model_id, provider_scope_name, base) = self.base.build()?;
+        Ok(OpenAICompatibleEmbeddingModel::new(
+            model_id,
+            OpenAICompatibleEmbeddingConfig {
+                provider_scope_name,
+                base_url: base.base_url,
+                headers: base.headers,
+                http: base.http,
+                transport_cfg: base.transport_cfg,
+                query_params: base.query_params,
+                max_embeddings_per_call: self.max_embeddings_per_call,
+                supports_parallel_calls: self.supports_parallel_calls,
+                default_options: base.default_options,
+            },
+        ))
+    }
+}
+
+impl_openai_compatible_builder_common!(OpenAICompatibleEmbeddingBuilder);
+
+#[derive(Clone, Debug)]
+pub struct OpenAICompatibleImageBuilder {
+    base: OpenAICompatibleBuilderBase,
+}
+
+impl OpenAICompatibleImageBuilder {
+    pub fn new(model_id: impl Into<String>) -> Self {
+        Self {
+            base: OpenAICompatibleBuilderBase::new(model_id),
+        }
+    }
+
+    pub fn build(
+        self,
+    ) -> Result<OpenAICompatibleImageModel<crate::reqwest_transport::ReqwestTransport>, SdkError>
+    {
+        let (model_id, provider_scope_name, base) = self.base.build()?;
+        Ok(OpenAICompatibleImageModel::new(
+            model_id,
+            OpenAICompatibleImageConfig {
+                provider_scope_name,
+                base_url: base.base_url,
+                headers: base.headers,
+                http: base.http,
+                transport_cfg: base.transport_cfg,
+                query_params: base.query_params,
+                default_options: base.default_options,
+            },
+        ))
+    }
+}
+
+impl_openai_compatible_builder_common!(OpenAICompatibleImageBuilder);
 
 fn match_openai_compatible_chat(def: &ProviderDefinition) -> bool {
     matches!(def.sdk_type, SdkType::OpenAICompatibleChat)
@@ -155,39 +528,27 @@ fn build_openai_compatible(
     model: &str,
     creds: &Credentials,
 ) -> Result<Arc<dyn LanguageModel>, SdkError> {
-    let base = build_base_config(def, creds)?;
-    let supported_urls = HashMap::from([(
-        "text/*".to_string(),
-        vec![
-            r"^https?://.*/v1/completions$".to_string(),
-            r"^https?://.*/v1/chat/completions$".to_string(),
-        ],
-    )]);
-
-    // Provider settings from internal options header
     let (include_usage_flag, _supports_structured_outputs_flag) = parse_provider_settings(def);
-    if let Some(defaults) = &base.default_options {
-        tracing::info!(
-            "[PROVOPTS]: openai-compatible default scopes {:?}",
-            defaults.keys().collect::<Vec<_>>()
-        );
+    let mut builder = OpenAICompatibleCompletionBuilder::new(model)
+        .with_provider_scope_name(def.name.clone())
+        .with_base_url(def.base_url.clone())
+        .with_headers(
+            def.headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .with_query_params(collect_query_params(def))
+        .with_transport_config(build_provider_transport_config(def, None))
+        .with_include_usage(include_usage_flag);
+    if let Some(default_options) = extract_default_options(def) {
+        builder = builder.with_default_options(default_options);
     }
-    let lm = OpenAICompatibleCompletionLanguageModel::new(
-        model.to_string(),
-        OpenAICompatibleCompletionConfig {
-            provider_scope_name: def.name.clone(),
-            base_url: base.base_url,
-            headers: base.headers,
-            http: base.http,
-            transport_cfg: base.transport_cfg,
-            include_usage: include_usage_flag,
-            supported_urls,
-            query_params: base.query_params,
-            default_options: base.default_options,
-        },
-    );
-
-    Ok(Arc::new(lm))
+    if let Some(bearer) = creds.as_bearer() {
+        builder = builder.with_bearer(bearer);
+    } else if let Some(api_key) = creds.as_api_key() {
+        builder = builder.with_api_key(api_key);
+    }
+    Ok(Arc::new(builder.build()?))
 }
 
 pub fn build_openai_compatible_chat(
@@ -195,40 +556,33 @@ pub fn build_openai_compatible_chat(
     model: &str,
     creds: &Credentials,
 ) -> Result<Arc<dyn LanguageModel>, SdkError> {
-    let base = build_base_config(def, creds)?;
-    let supported_urls = HashMap::from([(
-        "text/*".to_string(),
-        vec![r"^https?://.*/v1/chat/completions$".to_string()],
-    )]);
     let (include_usage_flag, supports_structured_outputs_flag) = parse_provider_settings(def);
     tracing::info!(
         "[PROVOPTS]: openai-compatible include_usage={} supports_structured={}",
         include_usage_flag,
         supports_structured_outputs_flag
     );
-    if let Some(defaults) = &base.default_options {
-        tracing::info!(
-            "[PROVOPTS]: openai-compatible default scopes {:?}",
-            defaults.keys().collect::<Vec<_>>()
-        );
+    let mut builder = OpenAICompatibleChatBuilder::new(model)
+        .with_provider_scope_name(def.name.clone())
+        .with_base_url(def.base_url.clone())
+        .with_headers(
+            def.headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .with_query_params(collect_query_params(def))
+        .with_transport_config(build_provider_transport_config(def, None))
+        .with_include_usage(include_usage_flag)
+        .with_structured_outputs(supports_structured_outputs_flag);
+    if let Some(default_options) = extract_default_options(def) {
+        builder = builder.with_default_options(default_options);
     }
-
-    let lm = OpenAICompatibleChatLanguageModel::new(
-        model.to_string(),
-        OpenAICompatibleChatConfig {
-            provider_scope_name: def.name.clone(),
-            base_url: base.base_url,
-            headers: base.headers,
-            http: base.http,
-            transport_cfg: base.transport_cfg,
-            include_usage: include_usage_flag,
-            supported_urls,
-            query_params: base.query_params,
-            supports_structured_outputs: supports_structured_outputs_flag,
-            default_options: base.default_options,
-        },
-    );
-    Ok(Arc::new(lm))
+    if let Some(bearer) = creds.as_bearer() {
+        builder = builder.with_bearer(bearer);
+    } else if let Some(api_key) = creds.as_api_key() {
+        builder = builder.with_api_key(api_key);
+    }
+    Ok(Arc::new(builder.build()?))
 }
 
 pub fn build_openai_compatible_completion(
@@ -244,25 +598,28 @@ pub fn build_openai_compatible_embedding(
     model: &str,
     creds: &Credentials,
 ) -> Result<Arc<dyn EmbeddingModel>, SdkError> {
-    let base = build_base_config(def, creds)?;
     let (max_embeddings_per_call, supports_parallel_calls) = parse_embedding_settings(def);
-
-    let cfg = OpenAICompatibleEmbeddingConfig {
-        provider_scope_name: def.name.clone(),
-        base_url: base.base_url,
-        headers: base.headers,
-        http: base.http,
-        transport_cfg: base.transport_cfg,
-        query_params: base.query_params,
-        max_embeddings_per_call,
-        supports_parallel_calls,
-        default_options: base.default_options,
-    };
-
-    Ok(Arc::new(OpenAICompatibleEmbeddingModel::new(
-        model.to_string(),
-        cfg,
-    )))
+    let mut builder = OpenAICompatibleEmbeddingBuilder::new(model)
+        .with_provider_scope_name(def.name.clone())
+        .with_base_url(def.base_url.clone())
+        .with_headers(
+            def.headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .with_query_params(collect_query_params(def))
+        .with_transport_config(build_provider_transport_config(def, None))
+        .with_max_embeddings_per_call(max_embeddings_per_call)
+        .with_supports_parallel_calls(supports_parallel_calls);
+    if let Some(default_options) = extract_default_options(def) {
+        builder = builder.with_default_options(default_options);
+    }
+    if let Some(bearer) = creds.as_bearer() {
+        builder = builder.with_bearer(bearer);
+    } else if let Some(api_key) = creds.as_api_key() {
+        builder = builder.with_api_key(api_key);
+    }
+    Ok(Arc::new(builder.build()?))
 }
 
 pub fn build_openai_compatible_image(
@@ -270,21 +627,25 @@ pub fn build_openai_compatible_image(
     model: &str,
     creds: &Credentials,
 ) -> Result<Arc<dyn ImageModel>, SdkError> {
-    let base = build_base_config(def, creds)?;
-    let cfg = OpenAICompatibleImageConfig {
-        provider_scope_name: def.name.clone(),
-        base_url: base.base_url,
-        headers: base.headers,
-        http: base.http,
-        transport_cfg: base.transport_cfg,
-        query_params: base.query_params,
-        default_options: base.default_options,
-    };
-
-    Ok(Arc::new(OpenAICompatibleImageModel::new(
-        model.to_string(),
-        cfg,
-    )))
+    let mut builder = OpenAICompatibleImageBuilder::new(model)
+        .with_provider_scope_name(def.name.clone())
+        .with_base_url(def.base_url.clone())
+        .with_headers(
+            def.headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .with_query_params(collect_query_params(def))
+        .with_transport_config(build_provider_transport_config(def, None));
+    if let Some(default_options) = extract_default_options(def) {
+        builder = builder.with_default_options(default_options);
+    }
+    if let Some(bearer) = creds.as_bearer() {
+        builder = builder.with_bearer(bearer);
+    } else if let Some(api_key) = creds.as_api_key() {
+        builder = builder.with_api_key(api_key);
+    }
+    Ok(Arc::new(builder.build()?))
 }
 
 inventory::submit! {

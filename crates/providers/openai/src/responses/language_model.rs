@@ -1032,30 +1032,36 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
         } else {
             self.send_session_websocket_request(body.clone()).await
         };
-        let (session_body, transport_body, stream, transport_headers, previous_response_id_used, warmup_response_id_used) =
-            match websocket_result {
-                Ok(result) => result,
-                Err(err)
-                    if transport_selection.fallback_http
-                        && should_fallback_to_http_after_websocket_error(&err) =>
-                {
-                    self.activate_http_fallback("websocket_http_fallback");
-                    return self
-                        .stream_http_request(
-                            body,
-                            options.include_raw_chunks,
-                            transport_selection.requested,
-                            &options.headers,
-                            warnings,
-                            tool_name_mapping,
-                            approval_request_id_map,
-                            store_for_stream,
-                            logprobs_enabled,
-                        )
-                        .await;
-                }
-                Err(err) => return Err(err),
-            };
+        let (
+            session_body,
+            transport_body,
+            stream,
+            transport_headers,
+            previous_response_id_used,
+            warmup_response_id_used,
+        ) = match websocket_result {
+            Ok(result) => result,
+            Err(err)
+                if transport_selection.fallback_http
+                    && should_fallback_to_http_after_websocket_error(&err) =>
+            {
+                self.activate_http_fallback("websocket_http_fallback");
+                return self
+                    .stream_http_request(
+                        body,
+                        options.include_raw_chunks,
+                        transport_selection.requested,
+                        &options.headers,
+                        warnings,
+                        tool_name_mapping,
+                        approval_request_id_map,
+                        store_for_stream,
+                        logprobs_enabled,
+                    )
+                    .await;
+            }
+            Err(err) => return Err(err),
+        };
         let response_headers = self.response_headers(
             transport_headers,
             transport_selection.requested,
@@ -1245,40 +1251,27 @@ fn response_headers_with_transport(
 
 // Convenience constructor for default reqwest transport
 impl OpenAIResponsesLanguageModel<crate::reqwest_transport::ReqwestTransport> {
+    pub fn builder(
+        model_id: impl Into<String>,
+    ) -> crate::provider_openai::provider::OpenAIResponsesBuilder {
+        crate::provider_openai::provider::OpenAIResponsesBuilder::new(model_id)
+    }
+
     pub fn create_simple(
         model_id: impl Into<String>,
         base_url: Option<String>,
         api_key: String,
     ) -> Self {
-        let mut cfg = TransportConfig::default();
-        cfg.idle_read_timeout = std::time::Duration::from_secs(45);
-        let http = crate::reqwest_transport::ReqwestTransport::new(&cfg);
-        let mut headers: Vec<(String, String)> = vec![
-            ("content-type".into(), "application/json".into()),
-            ("accept".into(), "application/json".into()),
-        ];
-        if !api_key.is_empty() {
-            headers.push(("authorization".into(), format!("Bearer {}", api_key)));
+        let mut builder = Self::builder(model_id);
+        if let Some(base_url) = base_url {
+            builder = builder.with_base_url(base_url);
         }
-        let config = OpenAIConfig {
-            provider_name: "openai.responses".into(),
-            provider_scope_name: "openai".into(),
-            base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
-            endpoint_path: "/responses".into(),
-            headers,
-            query_params: vec![],
-            supported_urls: HashMap::from([
-                ("image/*".to_string(), vec![r"^https?://.*$".to_string()]),
-                (
-                    "application/pdf".to_string(),
-                    vec![r"^https?://.*$".to_string()],
-                ),
-            ]),
-            file_id_prefixes: Some(vec!["file-".into()]),
-            default_options: None,
-            request_defaults: None,
-        };
-        OpenAIResponsesLanguageModel::new(model_id, config, http, cfg)
+        if !api_key.is_empty() {
+            builder = builder.with_api_key(api_key);
+        }
+        builder
+            .build()
+            .expect("openai builder should create the default reqwest transport")
     }
 }
 

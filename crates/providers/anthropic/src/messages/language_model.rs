@@ -1286,6 +1286,14 @@ impl<T: HttpTransport> AnthropicMessagesLanguageModel<T> {
     }
 }
 
+impl AnthropicMessagesLanguageModel<crate::reqwest_transport::ReqwestTransport> {
+    pub fn builder(
+        model_id: impl Into<AnthropicMessagesModelId>,
+    ) -> crate::provider_anthropic::provider::AnthropicMessagesBuilder {
+        crate::provider_anthropic::provider::AnthropicMessagesBuilder::new(model_id.into())
+    }
+}
+
 #[async_trait]
 impl<T: HttpTransport + Send + Sync> LanguageModel for AnthropicMessagesLanguageModel<T> {
     fn provider_name(&self) -> &'static str {

@@ -185,6 +185,14 @@ impl<T: HttpTransport> OpenAICompatibleChatLanguageModel<T> {
     }
 }
 
+impl OpenAICompatibleChatLanguageModel<crate::reqwest_transport::ReqwestTransport> {
+    pub fn builder(
+        model_id: impl Into<String>,
+    ) -> crate::provider_openai_compatible::provider::OpenAICompatibleChatBuilder {
+        crate::provider_openai_compatible::provider::OpenAICompatibleChatBuilder::new(model_id)
+    }
+}
+
 #[async_trait]
 impl<T: HttpTransport + Send + Sync> LanguageModel for OpenAICompatibleChatLanguageModel<T> {
     fn provider_name(&self) -> &'static str {
