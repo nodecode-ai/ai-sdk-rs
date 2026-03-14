@@ -121,8 +121,8 @@
   - pseudo-crate alias plumbing is removed rather than left as compatibility scaffolding
   - the internal module tree has one ownership model end to end
 
-- [ ] `MT3` Validate the surviving single module tree.
-  Lineage commit: `<pending>`
+- [x] `MT3` Validate the surviving single module tree.
+  Lineage commit: `b56b793`
   Commit subject: `test(layout): validate single module tree`
   Lineage parent: `MT2`
   Scope:
