@@ -6,10 +6,14 @@ use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
 use crate::ai_sdk_core::{GenerateResponse, LanguageModel, SdkError, StreamResponse};
 use crate::ai_sdk_types::v2 as v2t;
 
-use super::options::{parse_google_provider_options, GoogleProviderOptions, ThinkingConfig};
-use super::prompt::{convert_to_google_prompt, GooglePrompt};
-use crate::provider_google::error::map_transport_error_to_sdk_error;
-use crate::provider_google::prepare_tools::{convert_json_schema_to_openapi_schema, prepare_tools};
+use crate::provider_google::shared::error::map_transport_error_to_sdk_error;
+use crate::provider_google::shared::options::{
+    parse_google_provider_options_for_scopes, GoogleProviderOptions, ThinkingConfig,
+};
+use crate::provider_google::shared::prepare_tools::{
+    convert_json_schema_to_openapi_schema, prepare_tools,
+};
+use crate::provider_google::shared::prompt::{convert_to_google_prompt_with_scopes, GooglePrompt};
 use crate::provider_google::shared::stream_core::build_google_stream_part_stream;
 
 const TRACE_PREFIX: &str = "[GOOGLE-V2]";
@@ -100,7 +104,7 @@ impl<T: HttpTransport> GoogleGenAiLanguageModel<T> {
 
         // provider options
         let google_opts: Option<GoogleProviderOptions> =
-            parse_google_provider_options(&options.provider_options);
+            parse_google_provider_options_for_scopes(&options.provider_options, &["google"]);
 
         // thinking include thoughts warning for non-vertex provider
         if self.cfg.warn_on_include_thoughts {
@@ -124,7 +128,8 @@ impl<T: HttpTransport> GoogleGenAiLanguageModel<T> {
         }
 
         // prompt conversion
-        let prompt = convert_to_google_prompt(&options.prompt, self.is_gemma())?;
+        let prompt =
+            convert_to_google_prompt_with_scopes(&options.prompt, self.is_gemma(), &["google"])?;
         let GooglePrompt {
             system_instruction,
             contents,
