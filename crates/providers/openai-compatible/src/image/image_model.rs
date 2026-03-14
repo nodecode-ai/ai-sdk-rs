@@ -306,6 +306,14 @@ impl<T: HttpTransport> OpenAICompatibleImageModel<T> {
     }
 }
 
+impl OpenAICompatibleImageModel<crate::reqwest_transport::ReqwestTransport> {
+    pub fn builder(
+        model_id: impl Into<String>,
+    ) -> crate::provider_openai_compatible::provider::OpenAICompatibleImageBuilder {
+        crate::provider_openai_compatible::provider::OpenAICompatibleImageBuilder::new(model_id)
+    }
+}
+
 #[async_trait::async_trait]
 impl<T: HttpTransport + Send + Sync> ImageModel for OpenAICompatibleImageModel<T> {
     fn provider_name(&self) -> &'static str {

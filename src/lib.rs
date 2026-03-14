@@ -1,12 +1,7 @@
-#[path = "../crates/core/src/lib.rs"]
 pub mod core;
-#[path = "../crates/provider/src/lib.rs"]
 pub mod provider;
-#[path = "../crates/streaming-sse/src/lib.rs"]
 pub mod streaming_sse;
-#[path = "../crates/transports/reqwest/src/lib.rs"]
 pub mod transport_reqwest;
-#[path = "../crates/sdk-types/src/lib.rs"]
 pub mod types;
 
 #[path = "../crates/providers/amazon-bedrock/src/lib.rs"]

@@ -76,8 +76,8 @@
 
 ## Atomic Slices
 
-- [ ] `MT0` Lock public surface and topology evidence.
-  Lineage commit: `<pending>`
+- [x] `MT0` Lock public surface and topology evidence.
+  Lineage commit: `7f9b581`
   Commit subject: `test(layout): lock single module tree seam`
   Lineage parent: `HEAD`
   Scope:
