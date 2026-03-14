@@ -107,8 +107,8 @@
   - public exports remain unchanged
   - no provider implementation behavior changes beyond import rewiring land in this slice
 
-- [ ] `MT2` Move provider implementations onto the same module tree and delete pseudo-crate aliases.
-  Lineage commit: `<pending>`
+- [x] `MT2` Move provider implementations onto the same module tree and delete pseudo-crate aliases.
+  Lineage commit: `3655fad`
   Commit subject: `refactor(layout): remove pseudo crate provider aliases`
   Lineage parent: `MT1`
   Scope:

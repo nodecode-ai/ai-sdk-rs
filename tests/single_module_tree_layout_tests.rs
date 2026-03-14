@@ -41,10 +41,10 @@ fn public_surface_reexports_compile() {
 }
 
 #[test]
-fn lib_root_still_records_the_crates_mount_seam() {
+fn lib_root_uses_direct_module_tree_without_pseudo_crate_aliases() {
     let lib_rs = include_str!("../src/lib.rs");
 
-    for mounted in [
+    for removed_mount in [
         r#"#[path = "../crates/core/src/lib.rs"]"#,
         r#"#[path = "../crates/provider/src/lib.rs"]"#,
         r#"#[path = "../crates/streaming-sse/src/lib.rs"]"#,
@@ -54,12 +54,12 @@ fn lib_root_still_records_the_crates_mount_seam() {
         r#"#[path = "../crates/providers/openai-compatible/src/lib.rs"]"#,
     ] {
         assert!(
-            lib_rs.contains(mounted),
-            "expected src/lib.rs to keep the current path-mount seam: {mounted}",
+            !lib_rs.contains(removed_mount),
+            "expected src/lib.rs to stop path-mounting provider trees: {removed_mount}",
         );
     }
 
-    for alias in [
+    for removed_alias in [
         "pub(crate) use crate::core as ai_sdk_core;",
         "pub(crate) use crate::provider as ai_sdk_provider;",
         "pub(crate) use crate::provider_openai as ai_sdk_providers_openai;",
@@ -68,8 +68,13 @@ fn lib_root_still_records_the_crates_mount_seam() {
         "pub(crate) use crate::types as ai_sdk_types;",
     ] {
         assert!(
-            lib_rs.contains(alias),
-            "expected src/lib.rs to keep the current pseudo-crate alias seam: {alias}",
+            !lib_rs.contains(removed_alias),
+            "expected src/lib.rs to stop exporting pseudo-crate aliases: {removed_alias}",
         );
     }
+
+    assert!(
+        lib_rs.contains("pub mod providers;"),
+        "expected src/lib.rs to expose the real provider module tree",
+    );
 }
