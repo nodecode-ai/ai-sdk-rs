@@ -6,17 +6,37 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::json;
 
-use crate::ai_sdk_core::error::TransportError;
+use crate::ai_sdk_core::error::{SdkError, TransportError};
 use crate::ai_sdk_types::v2 as v2t;
-use crate::provider_google::gen_ai::options::parse_google_provider_options;
-use crate::provider_google::gen_ai::prompt::{
-    convert_to_google_prompt as convert_google_prompt, GoogleContent, GoogleContentPart,
+use crate::provider_google::shared::options::{
+    parse_google_provider_options_for_scopes, GoogleProviderOptions,
 };
-use crate::provider_google::prepare_tools::prepare_tools as prepare_google_tools;
+use crate::provider_google::shared::prepare_tools::prepare_tools as prepare_google_family_tools;
+use crate::provider_google::shared::prompt::{
+    convert_to_google_prompt_with_scopes, GoogleContent, GoogleContentPart, GooglePrompt,
+};
 use crate::provider_google::shared::stream_core::build_google_stream_part_stream;
-use crate::provider_google_vertex::options::parse_google_vertex_provider_options;
-use crate::provider_google_vertex::prepare_tools::prepare_tools as prepare_vertex_tools;
-use crate::provider_google_vertex::prompt::convert_to_google_prompt as convert_vertex_prompt;
+
+const GOOGLE_SCOPES: &[&str] = &["google"];
+const GOOGLE_VERTEX_SCOPES: &[&str] = &["google-vertex", "google"];
+
+fn parse_google_provider_options(opts: &v2t::ProviderOptions) -> Option<GoogleProviderOptions> {
+    parse_google_provider_options_for_scopes(opts, GOOGLE_SCOPES)
+}
+
+fn parse_google_vertex_provider_options(
+    opts: &v2t::ProviderOptions,
+) -> Option<GoogleProviderOptions> {
+    parse_google_provider_options_for_scopes(opts, GOOGLE_VERTEX_SCOPES)
+}
+
+fn convert_google_prompt(prompt: &v2t::Prompt, is_gemma: bool) -> Result<GooglePrompt, SdkError> {
+    convert_to_google_prompt_with_scopes(prompt, is_gemma, GOOGLE_SCOPES)
+}
+
+fn convert_vertex_prompt(prompt: &v2t::Prompt, is_gemma: bool) -> Result<GooglePrompt, SdkError> {
+    convert_to_google_prompt_with_scopes(prompt, is_gemma, GOOGLE_VERTEX_SCOPES)
+}
 
 fn provider_tool(id: &str, args: serde_json::Value) -> v2t::Tool {
     v2t::Tool::Provider(v2t::ProviderTool {
@@ -50,8 +70,8 @@ fn prepare_tools_function_path_parity_between_google_and_vertex() {
         name: "calc".to_string(),
     });
 
-    let google = prepare_google_tools(&tools, &choice, "gemini-2.5-flash");
-    let vertex = prepare_vertex_tools(&tools, &choice, "gemini-2.5-flash");
+    let google = prepare_google_family_tools(&tools, &choice, "gemini-2.5-flash");
+    let vertex = prepare_google_family_tools(&tools, &choice, "gemini-2.5-flash");
 
     assert_eq!(google.tools, vertex.tools);
     assert_eq!(google.tool_config, vertex.tool_config);
@@ -71,8 +91,8 @@ fn prepare_tools_provider_path_parity_between_google_and_vertex() {
         }),
     )];
 
-    let google = prepare_google_tools(&tools, &None, "gemini-1.5-flash");
-    let vertex = prepare_vertex_tools(&tools, &None, "gemini-1.5-flash");
+    let google = prepare_google_family_tools(&tools, &None, "gemini-1.5-flash");
+    let vertex = prepare_google_family_tools(&tools, &None, "gemini-1.5-flash");
 
     assert_eq!(google.tools, vertex.tools);
     assert_eq!(google.tool_config, vertex.tool_config);
@@ -113,9 +133,7 @@ fn provider_option_scope_resolution_matches_expected_behavior() {
     );
 }
 
-fn first_model_text_signature(
-    prompt: &crate::provider_google::gen_ai::prompt::GooglePrompt,
-) -> Option<String> {
+fn first_model_text_signature(prompt: &GooglePrompt) -> Option<String> {
     prompt.contents.iter().find_map(|content| match content {
         GoogleContent::Model { parts } => parts.iter().find_map(|part| match part {
             GoogleContentPart::Text {
@@ -174,6 +192,15 @@ fn stream_input(
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>> {
     let data = format!("data: {}\n\n", payload);
     Box::pin(futures_util::stream::iter(vec![Ok(Bytes::from(data))]))
+}
+
+fn stream_inputs(
+    payloads: Vec<serde_json::Value>,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>> {
+    let items = payloads
+        .into_iter()
+        .map(|payload| Ok(Bytes::from(format!("data: {payload}\n\n"))));
+    Box::pin(futures_util::stream::iter(items))
 }
 
 fn metadata_scope(meta: &Option<v2t::ProviderMetadata>) -> Option<String> {
@@ -258,4 +285,97 @@ async fn shared_stream_core_preserves_provider_scope_namespace() {
     assert!(matches!(vertex_finish_reason, v2t::FinishReason::Stop));
     assert_eq!(google_scope.as_deref(), Some("google"));
     assert_eq!(vertex_scope.as_deref(), Some("google-vertex"));
+}
+
+#[tokio::test]
+async fn shared_stream_core_normalizes_reasoning_tool_raw_and_finish() {
+    let payload = json!({
+        "candidates": [{
+            "content": {
+                "parts": [
+                    {
+                        "text": "hidden reasoning",
+                        "thought": true,
+                        "thoughtSignature": "sig-456"
+                    },
+                    {
+                        "text": "visible answer"
+                    },
+                    {
+                        "functionCall": {
+                            "name": "weather",
+                            "args": {"city": "SF"}
+                        }
+                    }
+                ]
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 2,
+            "candidatesTokenCount": 3,
+            "totalTokenCount": 5,
+            "thoughtsTokenCount": 1
+        }
+    });
+
+    let mut google_stream =
+        build_google_stream_part_stream(stream_inputs(vec![payload]), vec![], true, "google");
+    let mut parts = Vec::new();
+    while let Some(part) = google_stream.next().await {
+        parts.push(part.expect("google stream part"));
+    }
+
+    assert!(matches!(&parts[0], v2t::StreamPart::StreamStart { warnings } if warnings.is_empty()));
+    assert!(matches!(&parts[1], v2t::StreamPart::Raw { .. }));
+    assert!(matches!(
+        &parts[2],
+        v2t::StreamPart::ReasoningStart { provider_metadata, .. }
+            if metadata_scope(provider_metadata).as_deref() == Some("google")
+    ));
+    assert!(matches!(
+        &parts[3],
+        v2t::StreamPart::ReasoningDelta { delta, .. } if delta == "hidden reasoning"
+    ));
+    assert!(matches!(&parts[4], v2t::StreamPart::ReasoningEnd { .. }));
+    assert!(matches!(&parts[5], v2t::StreamPart::TextStart { .. }));
+    assert!(matches!(
+        &parts[6],
+        v2t::StreamPart::TextDelta { delta, .. } if delta == "visible answer"
+    ));
+    assert!(matches!(
+        &parts[7],
+        v2t::StreamPart::ToolInputStart { tool_name, provider_executed, .. }
+            if tool_name == "weather" && !provider_executed
+    ));
+    assert!(matches!(
+        &parts[8],
+        v2t::StreamPart::ToolInputDelta { delta, provider_executed, .. }
+            if delta == "{\"city\":\"SF\"}" && !provider_executed
+    ));
+    assert!(matches!(
+        &parts[9],
+        v2t::StreamPart::ToolInputEnd { provider_executed, .. } if !provider_executed
+    ));
+    assert!(matches!(
+        &parts[10],
+        v2t::StreamPart::ToolCall(call)
+            if call.tool_name == "weather"
+                && call.input == "{\"city\":\"SF\"}"
+                && !call.provider_executed
+    ));
+    assert!(matches!(&parts[11], v2t::StreamPart::TextEnd { .. }));
+    assert!(matches!(
+        &parts[12],
+        v2t::StreamPart::Finish {
+            usage,
+            finish_reason,
+            provider_metadata,
+        } if usage.input_tokens == Some(2)
+            && usage.output_tokens == Some(3)
+            && usage.total_tokens == Some(5)
+            && usage.reasoning_tokens == Some(1)
+            && matches!(finish_reason, v2t::FinishReason::ToolCalls)
+            && metadata_scope(provider_metadata).as_deref() == Some("google")
+    ));
 }

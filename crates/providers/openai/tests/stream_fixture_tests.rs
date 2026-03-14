@@ -142,6 +142,16 @@ async fn collect_parts(
     tools: Vec<v2t::Tool>,
     provider_options: Option<v2t::ProviderOptions>,
 ) -> Vec<v2t::StreamPart> {
+    collect_parts_with_raw(fixture, model_id, tools, provider_options, false).await
+}
+
+async fn collect_parts_with_raw(
+    fixture: &str,
+    model_id: &str,
+    tools: Vec<v2t::Tool>,
+    provider_options: Option<v2t::ProviderOptions>,
+    include_raw_chunks: bool,
+) -> Vec<v2t::StreamPart> {
     let transport = FixtureTransport::from_fixture(fixture);
     let model = OpenAIResponsesLanguageModel::new(
         model_id,
@@ -159,6 +169,7 @@ async fn collect_parts(
         }],
         tools,
         provider_options: provider_options.unwrap_or_default(),
+        include_raw_chunks,
         ..Default::default()
     };
     let resp = model.do_stream(opts).await.expect("stream");
@@ -669,6 +680,43 @@ async fn stream_apply_patch_delete_fixture() {
     let inputs = tool_input_starts(&parts, "apply_patch");
     assert!(!inputs.is_empty());
     assert!(inputs.iter().all(|exec| !*exec));
+}
+
+#[tokio::test]
+async fn stream_fixture_can_include_raw_chunks() {
+    let tools = vec![provider_tool("openai.local_shell", "shell", json!({}))];
+    let parts = collect_parts_with_raw(
+        "openai-local-shell-tool.1",
+        "gpt-5-codex",
+        tools,
+        None,
+        true,
+    )
+    .await;
+
+    assert_ok_stream(&parts);
+
+    let raw_indices: Vec<usize> = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, part)| match part {
+            v2t::StreamPart::Raw { .. } => Some(idx),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !raw_indices.is_empty(),
+        "openai responses stream should emit raw chunks when include_raw_chunks is enabled"
+    );
+
+    let response_metadata_idx = parts
+        .iter()
+        .position(|part| matches!(part, v2t::StreamPart::ResponseMetadata { .. }))
+        .expect("response metadata part");
+    assert!(
+        raw_indices[0] < response_metadata_idx,
+        "raw passthrough should remain on the provider-chunk side of normalized response metadata"
+    );
 }
 
 #[tokio::test]

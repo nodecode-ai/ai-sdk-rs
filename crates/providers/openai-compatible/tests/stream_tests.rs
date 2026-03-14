@@ -509,3 +509,50 @@ async fn newly_routed_scopes_preserve_stream_usage_and_provider_metadata_shape()
         assert_eq!(scoped_meta.get("rejectedPredictionTokens"), Some(&json!(1)));
     }
 }
+
+#[tokio::test]
+async fn streams_raw_chunks_alongside_normalized_parts() {
+    let first_payload = json!({
+        "id":"chat-raw-1",
+        "model":"grok-beta",
+        "created":321,
+        "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]
+    });
+    let second_payload = json!({
+        "id":"chat-raw-1",
+        "choices":[{"index":0,"delta":{"content":"Hello raw"},"finish_reason":"stop"}]
+    });
+
+    let parts: Vec<v2t::StreamPart> = build_stream(
+        stream::iter(vec![
+            json_chunk(first_payload.clone()),
+            json_chunk(second_payload.clone()),
+            chunk("data: [DONE]\n\n"),
+        ]),
+        StreamSettings {
+            warnings: vec![],
+            include_raw: true,
+            include_usage: false,
+            provider_scope_name: "openai-compatible".into(),
+        },
+        StreamMode::Chat,
+    )
+    .try_collect()
+    .await
+    .expect("stream parts");
+
+    let raw_parts: Vec<serde_json::Value> = parts
+        .iter()
+        .filter_map(|part| match part {
+            v2t::StreamPart::Raw { raw_value } => Some(raw_value.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(raw_parts, vec![first_payload, second_payload]);
+    assert!(parts.iter().any(
+        |part| matches!(part, v2t::StreamPart::TextDelta { delta, .. } if delta == "Hello raw")
+    ));
+    assert!(parts
+        .iter()
+        .any(|part| matches!(part, v2t::StreamPart::Finish { .. })));
+}

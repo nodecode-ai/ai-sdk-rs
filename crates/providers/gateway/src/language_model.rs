@@ -914,3 +914,178 @@ fn content_from_value(value: Option<&JsonValue>) -> Result<Vec<v2t::Content>, Sd
         None => Ok(vec![]),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::decode_gateway_stream;
+    use crate::ai_sdk_core::SdkError;
+    use crate::ai_sdk_types::v2 as v2t;
+    use bytes::Bytes;
+    use futures_util::{stream, TryStreamExt};
+    use serde_json::json;
+
+    fn sse_chunk(value: serde_json::Value) -> Result<Bytes, SdkError> {
+        Ok(Bytes::from(format!("data: {value}\n\n")))
+    }
+
+    #[tokio::test]
+    async fn decode_gateway_stream_normalizes_text_reasoning_tool_raw_and_finish() {
+        let parts: Vec<v2t::StreamPart> = decode_gateway_stream(
+            stream::iter(vec![
+                sse_chunk(json!({
+                    "type": "stream-start",
+                    "warnings": [{"type": "other", "message": "gateway warning"}]
+                })),
+                sse_chunk(json!({
+                    "type": "response-metadata",
+                    "id": "resp-gateway-1",
+                    "modelId": "gateway-model",
+                    "timestamp": "2026-01-02T03:04:05Z"
+                })),
+                sse_chunk(json!({
+                    "type": "reasoning-delta",
+                    "delta": "thinking",
+                    "providerMetadata": {"gateway": {"phase": "reasoning"}}
+                })),
+                sse_chunk(json!({
+                    "type": "text-delta",
+                    "delta": "hello",
+                    "providerMetadata": {"gateway": {"phase": "text"}}
+                })),
+                sse_chunk(json!({
+                    "type": "tool-input-start",
+                    "id": "call-1",
+                    "toolName": "weather",
+                    "providerExecuted": false
+                })),
+                sse_chunk(json!({
+                    "type": "tool-input-delta",
+                    "id": "call-1",
+                    "delta": "{\"city\":\"SF\"}",
+                    "providerExecuted": false
+                })),
+                sse_chunk(json!({
+                    "type": "tool-input-end",
+                    "id": "call-1",
+                    "providerExecuted": false
+                })),
+                sse_chunk(json!({
+                    "type": "tool-call",
+                    "toolCallId": "call-1",
+                    "toolName": "weather",
+                    "input": {"city": "SF"},
+                    "providerExecuted": false
+                })),
+                sse_chunk(json!({
+                    "type": "raw",
+                    "rawValue": {"upstream": "frame-9"}
+                })),
+                sse_chunk(json!({
+                    "type": "finish",
+                    "finishReason": "tool-calls",
+                    "usage": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 3,
+                        "total_tokens": 5
+                    },
+                    "providerMetadata": {"gateway": {"finishSource": "gateway"}}
+                })),
+                Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+            ]),
+            true,
+        )
+        .try_collect()
+        .await
+        .expect("gateway stream parts");
+
+        assert!(matches!(
+            &parts[0],
+            v2t::StreamPart::StreamStart { warnings }
+                if warnings.len() == 1
+                    && matches!(
+                        warnings[0],
+                        v2t::CallWarning::Other { ref message } if message == "gateway warning"
+                    )
+        ));
+        assert!(matches!(
+            &parts[1],
+            v2t::StreamPart::ResponseMetadata { meta }
+                if meta.id.as_deref() == Some("resp-gateway-1")
+                    && meta.model_id.as_deref() == Some("gateway-model")
+        ));
+        assert!(matches!(
+            &parts[2],
+            v2t::StreamPart::ReasoningStart { id, provider_metadata }
+                if id == "reasoning-1"
+                    && provider_metadata
+                        .as_ref()
+                        .and_then(|meta| meta.get("gateway"))
+                        .and_then(|inner| inner.get("phase"))
+                        == Some(&json!("reasoning"))
+        ));
+        assert!(matches!(
+            &parts[3],
+            v2t::StreamPart::ReasoningDelta { id, delta, .. }
+                if id == "reasoning-1" && delta == "thinking"
+        ));
+        assert!(matches!(
+            &parts[4],
+            v2t::StreamPart::TextStart { id, provider_metadata }
+                if id == "text-1"
+                    && provider_metadata
+                        .as_ref()
+                        .and_then(|meta| meta.get("gateway"))
+                        .and_then(|inner| inner.get("phase"))
+                        == Some(&json!("text"))
+        ));
+        assert!(matches!(
+            &parts[5],
+            v2t::StreamPart::TextDelta { id, delta, .. }
+                if id == "text-1" && delta == "hello"
+        ));
+        assert!(matches!(
+            &parts[6],
+            v2t::StreamPart::ToolInputStart { id, tool_name, provider_executed, .. }
+                if id == "call-1" && tool_name == "weather" && !provider_executed
+        ));
+        assert!(matches!(
+            &parts[7],
+            v2t::StreamPart::ToolInputDelta { id, delta, provider_executed, .. }
+                if id == "call-1" && delta == "{\"city\":\"SF\"}" && !provider_executed
+        ));
+        assert!(matches!(
+            &parts[8],
+            v2t::StreamPart::ToolInputEnd { id, provider_executed, .. }
+                if id == "call-1" && !provider_executed
+        ));
+        assert!(matches!(
+            &parts[9],
+            v2t::StreamPart::ToolCall(call)
+                if call.tool_call_id == "call-1"
+                    && call.tool_name == "weather"
+                    && call.input == "{\"city\":\"SF\"}"
+                    && !call.provider_executed
+        ));
+        assert!(matches!(
+            &parts[10],
+            v2t::StreamPart::Raw { raw_value }
+                if raw_value == &json!({"upstream": "frame-9"})
+        ));
+        assert!(matches!(
+            &parts[11],
+            v2t::StreamPart::Finish {
+                usage,
+                finish_reason,
+                provider_metadata,
+            } if usage.input_tokens == Some(2)
+                && usage.output_tokens == Some(3)
+                && usage.total_tokens == Some(5)
+                && matches!(finish_reason, v2t::FinishReason::ToolCalls)
+                && provider_metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("gateway"))
+                    .and_then(|inner| inner.get("finishSource"))
+                    == Some(&json!("gateway"))
+        ));
+    }
+}

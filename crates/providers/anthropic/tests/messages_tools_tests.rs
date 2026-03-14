@@ -13,7 +13,7 @@ use crate::ai_sdk_types::v2 as v2t;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
-use futures_util::stream;
+use futures_util::{stream, TryStreamExt};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
@@ -67,9 +67,18 @@ fn transport_observer() -> Arc<RecordingObserver> {
 struct TestTransport {
     last_body: Arc<Mutex<Option<serde_json::Value>>>,
     last_headers: Arc<Mutex<Option<Vec<(String, String)>>>>,
+    stream_chunks: Arc<Vec<Bytes>>,
 }
 
 impl TestTransport {
+    fn with_stream_chunks(chunks: Vec<Bytes>) -> Self {
+        Self {
+            last_body: Arc::new(Mutex::new(None)),
+            last_headers: Arc::new(Mutex::new(None)),
+            stream_chunks: Arc::new(chunks),
+        }
+    }
+
     fn last_body(&self) -> Option<serde_json::Value> {
         self.last_body.lock().unwrap().clone()
     }
@@ -113,7 +122,7 @@ impl HttpTransport for TestTransport {
         *self.last_headers.lock().unwrap() = Some(headers.to_vec());
         Ok(TestStreamResponse {
             headers: vec![],
-            chunks: vec![],
+            chunks: self.stream_chunks.iter().cloned().map(Ok).collect(),
         })
     }
 
@@ -222,6 +231,15 @@ fn contains_object_null(value: &serde_json::Value) -> bool {
         serde_json::Value::Array(items) => items.iter().any(contains_object_null),
         _ => false,
     }
+}
+
+fn sse_chunk(event: Option<&str>, payload: serde_json::Value) -> Bytes {
+    let mut chunk = String::new();
+    if let Some(event) = event {
+        chunk.push_str(&format!("event: {event}\n"));
+    }
+    chunk.push_str(&format!("data: {payload}\n\n"));
+    Bytes::from(chunk)
 }
 
 #[tokio::test]
@@ -483,4 +501,232 @@ async fn registry_built_anthropic_stream_payload_is_null_free_on_wire() {
         !contains_object_null(&wire_body),
         "registry-built Anthropic transport should keep object nulls off the wire: {wire_body}"
     );
+}
+
+#[tokio::test]
+async fn shared_event_mapper_streams_reasoning_text_tool_and_finish() {
+    let transport = TestTransport::with_stream_chunks(vec![
+        sse_chunk(
+            Some("message_start"),
+            json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 2,
+                        "output_tokens": 0
+                    }
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_start"),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking"}
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_delta"),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": "ponder"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_delta"),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": "sig-1"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_delta"),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "text_delta",
+                    "text": "hello"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_start"),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "weather"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_delta"),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{\"city\":\"SF\"}"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("message_delta"),
+            json!({
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 3
+                }
+            }),
+        ),
+        sse_chunk(Some("message_stop"), json!({"type": "message_stop"})),
+    ]);
+    let model = build_model(transport);
+
+    let response = model
+        .do_stream(v2t::CallOptions::new(basic_prompt()))
+        .await
+        .expect("stream response");
+    let parts: Vec<v2t::StreamPart> = response
+        .stream
+        .try_collect()
+        .await
+        .expect("collect stream parts");
+
+    assert!(matches!(
+        &parts[0],
+        v2t::StreamPart::StreamStart { warnings } if warnings.is_empty()
+    ));
+
+    let reasoning_start_idx = parts
+        .iter()
+        .position(|part| matches!(part, v2t::StreamPart::ReasoningStart { id, .. } if id == "0"))
+        .expect("reasoning start");
+    let reasoning_delta_idx = parts
+        .iter()
+        .position(|part| {
+            matches!(
+                part,
+                v2t::StreamPart::ReasoningDelta { id, delta, .. }
+                    if id == "0" && delta == "ponder"
+            )
+        })
+        .expect("reasoning delta");
+    let reasoning_signature_idx = parts
+        .iter()
+        .position(|part| {
+            matches!(
+                part,
+                v2t::StreamPart::ReasoningSignature { signature, .. } if signature == "sig-1"
+            )
+        })
+        .expect("reasoning signature");
+    let text_start_idx = parts
+        .iter()
+        .position(|part| matches!(part, v2t::StreamPart::TextStart { id, .. } if id == "text-1"))
+        .expect("text start");
+    let text_delta_idx = parts
+        .iter()
+        .position(|part| {
+            matches!(
+                part,
+                v2t::StreamPart::TextDelta { id, delta, .. }
+                    if id == "text-1" && delta == "hello"
+            )
+        })
+        .expect("text delta");
+    let tool_input_start_idx = parts
+        .iter()
+        .position(|part| {
+            matches!(
+                part,
+                v2t::StreamPart::ToolInputStart { id, tool_name, provider_executed, .. }
+                    if id == "tool-1" && tool_name == "weather" && !provider_executed
+            )
+        })
+        .expect("tool input start");
+    let tool_input_delta_idx = parts
+        .iter()
+        .position(|part| {
+            matches!(
+                part,
+                v2t::StreamPart::ToolInputDelta { id, delta, provider_executed, .. }
+                    if id == "tool-1" && delta == "{\"city\":\"SF\"}" && !provider_executed
+            )
+        })
+        .expect("tool input delta");
+    let tool_input_end_idx = parts
+        .iter()
+        .position(|part| {
+            matches!(
+                part,
+                v2t::StreamPart::ToolInputEnd { id, provider_executed, .. }
+                    if id == "tool-1" && !provider_executed
+            )
+        })
+        .expect("tool input end");
+    let tool_call_idx = parts
+        .iter()
+        .position(|part| {
+            matches!(
+                part,
+                v2t::StreamPart::ToolCall(call)
+                    if call.tool_call_id == "tool-1"
+                        && call.tool_name == "weather"
+                        && call.input == "{\"city\":\"SF\"}"
+                        && !call.provider_executed
+            )
+        })
+        .expect("tool call");
+    let text_end_idx = parts
+        .iter()
+        .position(|part| matches!(part, v2t::StreamPart::TextEnd { id, .. } if id == "text-1"))
+        .expect("text end");
+    let reasoning_end_idx = parts
+        .iter()
+        .position(|part| matches!(part, v2t::StreamPart::ReasoningEnd { id, .. } if id == "0"))
+        .expect("reasoning end");
+    let finish_idx = parts
+        .iter()
+        .position(|part| {
+            matches!(
+                part,
+                v2t::StreamPart::Finish {
+                    usage,
+                    finish_reason,
+                    ..
+                } if usage.input_tokens == Some(2)
+                    && usage.output_tokens == Some(3)
+                    && usage.total_tokens == Some(5)
+                    && matches!(finish_reason, v2t::FinishReason::ToolCalls)
+            )
+        })
+        .expect("finish");
+
+    assert!(reasoning_start_idx < reasoning_delta_idx);
+    assert!(reasoning_delta_idx < reasoning_signature_idx);
+    assert!(reasoning_signature_idx < text_start_idx);
+    assert!(text_start_idx < text_delta_idx);
+    assert!(text_delta_idx < tool_input_start_idx);
+    assert!(tool_input_start_idx < tool_input_delta_idx);
+    assert!(tool_input_delta_idx < tool_input_end_idx);
+    assert!(tool_input_end_idx < tool_call_idx);
+    assert!(tool_call_idx < finish_idx);
+    assert!(text_start_idx < text_end_idx);
+    assert!(reasoning_start_idx < reasoning_end_idx);
+    assert!(text_end_idx < finish_idx);
+    assert!(reasoning_end_idx < finish_idx);
 }
