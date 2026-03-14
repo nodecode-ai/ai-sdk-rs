@@ -1,11 +1,11 @@
-use crate::ai_sdk_core::error::{SdkError, TransportError};
-use crate::ai_sdk_core::transport::{
+use crate::core::error::{SdkError, TransportError};
+use crate::core::transport::{
     HttpTransport, JsonStreamWebsocketConnection, TransportConfig, TransportStream,
 };
-use crate::ai_sdk_core::LanguageModel;
-use crate::ai_sdk_providers_openai::config::OpenAIConfig;
-use crate::ai_sdk_providers_openai::responses::language_model::OpenAIResponsesLanguageModel;
-use crate::ai_sdk_types::v2 as v2t;
+use crate::core::LanguageModel;
+use crate::providers::openai::config::OpenAIConfig;
+use crate::providers::openai::responses::language_model::OpenAIResponsesLanguageModel;
+use crate::types::v2 as v2t;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream;
@@ -292,9 +292,8 @@ impl TestWebsocketServer {
                 let connection_task = tokio::spawn(async move {
                     let captured_headers = Arc::new(Mutex::new(None::<HashMap<String, String>>));
                     let callback_headers = Arc::clone(&captured_headers);
-                    let mut websocket = accept_hdr_async(
-                        stream,
-                        move |request: &Request, response: Response| {
+                    let mut websocket =
+                        accept_hdr_async(stream, move |request: &Request, response: Response| {
                             let headers = request
                                 .headers()
                                 .iter()
@@ -307,10 +306,9 @@ impl TestWebsocketServer {
                                 .collect::<HashMap<_, _>>();
                             *callback_headers.lock().unwrap() = Some(headers);
                             Ok(response)
-                        },
-                    )
-                    .await
-                    .expect("accept websocket");
+                        })
+                        .await
+                        .expect("accept websocket");
                     task_connect_headers
                         .lock()
                         .unwrap()
@@ -499,14 +497,14 @@ async fn request_body_for_function_tool(function_tool: v2t::FunctionTool) -> Val
     transport.last_body().expect("request body")
 }
 
-async fn drain_stream_response(response: crate::ai_sdk_core::StreamResponse) {
+async fn drain_stream_response(response: crate::core::StreamResponse) {
     let mut stream = response.stream;
     while let Some(item) = stream.next().await {
         let _ = item.expect("stream part");
     }
 }
 
-async fn consume_until_finish_and_drop(response: crate::ai_sdk_core::StreamResponse) {
+async fn consume_until_finish_and_drop(response: crate::core::StreamResponse) {
     let mut stream = response.stream;
     while let Some(item) = stream.next().await {
         let item = item.expect("stream part");
@@ -1096,7 +1094,11 @@ async fn cold_codex_turn_session_skips_prewarm_when_first_request_succeeds() {
         vec!["wss://chatgpt.com/backend-api/codex/responses".to_string()]
     );
     let request_bodies = transport.websocket_request_bodies();
-    assert_eq!(request_bodies.len(), 2, "expected real request and follow-up frame");
+    assert_eq!(
+        request_bodies.len(),
+        2,
+        "expected real request and follow-up frame"
+    );
     let first_real = &request_bodies[0];
     let second_real = &request_bodies[1];
     assert_eq!(
@@ -1523,7 +1525,7 @@ async fn codex_first_request_with_upgrade_headers_skips_headerless_preconnect() 
         request_defaults: None,
     };
     let transport_cfg = TransportConfig::default();
-    let transport = crate::reqwest_transport::ReqwestTransport::new(&transport_cfg);
+    let transport = crate::transport_reqwest::ReqwestTransport::new(&transport_cfg);
     let mut model =
         OpenAIResponsesLanguageModel::new("gpt-5.3-codex", cfg, transport, transport_cfg);
     model.start_codex_websocket_preconnect();
@@ -1559,7 +1561,11 @@ async fn codex_first_request_with_upgrade_headers_skips_headerless_preconnect() 
     drain_stream_response(response).await;
 
     let connect_headers = server.connect_headers();
-    assert_eq!(connect_headers.len(), 2, "expected preconnect and fresh request socket");
+    assert_eq!(
+        connect_headers.len(),
+        2,
+        "expected preconnect and fresh request socket"
+    );
     assert!(
         !connect_headers[0].contains_key("x-codex-turn-metadata"),
         "preconnect should remain headerless"
@@ -1571,7 +1577,11 @@ async fn codex_first_request_with_upgrade_headers_skips_headerless_preconnect() 
         Some("{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}")
     );
     let request_records = server.request_records();
-    assert_eq!(request_records.len(), 1, "expected a single first-request frame");
+    assert_eq!(
+        request_records.len(),
+        1,
+        "expected a single first-request frame"
+    );
     assert_eq!(
         request_records[0].0, 2,
         "the first request must use the fresh header-bearing connection"

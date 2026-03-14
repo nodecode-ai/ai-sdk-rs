@@ -1,5 +1,5 @@
-use crate::ai_sdk_provider::{registry, sdk_type_from_id, Credentials};
-use crate::ai_sdk_types::catalog::{ModelInfo, ProviderDefinition, SdkType};
+use crate::provider::{registry, sdk_type_from_id, Credentials};
+use crate::types::catalog::{ModelInfo, ProviderDefinition, SdkType};
 use std::collections::HashMap;
 
 const OPENAI_COMPATIBLE_PROVIDER_ALIASES: &[&str] = &[

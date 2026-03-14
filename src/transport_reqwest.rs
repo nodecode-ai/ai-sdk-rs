@@ -1,5 +1,5 @@
-use crate::ai_sdk_core::error::{display_body_for_error, TransportError};
-use crate::ai_sdk_core::transport::{
+use crate::core::error::{display_body_for_error, TransportError};
+use crate::core::transport::{
     emit_transport_event, HttpTransport, JsonStreamWebsocketConnection, MultipartForm,
     MultipartValue, TransportBody, TransportConfig, TransportEvent, TransportStream,
 };
@@ -49,7 +49,7 @@ struct ReqwestJsonStreamWebsocketConnection {
 impl ReqwestTransport {
     fn json_request_body<'a>(body: &'a Value, cfg: &TransportConfig) -> Cow<'a, Value> {
         if cfg.strip_null_fields {
-            Cow::Owned(crate::ai_sdk_core::json::without_null_fields(body))
+            Cow::Owned(crate::core::json::without_null_fields(body))
         } else {
             Cow::Borrowed(body)
         }

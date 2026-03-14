@@ -7,8 +7,8 @@
 //! - `SseDecoder`: Incremental SSE frame decoder
 //! - `ProviderChunk`: Trait for provider-specific event parsing
 
-use crate::ai_sdk_core::error::SdkError;
-use crate::ai_sdk_types::Event;
+use crate::core::error::SdkError;
+use crate::types::Event;
 use bytes::Bytes;
 use std::collections::VecDeque;
 

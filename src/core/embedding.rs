@@ -1,5 +1,5 @@
-use crate::ai_sdk_types::embedding as embt;
-use crate::ai_sdk_types::v2 as v2t;
+use crate::types::embedding as embt;
+use crate::types::v2 as v2t;
 
 use crate::core::SdkError;
 

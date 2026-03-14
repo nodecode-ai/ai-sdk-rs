@@ -1,9 +1,9 @@
-use crate::ai_sdk_provider::{
+use crate::provider::{
     persisted_reasoning_options, reasoning_scope_aliases, reasoning_stream_options,
 };
-use ai_sdk_providers_amazon_bedrock as _;
-use ai_sdk_providers_anthropic as _;
-use crate::ai_sdk_types::catalog::SdkType;
+use crate::providers::amazon_bedrock as _;
+use crate::providers::anthropic as _;
+use crate::types::catalog::SdkType;
 use serde_json::Value as JsonValue;
 
 #[test]

@@ -9,9 +9,9 @@
 
 use std::collections::HashMap;
 
-use crate::ai_sdk_types::embedding::EmbedOptions;
-use crate::ai_sdk_types::image::ImageOptions;
-use crate::ai_sdk_types::v2 as v2t;
+use crate::types::embedding::EmbedOptions;
+use crate::types::image::ImageOptions;
+use crate::types::v2 as v2t;
 use serde_json::Value as JsonValue;
 
 fn json_object_to_hashmap(map: &serde_json::Map<String, JsonValue>) -> HashMap<String, JsonValue> {

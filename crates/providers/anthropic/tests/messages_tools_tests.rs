@@ -1,15 +1,15 @@
-use crate::ai_sdk_core::error::TransportError;
-use crate::ai_sdk_core::json::without_null_fields;
-use crate::ai_sdk_core::transport::{
+use crate::core::error::TransportError;
+use crate::core::json::without_null_fields;
+use crate::core::transport::{
     set_transport_observer, HttpTransport, TransportBody, TransportConfig, TransportEvent,
     TransportObserver,
 };
-use crate::ai_sdk_core::{LanguageModel, SdkError};
-use crate::ai_sdk_provider::{registry, Credentials};
-use crate::ai_sdk_providers_anthropic::messages::language_model::AnthropicMessagesConfig;
-use crate::ai_sdk_providers_anthropic::AnthropicMessagesLanguageModel;
-use crate::ai_sdk_types::catalog::{ModelInfo, ProviderDefinition, SdkType};
-use crate::ai_sdk_types::v2 as v2t;
+use crate::core::{LanguageModel, SdkError};
+use crate::provider::{registry, Credentials};
+use crate::providers::anthropic::messages::language_model::AnthropicMessagesConfig;
+use crate::providers::anthropic::AnthropicMessagesLanguageModel;
+use crate::types::catalog::{ModelInfo, ProviderDefinition, SdkType};
+use crate::types::v2 as v2t;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
@@ -140,7 +140,7 @@ impl HttpTransport for TestTransport {
         &self,
         _url: &str,
         _headers: &[(String, String)],
-        _form: &crate::ai_sdk_core::transport::MultipartForm,
+        _form: &crate::core::transport::MultipartForm,
         _cfg: &TransportConfig,
     ) -> Result<(serde_json::Value, Vec<(String, String)>), TransportError> {
         Err(TransportError::Other("post_multipart unused".into()))

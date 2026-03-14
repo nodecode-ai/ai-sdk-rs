@@ -33,7 +33,7 @@ pub enum SdkType {
 }
 
 // SdkType parsing is intentionally centralized in the provider registry via
-// `crate::ai_sdk_provider::sdk_type_from_id`, which uses registered builders as the
+// `crate::provider::sdk_type_from_id`, which uses registered builders as the
 // source of truth. This avoids ad-hoc string parsers living in sdk-types.
 
 /// Information about a specific model

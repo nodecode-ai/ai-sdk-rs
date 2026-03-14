@@ -1,7 +1,7 @@
-use crate::ai_sdk_providers_anthropic::messages::options::{
+use crate::providers::anthropic::messages::options::{
     parse_anthropic_provider_options, ThinkingOption,
 };
-use crate::ai_sdk_types::v2::ProviderOptions;
+use crate::types::v2::ProviderOptions;
 use serde_json::json;
 use std::collections::HashMap;
 

@@ -1,7 +1,7 @@
 //! Vercel-compatible LanguageModel interface (formerly V2) and helpers.
 
-use crate::ai_sdk_types::v2 as v2t;
 use crate::core::SdkError;
+use crate::types::v2 as v2t;
 use futures_core::Stream;
 use std::pin::Pin;
 

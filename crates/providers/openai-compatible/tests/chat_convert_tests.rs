@@ -1,5 +1,5 @@
-use crate::ai_sdk_providers_openai_compatible::chat::convert::convert_to_openai_compatible_chat_messages;
-use crate::ai_sdk_types::v2 as v2t;
+use crate::providers::openai_compatible::chat::convert::convert_to_openai_compatible_chat_messages;
+use crate::types::v2 as v2t;
 use serde_json::json;
 
 #[test]

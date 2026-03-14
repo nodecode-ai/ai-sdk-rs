@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ai_sdk_types::v2 as v2t;
-use crate::ai_sdk_types::Event as ProviderEvent;
+use crate::types::v2 as v2t;
+use crate::types::Event as ProviderEvent;
 use async_stream::try_stream;
 use futures_core::Stream;
 use futures_util::StreamExt;

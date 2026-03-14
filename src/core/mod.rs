@@ -24,9 +24,7 @@ pub use crate::core::v2::{
     PartStream, StreamResponse,
 };
 // Convenience re-exports of common types
-pub use crate::ai_sdk_types::embedding::{EmbedOptions, EmbedUsage, Embedding};
-pub use crate::ai_sdk_types::image::{
-    ImageData, ImageFile, ImageOptions, ImageUsage, ImageWarning,
-};
-pub use crate::ai_sdk_types::v2 as types;
-pub use crate::ai_sdk_types::Event;
+pub use crate::types::embedding::{EmbedOptions, EmbedUsage, Embedding};
+pub use crate::types::image::{ImageData, ImageFile, ImageOptions, ImageUsage, ImageWarning};
+pub use crate::types::v2 as types;
+pub use crate::types::Event;

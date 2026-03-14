@@ -3,9 +3,9 @@
 //! This module provides a reusable pipeline for converting raw SSE byte streams
 //! into typed Event streams using provider-specific parsers.
 
-use crate::ai_sdk_core::SdkError;
-use crate::ai_sdk_types::Event;
+use crate::core::SdkError;
 use crate::streaming_sse::{ProviderChunk, SseDecoder};
+use crate::types::Event;
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_util::StreamExt;

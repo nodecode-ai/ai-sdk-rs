@@ -17,6 +17,11 @@
 - Pseudo-crate aliases allow broad reach-through imports that would be constrained by either a real workspace or a normal module tree.
 - Tooling and example packaging have already drifted because the repository shape advertises crate boundaries that Cargo does not actually enforce.
 
+## Relation To Prior Lineage
+
+- `MT1` landed as commit `a93a3b3` while this plan was in flight.
+- An unrelated follow-up commit, `5e8a0b6`, landed on `master` before `MT2`; execution resumes from that newer `HEAD` while preserving the planned slice lineage labels below.
+
 ## Scope
 
 - In scope:
@@ -89,8 +94,8 @@
   - the pseudo-crate topology is described by executable or checked-in evidence
   - no production module moves land in this slice
 
-- [ ] `MT1` Move foundational modules onto the real `src/` tree.
-  Lineage commit: `<pending>`
+- [x] `MT1` Move foundational modules onto the real `src/` tree.
+  Lineage commit: `a93a3b3`
   Commit subject: `refactor(layout): move foundational modules into src`
   Lineage parent: `MT0`
   Scope:
@@ -109,6 +114,7 @@
   Scope:
   - provider modules currently under `crates/providers/**`
   - `src/lib.rs`
+  - directly affected foundational modules and tests that stop importing removed pseudo-crate aliases
   - directly affected provider tests only
   Gate:
   - provider code imports through real modules only

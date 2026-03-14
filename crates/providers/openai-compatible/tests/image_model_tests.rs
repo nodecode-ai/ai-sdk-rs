@@ -1,14 +1,12 @@
-use crate::ai_sdk_core::error::TransportError;
-use crate::ai_sdk_core::json::without_null_fields;
-use crate::ai_sdk_core::transport::{
-    HttpTransport, MultipartForm, MultipartValue, TransportConfig,
-};
-use crate::ai_sdk_core::ImageModel;
-use crate::ai_sdk_providers_openai_compatible::image::image_model::{
+use crate::core::error::TransportError;
+use crate::core::json::without_null_fields;
+use crate::core::transport::{HttpTransport, MultipartForm, MultipartValue, TransportConfig};
+use crate::core::ImageModel;
+use crate::providers::openai_compatible::image::image_model::{
     OpenAICompatibleImageConfig, OpenAICompatibleImageModel,
 };
-use crate::ai_sdk_types::image::{ImageData, ImageFile, ImageOptions, ImageWarning};
-use crate::ai_sdk_types::v2 as v2t;
+use crate::types::image::{ImageData, ImageFile, ImageOptions, ImageWarning};
+use crate::types::v2 as v2t;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;

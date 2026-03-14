@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
-use crate::ai_sdk_types::image as imgt;
-use crate::ai_sdk_types::v2 as v2t;
+use crate::types::image as imgt;
+use crate::types::v2 as v2t;
 
 use crate::core::SdkError;
 

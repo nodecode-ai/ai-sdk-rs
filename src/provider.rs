@@ -5,11 +5,11 @@
 //! builders. The factory crate can then either consume registered builders or
 //! fall back to sdk_type-based construction.
 
-use crate::ai_sdk_core::options as sdkopt;
-use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
-use crate::ai_sdk_core::transport::TransportConfig;
-use crate::ai_sdk_core::{LanguageModel, SdkError};
-use crate::ai_sdk_types::{
+use crate::core::options as sdkopt;
+use crate::core::request_builder::defaults::provider_defaults_from_json;
+use crate::core::transport::TransportConfig;
+use crate::core::{LanguageModel, SdkError};
+use crate::types::{
     catalog::{ProviderDefinition, SdkType},
     v2::ProviderOptions as V2ProviderOptions,
 };
@@ -64,7 +64,7 @@ impl Credentials {
 /// Providers may `inventory::submit!` a registration to avoid factory matches.
 pub mod registry {
     use super::*;
-    use crate::ai_sdk_types::catalog::SdkType;
+    use crate::types::catalog::SdkType;
 
     /// Static registration record for a provider builder.
     pub struct ProviderRegistration {
@@ -354,7 +354,7 @@ pub fn persisted_reasoning_options(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai_sdk_types::catalog::{ModelInfo, ProviderDefinition, SdkType};
+    use crate::types::catalog::{ModelInfo, ProviderDefinition, SdkType};
     use serde_json::json;
 
     fn test_provider_def() -> ProviderDefinition {

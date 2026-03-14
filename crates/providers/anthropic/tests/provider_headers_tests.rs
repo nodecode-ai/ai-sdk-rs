@@ -1,4 +1,4 @@
-use crate::ai_sdk_providers_anthropic::provider::default_headers_from_creds;
+use crate::providers::anthropic::provider::default_headers_from_creds;
 use std::collections::HashMap;
 
 const OAUTH_BETA_HEADER_VALUE: &str = "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14";

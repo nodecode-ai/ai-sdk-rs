@@ -1,5 +1,5 @@
-use crate::ai_sdk_providers_openai_compatible::completion::options::parse_openai_compatible_completion_provider_options;
-use crate::ai_sdk_types::v2 as v2t;
+use crate::providers::openai_compatible::completion::options::parse_openai_compatible_completion_provider_options;
+use crate::types::v2 as v2t;
 use serde_json::json;
 use std::collections::HashMap;
 

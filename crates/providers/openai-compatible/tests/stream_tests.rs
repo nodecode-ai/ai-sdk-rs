@@ -1,6 +1,6 @@
-use crate::ai_sdk_core::SdkError;
-use crate::ai_sdk_providers_openai_compatible::{build_stream, StreamMode, StreamSettings};
-use crate::ai_sdk_types::v2 as v2t;
+use crate::core::SdkError;
+use crate::providers::openai_compatible::{build_stream, StreamMode, StreamSettings};
+use crate::types::v2 as v2t;
 use bytes::Bytes;
 use futures_util::stream;
 use futures_util::TryStreamExt;

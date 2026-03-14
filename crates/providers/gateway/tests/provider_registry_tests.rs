@@ -1,5 +1,5 @@
-use crate::ai_sdk_provider::{registry, Credentials};
-use crate::ai_sdk_types::catalog::{ModelInfo, ProviderDefinition, SdkType};
+use crate::provider::{registry, Credentials};
+use crate::types::catalog::{ModelInfo, ProviderDefinition, SdkType};
 use std::collections::HashMap;
 
 #[test]

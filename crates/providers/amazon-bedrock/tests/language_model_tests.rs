@@ -1,9 +1,9 @@
-use crate::ai_sdk_core::error::TransportError;
-use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
-use crate::ai_sdk_core::LanguageModel;
-use crate::ai_sdk_providers_amazon_bedrock::config::{BedrockAuth, BedrockConfig};
-use crate::ai_sdk_providers_amazon_bedrock::language_model::BedrockLanguageModel;
-use crate::ai_sdk_types::v2 as v2t;
+use crate::core::error::TransportError;
+use crate::core::transport::{HttpTransport, TransportConfig};
+use crate::core::LanguageModel;
+use crate::providers::amazon_bedrock::config::{BedrockAuth, BedrockConfig};
+use crate::providers::amazon_bedrock::language_model::BedrockLanguageModel;
+use crate::types::v2 as v2t;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
