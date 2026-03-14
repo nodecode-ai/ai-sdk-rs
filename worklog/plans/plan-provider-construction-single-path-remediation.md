@@ -105,7 +105,7 @@
   - overlapping helper entrypoints are narrowed rather than multiplied
 
 - [x] `PC2` Move docs and callers to the canonical construction path and demote displaced authorities.
-  Lineage commit: `<fill after landing>`
+  Lineage commit: `7b270d9`
   Commit subject: `refactor(api): narrow redundant provider construction paths`
   Lineage parent: `PC1`
   Scope:
@@ -117,8 +117,8 @@
   - registry use is clearly advanced-only rather than the default public story
   - redundant happy-path helpers are removed or explicitly narrowed in the same slice
 
-- [ ] `PC3` Validate the surviving provider construction surface.
-  Lineage commit: `<pending>`
+- [x] `PC3` Validate the surviving provider construction surface.
+  Lineage commit: `<fill after landing>`
   Commit subject: `test(api): validate provider construction surface`
   Lineage parent: `PC2`
   Scope:
