@@ -130,7 +130,7 @@
   - targeted Google and Google Vertex parity tests
   - `worklog/plans/plan-google-provider-family-single-owner-remediation.md`
   Gate:
-  - clean detached-worktree `cargo check --tests` passes for the Google provider family after wrapper removal
+  - clean detached-worktree `cargo test parity_regression_tests` passes for the Google provider family after wrapper removal
   - one shared helper owner remains for the Google provider family
   - the plan matches the landed ownership shape
 
