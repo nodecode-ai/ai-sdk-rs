@@ -99,7 +99,7 @@
   - HTTP fallback behavior remains unchanged
 
 - [x] `CW2` Validate the surviving Codex websocket path.
-  Lineage commit: `<fill after landing>`
+  Lineage commit: `8a1fab6`
   Commit subject: `test(openai): validate codex websocket session path`
   Lineage parent: `285d098`
   Scope:
