@@ -33,7 +33,7 @@ aws-smithy-runtime-api = "1"
 aws-smithy-types = "1"
 base64 = "0.22"
 bytes = "1"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 directories = "5"
 dirs = "5"
 futures-core = "0.3"
@@ -57,7 +57,7 @@ tokio-util = "0.7"
 tracing = "0.1"
 url = "2"
 urlencoding = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", default-features = false, features = ["std", "v4", "serde"] }
 
 [features]
 default = ["reqwest", "stream"]

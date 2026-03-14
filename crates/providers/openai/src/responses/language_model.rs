@@ -23,6 +23,7 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter};
 use serde_json::{json, Map, Value};
+use tokio::task::JoinHandle;
 use url::Url;
 use uuid::Uuid;
 
@@ -94,6 +95,12 @@ struct OpenAIResponsesTurnSessionTelemetry {
     reset_reason: Option<String>,
 }
 
+#[derive(Default)]
+struct WebsocketPreconnectState {
+    ready: Option<Box<dyn JsonStreamWebsocketConnection>>,
+    pending: Option<JoinHandle<Result<Box<dyn JsonStreamWebsocketConnection>, SdkError>>>,
+}
+
 struct OpenAIResponsesTurnSession<'a, T: HttpTransport> {
     model: &'a OpenAIResponsesLanguageModel<T>,
     websocket: Option<Box<dyn JsonStreamWebsocketConnection>>,
@@ -108,6 +115,7 @@ pub struct OpenAIResponsesLanguageModel<
     pub http: T,
     pub transport_cfg: TransportConfig,
     pub limiter: Option<Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>>,
+    websocket_preconnect: Arc<Mutex<WebsocketPreconnectState>>,
 }
 
 impl Default for OpenAIResponsesLanguageModel<crate::reqwest_transport::ReqwestTransport> {
@@ -130,6 +138,7 @@ impl Default for OpenAIResponsesLanguageModel<crate::reqwest_transport::ReqwestT
             http: crate::reqwest_transport::ReqwestTransport::new(&cfg),
             transport_cfg: cfg,
             limiter: None,
+            websocket_preconnect: Arc::new(Mutex::new(WebsocketPreconnectState::default())),
         }
     }
 }
@@ -147,6 +156,7 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             http,
             transport_cfg,
             limiter: None,
+            websocket_preconnect: Arc::new(Mutex::new(WebsocketPreconnectState::default())),
         }
     }
 
@@ -160,6 +170,30 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
 
     fn endpoint_url(&self) -> String {
         self.config.endpoint_url()
+    }
+
+    async fn take_preconnected_websocket(&self) -> Option<Box<dyn JsonStreamWebsocketConnection>> {
+        let pending = {
+            let mut state = self.websocket_preconnect.lock().unwrap();
+            if let Some(connection) = state.ready.take() {
+                return Some(connection);
+            }
+            state.pending.take()
+        };
+        let Some(handle) = pending else {
+            return None;
+        };
+        match handle.await {
+            Ok(Ok(connection)) => Some(connection),
+            Ok(Err(err)) => {
+                tracing::debug!(error = %err, "openai websocket preconnect failed");
+                None
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "openai websocket preconnect task cancelled");
+                None
+            }
+        }
     }
 
     fn canonicalize_header(lc: &str) -> String {
@@ -225,7 +259,10 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
                                 None,
                             ),
                         )),
-                        Err(err) if transport.fallback_http => {
+                        Err(err)
+                            if transport.fallback_http
+                                && should_fallback_to_http_after_websocket_error(&err) =>
+                        {
                             let (stream, res_headers) = self
                                 .send_once(&hdrs, &body, ResponseTransportMode::Http)
                                 .await?;
@@ -249,7 +286,9 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
                 }
             }
             Err(err)
-                if requested == ResponseTransportMode::Websocket && transport.fallback_http =>
+                if requested == ResponseTransportMode::Websocket
+                    && transport.fallback_http
+                    && should_fallback_to_http_after_websocket_error(&err) =>
             {
                 let (stream, res_headers) = self
                     .send_once(&hdrs, &body, ResponseTransportMode::Http)
@@ -300,6 +339,43 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
                 Ok((stream, res_headers))
             }
             Err(te) => Err(map_transport_error(te)),
+        }
+    }
+}
+
+impl OpenAIResponsesLanguageModel<crate::reqwest_transport::ReqwestTransport> {
+    pub fn start_codex_websocket_preconnect(&mut self) {
+        if !should_use_codex_oauth_websocket_transport(&self.config.endpoint_path) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let url = match to_websocket_url(&self.endpoint_url()) {
+            Ok(url) => url,
+            Err(err) => {
+                tracing::debug!(error = %err, "openai websocket preconnect url resolution failed");
+                return;
+            }
+        };
+        let headers = {
+            let mut hdrs = self.request_headers(&HashMap::new());
+            hdrs.entry("openai-beta".into())
+                .or_insert_with(|| OPENAI_WS_BETA_VALUE.to_string());
+            hdrs.into_iter()
+                .map(|(k, v)| (Self::canonicalize_header(&k), v))
+                .collect::<Vec<_>>()
+        };
+        let http = self.http.clone();
+        let transport_cfg = self.transport_cfg.clone();
+        let task = runtime.spawn(async move {
+            http.connect_json_stream_websocket(&url, &headers, &transport_cfg)
+                .await
+                .map_err(map_transport_error)
+        });
+        let mut state = self.websocket_preconnect.lock().unwrap();
+        if state.ready.is_none() && state.pending.is_none() {
+            state.pending = Some(task);
         }
     }
 }
@@ -374,6 +450,15 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
         if self.websocket.is_some() {
             self.clear_incremental_state("websocket_reconnect");
             self.websocket = None;
+        }
+
+        if let Some(connection) = self.model.take_preconnected_websocket().await {
+            {
+                let mut state = self.state.lock().unwrap();
+                state.connection_count = state.connection_count.saturating_add(1);
+            }
+            self.websocket = Some(connection);
+            return Ok(false);
         }
 
         let url = to_websocket_url(&self.model.endpoint_url())?;
@@ -476,10 +561,9 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
                 Ok(v2t::StreamPart::Finish {
                     provider_metadata, ..
                 }) => {
-                    completed_response_id = provider_response_id_from_metadata(
-                        provider_metadata.as_ref(),
-                    )
-                    .or(completed_response_id);
+                    completed_response_id =
+                        provider_response_id_from_metadata(provider_metadata.as_ref())
+                            .or(completed_response_id);
                 }
                 Ok(_) => {}
                 Err(err) => return Err(err),
@@ -498,6 +582,23 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
         Ok(())
     }
 
+    async fn send_session_websocket_request(
+        &mut self,
+        body: Value,
+    ) -> Result<(Value, Value, ByteStream, Vec<(String, String)>, bool, bool), SdkError> {
+        let (session_body, transport_body, previous_response_id_used, warmup_response_id_used) =
+            self.prepared_websocket_body(body);
+        let (stream, transport_headers) = self.send_websocket_request(&transport_body).await?;
+        Ok((
+            session_body,
+            transport_body,
+            stream,
+            transport_headers,
+            previous_response_id_used,
+            warmup_response_id_used,
+        ))
+    }
+
     fn prepared_websocket_body(&self, mut body: Value) -> (Value, Value, bool, bool) {
         let mut previous_response_id_used = false;
         let mut warmup_response_id_used = false;
@@ -507,21 +608,32 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
-        let (last_response_id, last_request, last_response_id_from_warmup) = {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("previous_response_id");
+        }
+        let (last_response_id, last_request, last_response_id_from_warmup, reset_reason) = {
             let state = self.state.lock().unwrap();
             (
                 state.last_response_id.clone(),
                 state.last_request.clone(),
                 state.last_response_id_from_warmup,
+                state.last_reset_reason.clone(),
             )
         };
         if let Some(explicit_previous_response_id) = explicit_previous_response_id {
-            if let Some(object) = body.as_object_mut() {
-                object.insert(
-                    "previous_response_id".to_string(),
-                    Value::String(explicit_previous_response_id),
+            if reset_reason.is_none() {
+                if let Some(object) = body.as_object_mut() {
+                    object.insert(
+                        "previous_response_id".to_string(),
+                        Value::String(explicit_previous_response_id),
+                    );
+                    previous_response_id_used = true;
+                }
+            } else {
+                tracing::info!(
+                    reason = ?reset_reason,
+                    "ignoring explicit previous_response_id after provider-session reset"
                 );
-                previous_response_id_used = true;
             }
         } else if let Some(last_response_id) = last_response_id {
             if request_shape_matches_previous(last_request.as_ref(), &body) {
@@ -669,7 +781,7 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
 
     async fn stream_http_request(
         &self,
-        body: Value,
+        mut body: Value,
         include_raw: bool,
         requested: ResponseTransportMode,
         extra_headers: &HashMap<String, String>,
@@ -681,6 +793,9 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
     ) -> Result<StreamResponse, SdkError> {
         if let Some(limiter) = &self.model.limiter {
             let _ = limiter.until_ready().await;
+        }
+        if let Some(object) = body.as_object_mut() {
+            object.remove("previous_response_id");
         }
         let base_headers = self.model.request_headers(extra_headers);
         let request_body = transport_request_body(
@@ -788,7 +903,10 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
         let websocket_headers = self.websocket_headers(&options.headers);
         let reused = match self.ensure_websocket_connection(&websocket_headers).await {
             Ok(reused) => reused,
-            Err(err) if transport_selection.fallback_http => {
+            Err(err)
+                if transport_selection.fallback_http
+                    && should_fallback_to_http_after_websocket_error(&err) =>
+            {
                 self.activate_http_fallback("websocket_http_fallback");
                 return self
                     .stream_http_request(
@@ -806,10 +924,62 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
             }
             Err(err) => return Err(err),
         };
-        if self.should_prewarm_websocket(&body) {
-            match self.prewarm_websocket_session(&body).await {
-                Ok(()) => {}
-                Err(err) if transport_selection.fallback_http => {
+        let should_prewarm = self.should_prewarm_websocket(&body);
+        let websocket_result = if should_prewarm {
+            match self.send_session_websocket_request(body.clone()).await {
+                Ok(result) => Ok(result),
+                Err(SdkError::RateLimited { .. }) => {
+                    match self.ensure_websocket_connection(&websocket_headers).await {
+                        Ok(_) => {}
+                        Err(err)
+                            if transport_selection.fallback_http
+                                && should_fallback_to_http_after_websocket_error(&err) =>
+                        {
+                            self.activate_http_fallback("websocket_http_fallback");
+                            return self
+                                .stream_http_request(
+                                    body,
+                                    options.include_raw_chunks,
+                                    transport_selection.requested,
+                                    &options.headers,
+                                    warnings,
+                                    tool_name_mapping,
+                                    approval_request_id_map,
+                                    store_for_stream,
+                                    logprobs_enabled,
+                                )
+                                .await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                    match self.prewarm_websocket_session(&body).await {
+                        Ok(()) => self.send_session_websocket_request(body.clone()).await,
+                        Err(err)
+                            if transport_selection.fallback_http
+                                && should_fallback_to_http_after_websocket_error(&err) =>
+                        {
+                            self.activate_http_fallback("websocket_http_fallback");
+                            return self
+                                .stream_http_request(
+                                    body,
+                                    options.include_raw_chunks,
+                                    transport_selection.requested,
+                                    &options.headers,
+                                    warnings,
+                                    tool_name_mapping,
+                                    approval_request_id_map,
+                                    store_for_stream,
+                                    logprobs_enabled,
+                                )
+                                .await;
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(err)
+                    if transport_selection.fallback_http
+                        && should_fallback_to_http_after_websocket_error(&err) =>
+                {
                     self.activate_http_fallback("websocket_http_fallback");
                     return self
                         .stream_http_request(
@@ -827,29 +997,33 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
                 }
                 Err(err) => return Err(err),
             }
-        }
-        let (session_body, transport_body, previous_response_id_used, warmup_response_id_used) =
-            self.prepared_websocket_body(body.clone());
-        let (stream, transport_headers) = match self.send_websocket_request(&transport_body).await {
-            Ok(stream) => stream,
-            Err(err) if transport_selection.fallback_http => {
-                self.activate_http_fallback("websocket_http_fallback");
-                return self
-                    .stream_http_request(
-                        body,
-                        options.include_raw_chunks,
-                        transport_selection.requested,
-                        &options.headers,
-                        warnings,
-                        tool_name_mapping,
-                        approval_request_id_map,
-                        store_for_stream,
-                        logprobs_enabled,
-                    )
-                    .await;
-            }
-            Err(err) => return Err(err),
+        } else {
+            self.send_session_websocket_request(body.clone()).await
         };
+        let (session_body, transport_body, stream, transport_headers, previous_response_id_used, warmup_response_id_used) =
+            match websocket_result {
+                Ok(result) => result,
+                Err(err)
+                    if transport_selection.fallback_http
+                        && should_fallback_to_http_after_websocket_error(&err) =>
+                {
+                    self.activate_http_fallback("websocket_http_fallback");
+                    return self
+                        .stream_http_request(
+                            body,
+                            options.include_raw_chunks,
+                            transport_selection.requested,
+                            &options.headers,
+                            warnings,
+                            tool_name_mapping,
+                            approval_request_id_map,
+                            store_for_stream,
+                            logprobs_enabled,
+                        )
+                        .await;
+                }
+                Err(err) => return Err(err),
+            };
         let response_headers = self.response_headers(
             transport_headers,
             transport_selection.requested,
@@ -997,6 +1171,17 @@ fn map_transport_stream_error(err: TransportError) -> SdkError {
         TransportError::ConnectTimeout(_) => SdkError::Timeout,
         other => SdkError::Transport(other),
     }
+}
+
+fn should_fallback_to_http_after_websocket_error(err: &SdkError) -> bool {
+    !matches!(
+        err,
+        SdkError::RateLimited { .. }
+            | SdkError::Upstream {
+                status: 401 | 403,
+                ..
+            }
+    )
 }
 
 fn response_headers_with_transport(

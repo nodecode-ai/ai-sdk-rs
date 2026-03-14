@@ -11,6 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::debug;
 use url::Url;
 
+#[derive(Clone)]
 pub struct ReqwestTransport {
     client: Client,
 }
@@ -45,6 +47,14 @@ struct ReqwestJsonStreamWebsocketConnection {
 }
 
 impl ReqwestTransport {
+    fn json_request_body<'a>(body: &'a Value, cfg: &TransportConfig) -> Cow<'a, Value> {
+        if cfg.strip_null_fields {
+            Cow::Owned(crate::ai_sdk_core::json::without_null_fields(body))
+        } else {
+            Cow::Borrowed(body)
+        }
+    }
+
     fn configure_builder(
         mut builder: reqwest::ClientBuilder,
         cfg: &TransportConfig,
@@ -348,21 +358,16 @@ impl HttpTransport for ReqwestTransport {
         body: &Value,
         cfg: &TransportConfig,
     ) -> Result<Self::StreamResponse, TransportError> {
-        // Clean body by stripping null fields if configured
-        let cleaned_body: Value = if cfg.strip_null_fields {
-            crate::ai_sdk_core::json::without_null_fields(body)
-        } else {
-            body.clone()
-        };
+        let cleaned_body = Self::json_request_body(body, cfg);
 
         if Self::is_websocket_url(url) {
             return self
-                .post_json_stream_websocket(url, headers, &cleaned_body, cfg)
+                .post_json_stream_websocket(url, headers, cleaned_body.as_ref(), cfg)
                 .await;
         }
 
         // Build request
-        let mut req = self.client.post(url).json(&cleaned_body);
+        let mut req = self.client.post(url).json(cleaned_body.as_ref());
         for (k, v) in headers {
             // Skip Content-Type as .json() already sets it
             if !k.eq_ignore_ascii_case("content-type") {
@@ -382,7 +387,7 @@ impl HttpTransport for ReqwestTransport {
         } else {
             ("POST".to_string(), url.to_string(), headers.to_vec())
         };
-        let request_body = Some(TransportBody::Json(cleaned_body.clone()));
+        let request_body = Some(TransportBody::Json(cleaned_body.as_ref().clone()));
 
         // Send
         let resp = match req.send().await {
@@ -516,13 +521,8 @@ impl HttpTransport for ReqwestTransport {
         body: &Value,
         cfg: &TransportConfig,
     ) -> Result<(Value, Vec<(String, String)>), TransportError> {
-        // Clean body by stripping null fields if configured
-        let cleaned_body: Value = if cfg.strip_null_fields {
-            crate::ai_sdk_core::json::without_null_fields(body)
-        } else {
-            body.clone()
-        };
-        let mut req = self.client.post(url).json(&cleaned_body);
+        let cleaned_body = Self::json_request_body(body, cfg);
+        let mut req = self.client.post(url).json(cleaned_body.as_ref());
         for (k, v) in headers {
             if !k.eq_ignore_ascii_case("content-type") {
                 req = req.header(k, v);
@@ -541,7 +541,7 @@ impl HttpTransport for ReqwestTransport {
         } else {
             ("POST".to_string(), url.to_string(), headers.to_vec())
         };
-        let request_body = Some(TransportBody::Json(cleaned_body.clone()));
+        let request_body = Some(TransportBody::Json(cleaned_body.as_ref().clone()));
 
         let resp = match req.send().await {
             Ok(r) => r,

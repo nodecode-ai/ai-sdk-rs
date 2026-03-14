@@ -125,6 +125,42 @@ impl<T: HttpTransport> AnthropicMessagesLanguageModel<T> {
                 None
             }
         }
+        fn push_system_text_entry(
+            entries: &mut Vec<JsonValue>,
+            content: &str,
+            cache_control: Option<JsonValue>,
+        ) {
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            if let Some(last) = entries.last_mut() {
+                let last_cache_control = last.get("cache_control").cloned();
+                if last_cache_control == cache_control {
+                    if let Some(last_text) = last
+                        .as_object()
+                        .and_then(|obj| obj.get("text"))
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string)
+                    {
+                        if let Some(obj) = last.as_object_mut() {
+                            obj.insert(
+                                "text".into(),
+                                JsonValue::String(format!("{last_text}\n\n{trimmed}")),
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+            let mut obj = json!({"type":"text","text": trimmed});
+            if let Some(cc) = cache_control {
+                obj.as_object_mut()
+                    .unwrap()
+                    .insert("cache_control".into(), cc);
+            }
+            entries.push(obj);
+        }
         fn to_base64(data: &v2t::DataContent) -> Option<String> {
             match data {
                 v2t::DataContent::Base64 { base64 } => Some(base64.clone()),
@@ -292,13 +328,11 @@ impl<T: HttpTransport> AnthropicMessagesLanguageModel<T> {
                             if content.is_empty() {
                                 continue;
                             }
-                            let mut obj = json!({"type":"text","text": content});
-                            if let Some(cc) = get_cache_control(provider_options) {
-                                obj.as_object_mut()
-                                    .unwrap()
-                                    .insert("cache_control".into(), cc);
-                            }
-                            sys_vec.push(obj);
+                            push_system_text_entry(
+                                &mut sys_vec,
+                                content,
+                                get_cache_control(provider_options),
+                            );
                         }
                     }
                     if !sys_vec.is_empty() {

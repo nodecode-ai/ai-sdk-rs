@@ -132,7 +132,7 @@ fn strip_v1_prefix(path: &str) -> String {
     }
 }
 
-fn resolve_base_prefix(def: &ProviderDefinition) -> Result<String, SdkError> {
+pub(crate) fn resolve_base_prefix(def: &ProviderDefinition) -> Result<String, SdkError> {
     if !def.base_url.trim().is_empty() {
         return Ok(def.base_url.trim_end_matches('/').to_string());
     }
@@ -143,18 +143,12 @@ fn resolve_base_prefix(def: &ProviderDefinition) -> Result<String, SdkError> {
         }
     }
 
-    let mut env_candidates: Vec<String> = Vec::new();
-    if let Some(env_name) = def.env.as_ref() {
-        env_candidates.push(env_name.clone());
-    }
-    env_candidates.push(RESOURCE_ENV.to_string());
-
-    for env_name in env_candidates {
-        if let Ok(resource) = std::env::var(&env_name) {
-            let trimmed = resource.trim();
-            if !trimmed.is_empty() {
-                return Ok(DEFAULT_BASE_URL_FMT.replace("{resource}", trimmed));
-            }
+    // `ProviderDefinition.env` may point to credential env vars; resource discovery must stay
+    // Azure-specific so secrets never become hostname material.
+    if let Ok(resource) = std::env::var(RESOURCE_ENV) {
+        let trimmed = resource.trim();
+        if !trimmed.is_empty() {
+            return Ok(DEFAULT_BASE_URL_FMT.replace("{resource}", trimmed));
         }
     }
 

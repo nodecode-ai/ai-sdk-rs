@@ -105,6 +105,14 @@ fn basic_prompt() -> v2t::Prompt {
     }]
 }
 
+fn anthropic_cache_control_options() -> Option<v2t::ProviderOptions> {
+    let mut scope = HashMap::new();
+    scope.insert("cacheControl".to_string(), json!({ "type": "ephemeral" }));
+    let mut opts = v2t::ProviderOptions::new();
+    opts.insert("anthropic".to_string(), scope);
+    Some(opts)
+}
+
 fn build_model(transport: TestTransport) -> AnthropicMessagesLanguageModel<TestTransport> {
     let cfg = AnthropicMessagesConfig {
         provider_name: "anthropic",
@@ -117,6 +125,16 @@ fn build_model(transport: TestTransport) -> AnthropicMessagesLanguageModel<TestT
         default_options: None,
     };
     AnthropicMessagesLanguageModel::new("claude-3-5-sonnet-20241022".into(), cfg)
+}
+
+fn contains_object_null(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map
+            .values()
+            .any(|entry| entry.is_null() || contains_object_null(entry)),
+        serde_json::Value::Array(items) => items.iter().any(contains_object_null),
+        _ => false,
+    }
 }
 
 #[tokio::test]
@@ -199,4 +217,94 @@ async fn provider_tool_maps_web_fetch() {
         .filter(|v| !v.is_empty())
         .collect();
     assert!(betas.contains("web-fetch-2025-09-10"));
+}
+
+#[tokio::test]
+async fn adjacent_system_text_entries_with_matching_cache_policy_are_collapsed() {
+    let transport = TestTransport::default();
+    let model = build_model(transport);
+
+    let prompt = vec![
+        v2t::PromptMessage::System {
+            content: "cached system".into(),
+            provider_options: anthropic_cache_control_options(),
+        },
+        v2t::PromptMessage::System {
+            content: "plain one".into(),
+            provider_options: None,
+        },
+        v2t::PromptMessage::System {
+            content: "plain two".into(),
+            provider_options: None,
+        },
+        v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "hi".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        },
+    ];
+    let response = model
+        .do_stream(v2t::CallOptions::new(prompt))
+        .await
+        .expect("stream response");
+    let body = response.request_body.expect("request body");
+    let system = body
+        .get("system")
+        .and_then(|value| value.as_array())
+        .expect("system array");
+    assert_eq!(system.len(), 2);
+    assert_eq!(
+        system[0].get("text").and_then(|value| value.as_str()),
+        Some("cached system")
+    );
+    assert_eq!(
+        system[0]
+            .get("cache_control")
+            .and_then(|value| value.get("type"))
+            .and_then(|value| value.as_str()),
+        Some("ephemeral")
+    );
+    assert_eq!(
+        system[1].get("text").and_then(|value| value.as_str()),
+        Some("plain one\n\nplain two")
+    );
+    assert!(system[1].get("cache_control").is_none());
+}
+
+#[tokio::test]
+async fn request_body_contains_no_object_nulls() {
+    let transport = TestTransport::default();
+    let model = build_model(transport);
+
+    let prompt = vec![
+        v2t::PromptMessage::System {
+            content: "system".into(),
+            provider_options: anthropic_cache_control_options(),
+        },
+        v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "hi".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        },
+    ];
+    let mut options = v2t::CallOptions::new(prompt);
+    options.tools = vec![provider_tool(
+        "anthropic.web_fetch_20250910",
+        json!({
+            "maxUses": 1,
+            "allowedDomains": ["example.com"],
+            "citations": {"enabled": true}
+        }),
+    )];
+
+    let response = model.do_stream(options).await.expect("stream response");
+    let body = response.request_body.expect("request body");
+    assert!(
+        !contains_object_null(&body),
+        "anthropic request body should not require transport null pruning: {body}"
+    );
 }

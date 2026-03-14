@@ -95,7 +95,8 @@ fn build_openai(
     let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;
 
-    let lm = OpenAIResponsesLanguageModel::new(model.to_string(), config, http, transport_cfg);
+    let mut lm = OpenAIResponsesLanguageModel::new(model.to_string(), config, http, transport_cfg);
+    lm.start_codex_websocket_preconnect();
     Ok(Arc::new(lm))
 }
 

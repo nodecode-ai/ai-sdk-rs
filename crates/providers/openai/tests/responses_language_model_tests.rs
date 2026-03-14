@@ -31,6 +31,7 @@ struct TestTransport {
     websocket_connect_urls: Arc<Mutex<Vec<String>>>,
     websocket_request_bodies: Arc<Mutex<Vec<Value>>>,
     websocket_response_headers: Arc<Mutex<Vec<(String, String)>>>,
+    close_websocket_after_send: Arc<AtomicBool>,
     json_response: Arc<Mutex<Option<Value>>>,
     stream_behaviors: Arc<Mutex<VecDeque<StreamBehavior>>>,
 }
@@ -45,6 +46,7 @@ impl TestTransport {
             websocket_connect_urls: Arc::new(Mutex::new(Vec::new())),
             websocket_request_bodies: Arc::new(Mutex::new(Vec::new())),
             websocket_response_headers: Arc::new(Mutex::new(Vec::new())),
+            close_websocket_after_send: Arc::new(AtomicBool::new(false)),
             json_response: Arc::new(Mutex::new(None)),
             stream_behaviors: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -88,6 +90,12 @@ impl TestTransport {
         *self.websocket_response_headers.lock().unwrap() = headers;
         self
     }
+
+    fn with_close_websocket_after_send(self) -> Self {
+        self.close_websocket_after_send
+            .store(true, Ordering::SeqCst);
+        self
+    }
 }
 
 struct TestStreamResponse {
@@ -123,6 +131,13 @@ impl JsonStreamWebsocketConnection for TestWebsocketConnection {
                     b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-default\"}}\n\n",
                 ))])
             });
+        if self
+            .transport
+            .close_websocket_after_send
+            .load(Ordering::SeqCst)
+        {
+            self.closed.store(true, Ordering::SeqCst);
+        }
         match behavior {
             StreamBehavior::Chunks(chunks) => Ok(Box::pin(stream::iter(chunks))),
             StreamBehavior::Error(err) => {
@@ -262,6 +277,16 @@ fn provider_tool_outputs_fixture() -> Value {
 fn openai_error_fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/openai-error.1.json"))
         .expect("openai error fixture")
+}
+
+fn transport_http_status(status: u16) -> TransportError {
+    TransportError::HttpStatus {
+        status,
+        body: "{}".to_string(),
+        retry_after_ms: Some(250),
+        sanitized: format!("http status {status}"),
+        headers: vec![],
+    }
 }
 
 fn local_shell_response_fixture() -> Value {
@@ -594,7 +619,236 @@ async fn stream_falls_back_to_http_when_websocket_stream_closes_before_first_eve
 }
 
 #[tokio::test]
-async fn cold_codex_turn_session_prewarms_then_reuses_same_hot_websocket_session() {
+async fn stream_does_not_fallback_to_http_when_websocket_is_rate_limited() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://example.invalid/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new()
+        .with_stream_behavior(StreamBehavior::Error(transport_http_status(429)))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\"}\n\n",
+        ))]));
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-4o",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let err = match model
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "hello".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            provider_options: websocket_transport_options(),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(_) => panic!("rate limit should be surfaced"),
+        Err(err) => err,
+    };
+
+    match err {
+        SdkError::RateLimited { retry_after_ms, .. } => assert_eq!(retry_after_ms, Some(250)),
+        other => panic!("expected rate-limited error, got {other:?}"),
+    }
+    assert_eq!(
+        transport.stream_urls(),
+        vec!["wss://example.invalid/v1/responses".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn codex_websocket_http_fallback_drops_explicit_previous_response_id_after_reset() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new()
+        .with_stream_behavior(StreamBehavior::Chunks(vec![]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\"}}\n\n",
+        ))]));
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let mut session = model.new_turn_session();
+    let response = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "third".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([
+                    (
+                        "transport".into(),
+                        json!({
+                            "mode": "websocket",
+                            "fallback": "http",
+                        }),
+                    ),
+                    ("previousResponseId".into(), json!("resp-stale")),
+                ]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("fallback stream response");
+    let headers = response.response_headers.clone().expect("fallback headers");
+    drain_stream_response(response).await;
+
+    assert_eq!(
+        headers
+            .get("x-ai-sdk-effective-transport")
+            .map(String::as_str),
+        Some("http")
+    );
+    assert_eq!(
+        headers
+            .get("x-ai-sdk-transport-fallback")
+            .map(String::as_str),
+        Some("websocket->http")
+    );
+    assert_eq!(
+        headers
+            .get("x-ai-sdk-provider-session-reset-reason")
+            .map(String::as_str),
+        Some("websocket_http_fallback")
+    );
+    assert_eq!(
+        transport.last_url().as_deref(),
+        Some("https://chatgpt.com/backend-api/codex/responses")
+    );
+    assert_eq!(
+        transport
+            .last_body()
+            .as_ref()
+            .and_then(|body| body.get("previous_response_id"))
+            .and_then(|value| value.as_str()),
+        None
+    );
+    assert_eq!(
+        transport.stream_urls(),
+        vec![
+            "wss://chatgpt.com/backend-api/codex/responses".to_string(),
+            "https://chatgpt.com/backend-api/codex/responses".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn codex_websocket_cold_rate_limit_retries_with_prewarm_without_http_fallback() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new()
+        .with_stream_behavior(StreamBehavior::Error(transport_http_status(429)))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"warm-1\"}}\n\n",
+        ))]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        ))]));
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let mut session = model.new_turn_session();
+    let response = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "third".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            provider_options: websocket_transport_options(),
+            ..Default::default()
+        })
+        .await
+        .expect("cold websocket rate limit should retry via warmup");
+    let response_headers = response.response_headers.clone().expect("response headers");
+    drain_stream_response(response).await;
+
+    let request_bodies = transport.websocket_request_bodies();
+    assert_eq!(request_bodies.len(), 3);
+    assert_eq!(
+        request_bodies[0]
+            .get("previous_response_id")
+            .and_then(|value| value.as_str()),
+        None
+    );
+    assert_eq!(
+        request_bodies[1]
+            .get("generate")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        request_bodies[2]
+            .get("previous_response_id")
+            .and_then(|value| value.as_str()),
+        Some("warm-1")
+    );
+    assert_eq!(transport.stream_urls(), Vec::<String>::new());
+    assert_eq!(
+        transport.websocket_connect_urls(),
+        vec![
+            "wss://chatgpt.com/backend-api/codex/responses".to_string(),
+            "wss://chatgpt.com/backend-api/codex/responses".to_string(),
+        ]
+    );
+    assert_eq!(
+        response_headers
+            .get("x-ai-sdk-provider-session-prewarmed")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn cold_codex_turn_session_skips_prewarm_when_first_request_succeeds() {
     let cfg = OpenAIConfig {
         provider_name: "openai.responses".into(),
         provider_scope_name: "openai".into(),
@@ -694,32 +948,14 @@ async fn cold_codex_turn_session_prewarms_then_reuses_same_hot_websocket_session
         vec!["wss://chatgpt.com/backend-api/codex/responses".to_string()]
     );
     let request_bodies = transport.websocket_request_bodies();
-    assert_eq!(
-        request_bodies.len(),
-        3,
-        "expected warmup, real, and follow-up frames"
-    );
-    let warmup = &request_bodies[0];
-    let first_real = &request_bodies[1];
-    let second_real = &request_bodies[2];
-    assert_eq!(
-        warmup.get("type").and_then(|value| value.as_str()),
-        Some("response.create")
-    );
-    assert_eq!(
-        warmup.get("generate").and_then(|value| value.as_bool()),
-        Some(false)
-    );
-    assert_eq!(warmup.get("input"), Some(&json!([])));
-    assert_eq!(
-        request_shape_without_incremental_fields(warmup),
-        request_shape_without_incremental_fields(first_real)
-    );
+    assert_eq!(request_bodies.len(), 2, "expected real request and follow-up frame");
+    let first_real = &request_bodies[0];
+    let second_real = &request_bodies[1];
     assert_eq!(
         first_real
             .get("previous_response_id")
             .and_then(|value| value.as_str()),
-        Some("warm-1")
+        None
     );
     assert_eq!(
         second_real
@@ -732,25 +968,25 @@ async fn cold_codex_turn_session_prewarms_then_reuses_same_hot_websocket_session
         first_headers
             .get("x-ai-sdk-provider-session-prewarmed")
             .map(String::as_str),
-        Some("true")
+        Some("false")
     );
     assert_eq!(
         first_headers
             .get("x-ai-sdk-provider-session-request-count")
             .map(String::as_str),
-        Some("2")
+        Some("1")
     );
     assert_eq!(
         first_headers
             .get("x-ai-sdk-provider-previous-response-id-used")
             .map(String::as_str),
-        Some("true")
+        Some("false")
     );
     assert_eq!(
         first_headers
             .get("x-ai-sdk-provider-session-warmup-response-id-used")
             .map(String::as_str),
-        Some("true")
+        Some("false")
     );
     assert_eq!(
         first_headers
@@ -768,13 +1004,13 @@ async fn cold_codex_turn_session_prewarms_then_reuses_same_hot_websocket_session
         second_headers
             .get("x-ai-sdk-provider-session-prewarmed")
             .map(String::as_str),
-        Some("true")
+        Some("false")
     );
     assert_eq!(
         second_headers
             .get("x-ai-sdk-provider-session-request-count")
             .map(String::as_str),
-        Some("3")
+        Some("2")
     );
     assert_eq!(
         second_headers
@@ -797,6 +1033,116 @@ async fn cold_codex_turn_session_prewarms_then_reuses_same_hot_websocket_session
     assert_eq!(
         second_headers.get("x-codex-turn-state").map(String::as_str),
         Some("ts-1")
+    );
+}
+
+#[tokio::test]
+async fn explicit_previous_response_id_is_ignored_after_websocket_reconnect_reset() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new()
+        .with_close_websocket_after_send()
+        .with_websocket_response_headers(vec![(
+            "x-codex-turn-state".to_string(),
+            "ts-1".to_string(),
+        )])
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"warm-1\"}}\n\n",
+        ))]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        ))]))
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\"}}\n\n",
+        ))]));
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let mut session = model.new_turn_session();
+    let first = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "hello".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            provider_options: websocket_transport_options(),
+            ..Default::default()
+        })
+        .await
+        .expect("first stream response");
+    drain_stream_response(first).await;
+
+    let second = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "third".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([
+                    (
+                        "transport".into(),
+                        json!({
+                            "mode": "websocket",
+                            "fallback": "http",
+                        }),
+                    ),
+                    ("previousResponseId".into(), json!("resp-1")),
+                ]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("second stream response");
+    let second_headers = second.response_headers.clone().expect("second headers");
+    drain_stream_response(second).await;
+
+    assert_eq!(
+        transport.websocket_connect_urls(),
+        vec![
+            "wss://chatgpt.com/backend-api/codex/responses".to_string(),
+            "wss://chatgpt.com/backend-api/codex/responses".to_string(),
+        ]
+    );
+    let request_bodies = transport.websocket_request_bodies();
+    assert_eq!(
+        request_bodies[1]
+            .get("previous_response_id")
+            .and_then(|value| value.as_str()),
+        None
+    );
+    assert_eq!(
+        second_headers
+            .get("x-ai-sdk-provider-session-reset-reason")
+            .map(String::as_str),
+        Some("websocket_reconnect")
+    );
+    assert_eq!(
+        second_headers
+            .get("x-ai-sdk-provider-previous-response-id-used")
+            .map(String::as_str),
+        Some("false")
     );
 }
 
@@ -899,7 +1245,7 @@ async fn explicit_previous_response_id_wins_over_cached_warmup_id_on_reused_sock
 
     let request_bodies = transport.websocket_request_bodies();
     assert_eq!(
-        request_bodies[2]
+        request_bodies[1]
             .get("previous_response_id")
             .and_then(|value| value.as_str()),
         Some("explicit-final")
@@ -1006,7 +1352,7 @@ async fn codex_turn_session_updates_previous_response_id_before_stream_drain() {
     );
     let request_bodies = transport.websocket_request_bodies();
     assert_eq!(
-        request_bodies[2]
+        request_bodies[1]
             .get("previous_response_id")
             .and_then(|value| value.as_str()),
         Some("resp-1")
