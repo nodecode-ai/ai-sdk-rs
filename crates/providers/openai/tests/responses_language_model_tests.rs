@@ -571,7 +571,7 @@ async fn stream_uses_wss_for_codex_oauth_endpoint_path() {
 }
 
 #[tokio::test]
-async fn codex_websocket_request_body_omits_tool_defaults_when_callers_omit_them() {
+async fn codex_websocket_request_body_defaults_tool_settings_when_callers_omit_them() {
     let cfg = OpenAIConfig {
         provider_name: "openai.responses".into(),
         provider_scope_name: "openai".into(),
@@ -604,8 +604,8 @@ async fn codex_websocket_request_body_omits_tool_defaults_when_callers_omit_them
 
     let _ = model.do_stream(opts).await.expect("stream response");
     let body = transport.last_body().expect("request body");
-    assert_eq!(body.get("tool_choice"), None);
-    assert_eq!(body.get("parallel_tool_calls"), None);
+    assert_eq!(body.get("tool_choice"), Some(&json!("auto")));
+    assert_eq!(body.get("parallel_tool_calls"), Some(&json!(true)));
 }
 
 #[tokio::test]

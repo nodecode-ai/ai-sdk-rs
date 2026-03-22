@@ -4458,6 +4458,12 @@ struct OpenAIProviderOptionsParsed {
     transport_fallback_http: bool,
 }
 
+#[derive(Debug, Clone)]
+struct OpenAIRequestToolSettings {
+    parallel_tool_calls: Option<bool>,
+    tool_choice: Option<v2t::ToolChoice>,
+}
+
 fn parse_openai_provider_options(
     opts: &v2t::ProviderOptions,
     provider_scope: &str,
@@ -4538,6 +4544,22 @@ fn resolve_transport_selection(
     ResponseTransportSelection {
         requested,
         fallback_http: provider_options.transport_fallback_http,
+    }
+}
+
+fn resolve_request_tool_settings(
+    endpoint_path: &str,
+    provider_options: &OpenAIProviderOptionsParsed,
+    tool_choice: &Option<v2t::ToolChoice>,
+) -> OpenAIRequestToolSettings {
+    let codex_defaults = should_use_codex_oauth_websocket_transport(endpoint_path);
+    OpenAIRequestToolSettings {
+        parallel_tool_calls: provider_options
+            .parallel_tool_calls
+            .or_else(|| codex_defaults.then_some(true)),
+        tool_choice: tool_choice
+            .clone()
+            .or_else(|| codex_defaults.then_some(v2t::ToolChoice::Auto)),
     }
 }
 
@@ -5180,6 +5202,8 @@ fn build_request_body(
     }
 
     let prov = parse_openai_provider_options(&options.provider_options, &cfg.provider_scope_name);
+    let request_tool_settings =
+        resolve_request_tool_settings(&cfg.endpoint_path, &prov, &options.tool_choice);
     let model_cfg = get_responses_model_config(model_id);
     let base_is_reasoning_model = model_cfg.is_reasoning_model;
     let is_reasoning_model = prov.force_reasoning.unwrap_or(base_is_reasoning_model);
@@ -5323,7 +5347,7 @@ fn build_request_body(
     if let Some(n) = prov.max_tool_calls {
         body["max_tool_calls"] = json!(n);
     }
-    if let Some(b) = prov.parallel_tool_calls {
+    if let Some(b) = request_tool_settings.parallel_tool_calls {
         body["parallel_tool_calls"] = json!(b);
     }
     if let Some(s) = prov.previous_response_id {
@@ -5386,7 +5410,7 @@ fn build_request_body(
         }
     }
 
-    if let Some(tc) = map_tool_choice(&options.tool_choice, &tool_name_mapping) {
+    if let Some(tc) = map_tool_choice(&request_tool_settings.tool_choice, &tool_name_mapping) {
         body["tool_choice"] = tc;
     }
 
