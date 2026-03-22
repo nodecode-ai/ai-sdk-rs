@@ -565,6 +565,8 @@ async fn stream_uses_wss_for_codex_oauth_endpoint_path() {
             "type": "response.create",
             "model": "gpt-5.3-codex",
             "input": [{"role":"user","content":[{"type":"input_text","text":"hello"}]}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
             "stream": true
         })
     );
@@ -716,6 +718,8 @@ async fn codex_websocket_forwards_call_headers_and_client_metadata() {
             "client_metadata": {
                 "x-codex-turn-metadata": "{\"cwd\":\"/tmp/project\",\"approval_policy\":\"never\"}"
             },
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
             "stream": true
         })
     );
