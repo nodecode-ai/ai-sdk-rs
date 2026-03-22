@@ -106,8 +106,8 @@
   - explicit caller values still win
   - non-Codex OpenAI Responses paths remain unchanged
 
-- [ ] `RD2` Validate the surviving Codex request-default path and refresh evidence.
-  Lineage commit: `<pending>`
+- [x] `RD2` Validate the surviving Codex request-default path and refresh evidence.
+  Lineage commit: `<self; backfill after landing RD2>`
   Commit subject: `test(openai): validate codex request defaults`
   Lineage parent: `RD1`
   Scope:
@@ -120,9 +120,9 @@
 
 ## Validation Checklist
 
-- [ ] Add a Codex-endpoint request-body test that asserts omitted `tool_choice` and omitted `parallelToolCalls` become `tool_choice: "auto"` and `parallel_tool_calls: true`.
-- [ ] Add a Codex-endpoint request-body test that proves explicit caller values still override the Codex defaults.
-- [ ] Re-run the targeted OpenAI Responses Rust test lane covering the new assertions.
+- [x] Add a Codex-endpoint request-body test that asserts omitted `tool_choice` and omitted `parallelToolCalls` become `tool_choice: "auto"` and `parallel_tool_calls: true`.
+- [x] Add a Codex-endpoint request-body test that proves explicit caller values still override the Codex defaults.
+- [x] Re-run the targeted OpenAI Responses Rust test lane covering the new assertions.
 
 ## Acceptance Criteria
 
