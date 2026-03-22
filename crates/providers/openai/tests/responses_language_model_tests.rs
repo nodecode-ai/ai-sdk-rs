@@ -571,6 +571,87 @@ async fn stream_uses_wss_for_codex_oauth_endpoint_path() {
 }
 
 #[tokio::test]
+async fn codex_websocket_request_body_omits_tool_defaults_when_callers_omit_them() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let opts = v2t::CallOptions {
+        prompt: vec![v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "hello".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        }],
+        ..Default::default()
+    };
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    let body = transport.last_body().expect("request body");
+    assert_eq!(body.get("tool_choice"), None);
+    assert_eq!(body.get("parallel_tool_calls"), None);
+}
+
+#[tokio::test]
+async fn codex_websocket_request_body_keeps_explicit_tool_settings() {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+    let opts = v2t::CallOptions {
+        prompt: vec![v2t::PromptMessage::User {
+            content: vec![v2t::UserPart::Text {
+                text: "hello".into(),
+                provider_options: None,
+            }],
+            provider_options: None,
+        }],
+        tool_choice: Some(v2t::ToolChoice::None),
+        provider_options: v2t::ProviderOptions::from([(
+            "openai".into(),
+            HashMap::from([("parallelToolCalls".into(), json!(false))]),
+        )]),
+        ..Default::default()
+    };
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    let body = transport.last_body().expect("request body");
+    assert_eq!(body.get("tool_choice"), Some(&json!("none")));
+    assert_eq!(body.get("parallel_tool_calls"), Some(&json!(false)));
+}
+
+#[tokio::test]
 async fn codex_websocket_forwards_call_headers_and_client_metadata() {
     let cfg = OpenAIConfig {
         provider_name: "openai.responses".into(),
