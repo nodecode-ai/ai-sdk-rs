@@ -5,18 +5,18 @@ use base64::Engine;
 use futures_util::StreamExt;
 use serde_json::{json, Value as JsonValue};
 
-use crate::core::options;
-use crate::core::stream_collect::{collect_stream_to_response, StreamCollectorConfig};
-use crate::core::transport::{HttpTransport, TransportConfig};
-use crate::core::{
+use crate::ai_sdk_core::options;
+use crate::ai_sdk_core::stream_collect::{collect_stream_to_response, StreamCollectorConfig};
+use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
+use crate::ai_sdk_core::{
     map_events_to_parts, EventMapperConfig, EventMapperHooks, LanguageModel, SdkError,
 };
-use crate::streaming_sse::{sse_to_events, ProviderChunk, SseEvent};
-use crate::types::v2 as v2t;
-use crate::types::Event as ProviderEvent;
+use crate::ai_sdk_streaming_sse::{sse_to_events, ProviderChunk, SseEvent};
+use crate::ai_sdk_types::v2 as v2t;
+use crate::ai_sdk_types::Event as ProviderEvent;
 
-use crate::providers::anthropic::error::map_transport_error_to_sdk_error;
-use crate::providers::anthropic::messages::options::{
+use crate::provider_anthropic::error::map_transport_error_to_sdk_error;
+use crate::provider_anthropic::messages::options::{
     parse_anthropic_file_part_options, parse_anthropic_provider_options, AnthropicMessagesModelId,
     AnthropicProviderOptions, ThinkingOption,
 };
@@ -37,7 +37,7 @@ pub struct AnthropicMessagesConfig<T: HttpTransport> {
 }
 
 pub struct AnthropicMessagesLanguageModel<
-    T: HttpTransport = crate::transport_reqwest::ReqwestTransport,
+    T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
 > {
     model_id: AnthropicMessagesModelId,
     cfg: AnthropicMessagesConfig<T>,
@@ -1286,11 +1286,11 @@ impl<T: HttpTransport> AnthropicMessagesLanguageModel<T> {
     }
 }
 
-impl AnthropicMessagesLanguageModel<crate::transport_reqwest::ReqwestTransport> {
+impl AnthropicMessagesLanguageModel<crate::reqwest_transport::ReqwestTransport> {
     pub fn builder(
         model_id: impl Into<AnthropicMessagesModelId>,
-    ) -> crate::providers::anthropic::provider::AnthropicMessagesBuilder {
-        crate::providers::anthropic::provider::AnthropicMessagesBuilder::new(model_id.into())
+    ) -> crate::provider_anthropic::provider::AnthropicMessagesBuilder {
+        crate::provider_anthropic::provider::AnthropicMessagesBuilder::new(model_id.into())
     }
 }
 
@@ -1309,7 +1309,7 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for AnthropicMessagesLanguage
     async fn do_generate(
         &self,
         options: v2t::CallOptions,
-    ) -> Result<crate::core::GenerateResponse, SdkError> {
+    ) -> Result<crate::ai_sdk_core::GenerateResponse, SdkError> {
         let stream_resp = self.do_stream(options).await?;
         collect_stream_to_response(
             stream_resp,
@@ -1329,8 +1329,8 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for AnthropicMessagesLanguage
     async fn do_stream(
         &self,
         options: v2t::CallOptions,
-    ) -> Result<crate::core::StreamResponse, SdkError> {
-        let options = crate::core::request_builder::defaults::build_call_options(
+    ) -> Result<crate::ai_sdk_core::StreamResponse, SdkError> {
+        let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
             options,
             &self.cfg.provider_scope_name,
             self.cfg.default_options.as_ref(),
@@ -1430,15 +1430,15 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for AnthropicMessagesLanguage
         // Decode SSE and convert to provider-agnostic events, then map to v2 parts
         let events = sse_to_events::<_, AnthropicChunk, SdkError>(bytes_stream.map(|chunk_res| {
             chunk_res.map_err(|e| match e {
-                crate::core::error::TransportError::IdleReadTimeout(_) => SdkError::Timeout,
-                crate::core::error::TransportError::ConnectTimeout(_) => SdkError::Timeout,
+                crate::ai_sdk_core::error::TransportError::IdleReadTimeout(_) => SdkError::Timeout,
+                crate::ai_sdk_core::error::TransportError::ConnectTimeout(_) => SdkError::Timeout,
                 other => SdkError::Transport(other),
             })
         }));
 
         let mut hooks = EventMapperHooks::default();
         hooks.data = Some(Box::new(
-            |_state: &mut crate::core::EventMapperState<()>, key, value| {
+            |_state: &mut crate::ai_sdk_core::EventMapperState<()>, key, value| {
                 if key == "reasoning_signature" {
                     if let Some(sig) = value.get("signature").and_then(|s| s.as_str()) {
                         return Some(vec![v2t::StreamPart::ReasoningSignature {
@@ -1467,7 +1467,7 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for AnthropicMessagesLanguage
             },
         );
 
-        Ok(crate::core::StreamResponse {
+        Ok(crate::ai_sdk_core::StreamResponse {
             stream: parts,
             request_body: Some(body),
             response_headers: None,
@@ -1512,7 +1512,7 @@ fn summarize_anthropic_request(body: &JsonValue) -> AnthropicRequestSummary {
     }
 }
 
-// --- SSE parsing: Anthropic provider chunk to crate::types::Event ---
+// --- SSE parsing: Anthropic provider chunk to crate::ai_sdk_types::Event ---
 
 #[derive(Default)]
 struct AnthropicChunk {
@@ -1689,8 +1689,8 @@ impl AnthropicChunk {
 }
 
 fn push_anthropic_usage(out: &mut Vec<ProviderEvent>, usage: &JsonValue) {
-    use crate::types::TokenUsage;
-    let norm = crate::types::usage::normalize_anthropic(usage);
+    use crate::ai_sdk_types::TokenUsage;
+    let norm = crate::ai_sdk_types::usage::normalize_anthropic(usage);
     let input = norm
         .get("input_tokens")
         .and_then(|v| v.as_u64())

@@ -2,18 +2,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::transport::TransportConfig;
-use crate::core::{LanguageModel, SdkError};
-use crate::provider::{
+use crate::ai_sdk_core::transport::TransportConfig;
+use crate::ai_sdk_core::{LanguageModel, SdkError};
+use crate::ai_sdk_provider::{
     build_provider_transport_config, collect_query_params, filter_provider_bootstrap_headers,
     registry::ProviderRegistration, Credentials,
 };
-use crate::types::catalog::{ProviderDefinition, SdkType};
-use crate::types::v2 as v2t;
+use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
+use crate::ai_sdk_types::v2 as v2t;
 use serde_json::Value as JsonValue;
 
-use crate::providers::openai::config::OpenAIConfig;
-use crate::providers::openai::responses::language_model::OpenAIResponsesLanguageModel;
+use crate::provider_openai::config::OpenAIConfig;
+use crate::provider_openai::responses::language_model::OpenAIResponsesLanguageModel;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ENDPOINT_PATH: &str = "/responses";
@@ -167,7 +167,7 @@ impl OpenAIResponsesBuilder {
 
     pub fn build(
         self,
-    ) -> Result<OpenAIResponsesLanguageModel<crate::transport_reqwest::ReqwestTransport>, SdkError>
+    ) -> Result<OpenAIResponsesLanguageModel<crate::reqwest_transport::ReqwestTransport>, SdkError>
     {
         let mut headers = default_headers_from_creds(self.api_key, self.bearer);
         headers.extend(self.headers);
@@ -185,7 +185,7 @@ impl OpenAIResponsesBuilder {
             request_defaults: self.request_defaults,
         };
 
-        let http = crate::transport_reqwest::ReqwestTransport::try_new(&self.transport_cfg)
+        let http = crate::reqwest_transport::ReqwestTransport::try_new(&self.transport_cfg)
             .map_err(SdkError::Transport)?;
         let mut lm =
             OpenAIResponsesLanguageModel::new(self.model_id, config, http, self.transport_cfg);

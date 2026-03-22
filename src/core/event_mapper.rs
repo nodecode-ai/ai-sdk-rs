@@ -6,8 +6,8 @@ use async_stream::try_stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
 
-use crate::core::error::SdkError;
-use crate::core::v2::PartStream;
+use crate::ai_sdk_core::error::SdkError;
+use crate::ai_sdk_core::v2::PartStream;
 
 pub type ProviderMetadata = HashMap<String, HashMap<String, serde_json::Value>>;
 

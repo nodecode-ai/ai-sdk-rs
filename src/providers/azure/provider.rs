@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::{LanguageModel, SdkError, TransportError};
-use crate::provider::{
+use crate::ai_sdk_core::{LanguageModel, SdkError, TransportError};
+use crate::ai_sdk_provider::{
     build_provider_transport_config, filter_provider_bootstrap_headers,
     registry::ProviderRegistration, Credentials,
 };
-use crate::providers::openai::config::OpenAIConfig;
-use crate::providers::openai::responses::language_model::OpenAIResponsesLanguageModel;
-use crate::types::catalog::{ProviderDefinition, SdkType};
+use crate::provider_openai::config::OpenAIConfig;
+use crate::provider_openai::responses::language_model::OpenAIResponsesLanguageModel;
+use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 use tracing::info;
 
 const TRACE_PREFIX: &str = "[AZURE]";
@@ -224,7 +224,7 @@ fn build_azure(
     ]);
 
     let transport_cfg = build_provider_transport_config(def, Some(Duration::from_secs(45)));
-    let http = crate::transport_reqwest::ReqwestTransport::try_new(&transport_cfg)
+    let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;
 
     let config = OpenAIConfig {

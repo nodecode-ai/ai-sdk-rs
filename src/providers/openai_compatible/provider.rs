@@ -1,28 +1,28 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use crate::core::options as sdkopt;
-use crate::core::request_builder::defaults::provider_defaults_from_json;
-use crate::core::transport::TransportConfig;
-use crate::core::{EmbeddingModel, ImageModel, LanguageModel, SdkError};
-use crate::provider::{
+use crate::ai_sdk_core::options as sdkopt;
+use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
+use crate::ai_sdk_core::transport::TransportConfig;
+use crate::ai_sdk_core::{EmbeddingModel, ImageModel, LanguageModel, SdkError};
+use crate::ai_sdk_provider::{
     build_provider_transport_config, collect_query_params, registry::ProviderRegistration,
     Credentials,
 };
-use crate::types::catalog::{ProviderDefinition, SdkType};
-use crate::types::v2 as v2t;
+use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
+use crate::ai_sdk_types::v2 as v2t;
 
-use crate::providers::openai_compatible::chat::language_model::{
+use crate::provider_openai_compatible::chat::language_model::{
     OpenAICompatibleChatConfig, OpenAICompatibleChatLanguageModel,
 };
-use crate::providers::openai_compatible::completion::language_model::{
+use crate::provider_openai_compatible::completion::language_model::{
     OpenAICompatibleCompletionConfig, OpenAICompatibleCompletionLanguageModel,
 };
-use crate::providers::openai_compatible::embedding::embedding_model::{
+use crate::provider_openai_compatible::embedding::embedding_model::{
     OpenAICompatibleEmbeddingConfig, OpenAICompatibleEmbeddingModel,
     DEFAULT_MAX_EMBEDDINGS_PER_CALL,
 };
-use crate::providers::openai_compatible::image::image_model::{
+use crate::provider_openai_compatible::image::image_model::{
     OpenAICompatibleImageConfig, OpenAICompatibleImageModel,
 };
 
@@ -93,7 +93,7 @@ fn build_headers_from_pairs(
 struct BaseConfig {
     base_url: String,
     headers: Vec<(String, String)>,
-    http: crate::transport_reqwest::ReqwestTransport,
+    http: crate::reqwest_transport::ReqwestTransport,
     transport_cfg: TransportConfig,
     query_params: Vec<(String, String)>,
     default_options: Option<v2t::ProviderOptions>,
@@ -119,7 +119,7 @@ fn build_base_config_from_parts(
         });
     }
     let headers = build_headers_from_pairs(&header_pairs, api_key, bearer);
-    let http = crate::transport_reqwest::ReqwestTransport::try_new(&transport_cfg)
+    let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;
 
     Ok(BaseConfig {
@@ -347,7 +347,7 @@ impl OpenAICompatibleChatBuilder {
     pub fn build(
         self,
     ) -> Result<
-        OpenAICompatibleChatLanguageModel<crate::transport_reqwest::ReqwestTransport>,
+        OpenAICompatibleChatLanguageModel<crate::reqwest_transport::ReqwestTransport>,
         SdkError,
     > {
         let (model_id, provider_scope_name, base) = self.base.build()?;
@@ -396,7 +396,7 @@ impl OpenAICompatibleCompletionBuilder {
     pub fn build(
         self,
     ) -> Result<
-        OpenAICompatibleCompletionLanguageModel<crate::transport_reqwest::ReqwestTransport>,
+        OpenAICompatibleCompletionLanguageModel<crate::reqwest_transport::ReqwestTransport>,
         SdkError,
     > {
         let (model_id, provider_scope_name, base) = self.base.build()?;
@@ -453,7 +453,7 @@ impl OpenAICompatibleEmbeddingBuilder {
 
     pub fn build(
         self,
-    ) -> Result<OpenAICompatibleEmbeddingModel<crate::transport_reqwest::ReqwestTransport>, SdkError>
+    ) -> Result<OpenAICompatibleEmbeddingModel<crate::reqwest_transport::ReqwestTransport>, SdkError>
     {
         let (model_id, provider_scope_name, base) = self.base.build()?;
         Ok(OpenAICompatibleEmbeddingModel::new(
@@ -489,7 +489,7 @@ impl OpenAICompatibleImageBuilder {
 
     pub fn build(
         self,
-    ) -> Result<OpenAICompatibleImageModel<crate::transport_reqwest::ReqwestTransport>, SdkError>
+    ) -> Result<OpenAICompatibleImageModel<crate::reqwest_transport::ReqwestTransport>, SdkError>
     {
         let (model_id, provider_scope_name, base) = self.base.build()?;
         Ok(OpenAICompatibleImageModel::new(

@@ -1,9 +1,9 @@
 use std::time::SystemTime;
 
-use crate::types::image as imgt;
-use crate::types::v2 as v2t;
+use crate::ai_sdk_types::image as imgt;
+use crate::ai_sdk_types::v2 as v2t;
 
-use crate::core::SdkError;
+use crate::ai_sdk_core::SdkError;
 
 #[derive(Debug, Clone)]
 pub struct ImageResponseMeta {

@@ -13,7 +13,9 @@ use crate::provider_google::shared::options::{
 use crate::provider_google::shared::prepare_tools::{
     convert_json_schema_to_openapi_schema, prepare_tools,
 };
-use crate::provider_google::shared::prompt::{convert_to_google_prompt_with_scopes, GooglePrompt};
+use crate::provider_google::shared::prompt::{
+    convert_to_google_prompt_with_scopes, GooglePrompt,
+};
 use crate::provider_google::shared::stream_core::build_google_stream_part_stream;
 
 const TRACE_PREFIX: &str = "[GOOGLE-V2]";

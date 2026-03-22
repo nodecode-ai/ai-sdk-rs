@@ -3,16 +3,16 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value as JsonValue};
 
-use crate::core::stream_collect::{collect_stream_to_response, StreamCollectorConfig};
-use crate::core::transport::{HttpTransport, TransportConfig};
-use crate::core::{LanguageModel, SdkError};
-use crate::types::v2 as v2t;
+use crate::ai_sdk_core::stream_collect::{collect_stream_to_response, StreamCollectorConfig};
+use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
+use crate::ai_sdk_core::{LanguageModel, SdkError};
+use crate::ai_sdk_types::v2 as v2t;
 
-use crate::providers::openai_compatible::chat::convert::convert_to_openai_compatible_chat_messages as convert_messages;
-use crate::providers::openai_compatible::chat::options::{
+use crate::provider_openai_compatible::chat::convert::convert_to_openai_compatible_chat_messages as convert_messages;
+use crate::provider_openai_compatible::chat::options::{
     parse_openai_compatible_chat_provider_options, OpenAICompatibleChatProviderOptions,
 };
-use crate::providers::openai_compatible::chat::prepare_tools::prepare_tools;
+use crate::provider_openai_compatible::chat::prepare_tools::prepare_tools;
 
 pub struct OpenAICompatibleChatConfig<T: HttpTransport> {
     pub provider_scope_name: String,
@@ -28,7 +28,7 @@ pub struct OpenAICompatibleChatConfig<T: HttpTransport> {
 }
 
 pub struct OpenAICompatibleChatLanguageModel<
-    T: HttpTransport = crate::transport_reqwest::ReqwestTransport,
+    T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
 > {
     model_id: String,
     cfg: OpenAICompatibleChatConfig<T>,
@@ -185,11 +185,11 @@ impl<T: HttpTransport> OpenAICompatibleChatLanguageModel<T> {
     }
 }
 
-impl OpenAICompatibleChatLanguageModel<crate::transport_reqwest::ReqwestTransport> {
+impl OpenAICompatibleChatLanguageModel<crate::reqwest_transport::ReqwestTransport> {
     pub fn builder(
         model_id: impl Into<String>,
-    ) -> crate::providers::openai_compatible::provider::OpenAICompatibleChatBuilder {
-        crate::providers::openai_compatible::provider::OpenAICompatibleChatBuilder::new(model_id)
+    ) -> crate::provider_openai_compatible::provider::OpenAICompatibleChatBuilder {
+        crate::provider_openai_compatible::provider::OpenAICompatibleChatBuilder::new(model_id)
     }
 }
 
@@ -208,7 +208,7 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for OpenAICompatibleChatLangu
     async fn do_generate(
         &self,
         options: v2t::CallOptions,
-    ) -> Result<crate::core::GenerateResponse, SdkError> {
+    ) -> Result<crate::ai_sdk_core::GenerateResponse, SdkError> {
         let stream_resp = self.do_stream(options).await?;
         collect_stream_to_response(
             stream_resp,
@@ -224,8 +224,8 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for OpenAICompatibleChatLangu
     async fn do_stream(
         &self,
         options: v2t::CallOptions,
-    ) -> Result<crate::core::StreamResponse, SdkError> {
-        let options = crate::core::request_builder::defaults::build_call_options(
+    ) -> Result<crate::ai_sdk_core::StreamResponse, SdkError> {
+        let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
             options,
             &self.cfg.provider_scope_name,
             self.cfg.default_options.as_ref(),
@@ -241,19 +241,19 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for OpenAICompatibleChatLangu
         let url = self.build_request_url();
         let headers = self.cfg.headers.clone();
 
-        crate::providers::openai_compatible::stream::start_streaming(
+        crate::provider_openai_compatible::stream::start_streaming(
             &self.cfg.http,
             url,
             headers,
             body,
             &self.cfg.transport_cfg,
-            crate::providers::openai_compatible::stream::StreamSettings {
+            crate::provider_openai_compatible::stream::StreamSettings {
                 warnings,
                 include_raw: options.include_raw_chunks,
                 include_usage: self.cfg.include_usage,
                 provider_scope_name: self.cfg.provider_scope_name.clone(),
             },
-            crate::providers::openai_compatible::stream::StreamMode::Chat,
+            crate::provider_openai_compatible::stream::StreamMode::Chat,
         )
         .await
     }

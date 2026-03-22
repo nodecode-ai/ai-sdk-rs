@@ -1,6 +1,6 @@
 //! Async Stream support for SSE parsing
 
-use crate::streaming_sse::{SseDecoder, SseEvent};
+use crate::ai_sdk_streaming_sse::{SseDecoder, SseEvent};
 use bytes::Bytes;
 use futures_core::Stream;
 use std::pin::Pin;

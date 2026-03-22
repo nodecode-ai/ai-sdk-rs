@@ -1,17 +1,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use crate::core::image::{ImageModel, ImageResponse, ImageResponseMeta};
-use crate::core::options::is_internal_sdk_header;
-use crate::core::transport::{HttpTransport, MultipartForm, TransportConfig};
-use crate::core::SdkError;
-use crate::types::image::{ImageData, ImageFile, ImageOptions, ImageUsage, ImageWarning};
-use crate::types::v2 as v2t;
+use crate::ai_sdk_core::image::{ImageModel, ImageResponse, ImageResponseMeta};
+use crate::ai_sdk_core::options::is_internal_sdk_header;
+use crate::ai_sdk_core::transport::{HttpTransport, MultipartForm, TransportConfig};
+use crate::ai_sdk_core::SdkError;
+use crate::ai_sdk_types::image::{ImageData, ImageFile, ImageOptions, ImageUsage, ImageWarning};
+use crate::ai_sdk_types::v2 as v2t;
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 
-use crate::providers::openai_compatible::error::map_transport_error_to_sdk_error;
-use crate::providers::openai_compatible::image::options::{
+use crate::provider_openai_compatible::error::map_transport_error_to_sdk_error;
+use crate::provider_openai_compatible::image::options::{
     apply_provider_defaults, parse_openai_compatible_image_provider_options,
     OpenAICompatibleImageProviderOptions,
 };
@@ -26,7 +26,7 @@ pub struct OpenAICompatibleImageConfig<T: HttpTransport> {
     pub default_options: Option<v2t::ProviderOptions>,
 }
 
-pub struct OpenAICompatibleImageModel<T: HttpTransport = crate::transport_reqwest::ReqwestTransport>
+pub struct OpenAICompatibleImageModel<T: HttpTransport = crate::reqwest_transport::ReqwestTransport>
 {
     model_id: String,
     cfg: OpenAICompatibleImageConfig<T>,
@@ -306,11 +306,11 @@ impl<T: HttpTransport> OpenAICompatibleImageModel<T> {
     }
 }
 
-impl OpenAICompatibleImageModel<crate::transport_reqwest::ReqwestTransport> {
+impl OpenAICompatibleImageModel<crate::reqwest_transport::ReqwestTransport> {
     pub fn builder(
         model_id: impl Into<String>,
-    ) -> crate::providers::openai_compatible::provider::OpenAICompatibleImageBuilder {
-        crate::providers::openai_compatible::provider::OpenAICompatibleImageBuilder::new(model_id)
+    ) -> crate::provider_openai_compatible::provider::OpenAICompatibleImageBuilder {
+        crate::provider_openai_compatible::provider::OpenAICompatibleImageBuilder::new(model_id)
     }
 }
 

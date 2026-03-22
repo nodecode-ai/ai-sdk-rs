@@ -1,7 +1,7 @@
-use crate::types::embedding as embt;
-use crate::types::v2 as v2t;
+use crate::ai_sdk_types::embedding as embt;
+use crate::ai_sdk_types::v2 as v2t;
 
-use crate::core::SdkError;
+use crate::ai_sdk_core::SdkError;
 
 /// Response from an embedding model call.
 #[derive(Debug, Clone)]

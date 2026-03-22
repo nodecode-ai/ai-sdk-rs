@@ -7,10 +7,10 @@ use crate::ai_sdk_provider::{
     build_provider_transport_config, collect_query_params, filter_provider_bootstrap_headers,
     registry::ProviderRegistration, Credentials,
 };
-use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 use crate::provider_google_vertex::language_model::{
     GoogleVertexConfig, GoogleVertexLanguageModel,
 };
+use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 
 const DEFAULT_API_VERSION: &str = "v1beta1";
 

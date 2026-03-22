@@ -1,5 +1,5 @@
-use crate::types::embedding::EmbedOptions as EmbeddingCallOptions;
-use crate::types::v2 as v2t;
+use crate::ai_sdk_types::embedding::EmbedOptions as EmbeddingCallOptions;
+use crate::ai_sdk_types::v2 as v2t;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -63,5 +63,5 @@ pub fn apply_provider_defaults(
     provider_scope_name: &str,
     defaults: Option<&v2t::ProviderOptions>,
 ) -> EmbeddingCallOptions {
-    crate::core::request_builder::defaults::build_embed_options(opts, provider_scope_name, defaults)
+    crate::ai_sdk_core::request_builder::defaults::build_embed_options(opts, provider_scope_name, defaults)
 }

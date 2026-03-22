@@ -1,19 +1,19 @@
 use std::collections::{BTreeMap, HashMap};
 
-use crate::core::embedding::{EmbedResponse, EmbeddingModel};
-use crate::core::error::SdkError;
-use crate::core::options::is_internal_sdk_header;
-use crate::core::transport::{HttpTransport, TransportConfig};
-use crate::types::embedding::{EmbedOptions, EmbedUsage};
-use crate::types::v2 as v2t;
+use crate::ai_sdk_core::embedding::{EmbedResponse, EmbeddingModel};
+use crate::ai_sdk_core::error::SdkError;
+use crate::ai_sdk_core::options::is_internal_sdk_header;
+use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
+use crate::ai_sdk_types::embedding::{EmbedOptions, EmbedUsage};
+use crate::ai_sdk_types::v2 as v2t;
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 
-use crate::providers::openai_compatible::embedding::options::{
+use crate::provider_openai_compatible::embedding::options::{
     apply_provider_defaults, parse_openai_compatible_embedding_provider_options,
     OpenAICompatibleEmbeddingProviderOptions,
 };
-use crate::providers::openai_compatible::error::map_transport_error_to_sdk_error;
+use crate::provider_openai_compatible::error::map_transport_error_to_sdk_error;
 
 pub(crate) const DEFAULT_MAX_EMBEDDINGS_PER_CALL: usize = 2048;
 
@@ -31,7 +31,7 @@ pub struct OpenAICompatibleEmbeddingConfig<T: HttpTransport> {
 }
 
 pub struct OpenAICompatibleEmbeddingModel<
-    T: HttpTransport = crate::transport_reqwest::ReqwestTransport,
+    T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
 > {
     model_id: String,
     cfg: OpenAICompatibleEmbeddingConfig<T>,
@@ -149,11 +149,11 @@ impl<T: HttpTransport> OpenAICompatibleEmbeddingModel<T> {
     }
 }
 
-impl OpenAICompatibleEmbeddingModel<crate::transport_reqwest::ReqwestTransport> {
+impl OpenAICompatibleEmbeddingModel<crate::reqwest_transport::ReqwestTransport> {
     pub fn builder(
         model_id: impl Into<String>,
-    ) -> crate::providers::openai_compatible::provider::OpenAICompatibleEmbeddingBuilder {
-        crate::providers::openai_compatible::provider::OpenAICompatibleEmbeddingBuilder::new(
+    ) -> crate::provider_openai_compatible::provider::OpenAICompatibleEmbeddingBuilder {
+        crate::provider_openai_compatible::provider::OpenAICompatibleEmbeddingBuilder::new(
             model_id,
         )
     }

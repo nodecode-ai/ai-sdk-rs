@@ -1,4 +1,4 @@
-use crate::core::error::TransportError;
+use crate::ai_sdk_core::error::TransportError;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;

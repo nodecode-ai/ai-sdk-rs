@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::types::v2::{headers_is_empty, provider_options_is_empty, ProviderOptions};
+use crate::ai_sdk_types::v2::{headers_is_empty, provider_options_is_empty, ProviderOptions};
 
 /// Single embedding vector.
 pub type Embedding = Vec<f32>;

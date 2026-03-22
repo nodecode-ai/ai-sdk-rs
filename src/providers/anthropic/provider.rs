@@ -2,19 +2,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::core::options as sdkopt;
-use crate::core::request_builder::defaults::provider_defaults_from_json;
-use crate::core::transport::TransportConfig;
-use crate::core::{LanguageModel, SdkError};
-use crate::provider::{
+use crate::ai_sdk_core::options as sdkopt;
+use crate::ai_sdk_core::request_builder::defaults::provider_defaults_from_json;
+use crate::ai_sdk_core::transport::TransportConfig;
+use crate::ai_sdk_core::{LanguageModel, SdkError};
+use crate::ai_sdk_provider::{
     build_provider_transport_config, registry::ProviderRegistration, Credentials,
     ReasoningScopeContext,
 };
-use crate::types::catalog::{ProviderDefinition, SdkType};
-use crate::types::v2 as v2t;
+use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
+use crate::ai_sdk_types::v2 as v2t;
 use serde_json::Value as JsonValue;
 
-use crate::providers::anthropic::messages::language_model::{
+use crate::provider_anthropic::messages::language_model::{
     AnthropicMessagesConfig, AnthropicMessagesLanguageModel,
 };
 const OAUTH_BETA_HEADER_VALUE: &str = "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14";
@@ -178,7 +178,7 @@ impl AnthropicMessagesBuilder {
 
     pub fn build(
         self,
-    ) -> Result<AnthropicMessagesLanguageModel<crate::transport_reqwest::ReqwestTransport>, SdkError>
+    ) -> Result<AnthropicMessagesLanguageModel<crate::reqwest_transport::ReqwestTransport>, SdkError>
     {
         let mut header_map: BTreeMap<String, (String, String)> = BTreeMap::new();
         for (key, value) in default_headers_from_creds(self.api_key, self.bearer) {
@@ -196,7 +196,7 @@ impl AnthropicMessagesBuilder {
             headers.push((orig, value));
         }
 
-        let http = crate::transport_reqwest::ReqwestTransport::try_new(&self.transport_cfg)
+        let http = crate::reqwest_transport::ReqwestTransport::try_new(&self.transport_cfg)
             .map_err(SdkError::Transport)?;
         let supported_urls =
             HashMap::from([("image/*".to_string(), vec![r"^https?://.*$".to_string()])]);

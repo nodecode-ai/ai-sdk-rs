@@ -8,7 +8,9 @@ use crate::ai_sdk_provider::{
 };
 use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 
-use crate::provider_google::gen_ai::language_model::{GoogleGenAiConfig, GoogleGenAiLanguageModel};
+use crate::provider_google::gen_ai::language_model::{
+    GoogleGenAiConfig, GoogleGenAiLanguageModel,
+};
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 

@@ -1,4 +1,4 @@
-use crate::types::TokenUsage;
+use crate::ai_sdk_types::TokenUsage;
 use serde_json::Value;
 
 /// Parse OpenAI-style usage objects into TokenUsage.

@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value as JsonValue};
 
-use crate::core::stream_collect::{collect_stream_to_response, StreamCollectorConfig};
-use crate::core::transport::{HttpTransport, TransportConfig};
-use crate::core::{LanguageModel, SdkError};
-use crate::types::v2 as v2t;
+use crate::ai_sdk_core::stream_collect::{collect_stream_to_response, StreamCollectorConfig};
+use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
+use crate::ai_sdk_core::{LanguageModel, SdkError};
+use crate::ai_sdk_types::v2 as v2t;
 
-use crate::providers::openai_compatible::completion::convert::convert_to_openai_compatible_completion_prompt;
-use crate::providers::openai_compatible::completion::options::{
+use crate::provider_openai_compatible::completion::convert::convert_to_openai_compatible_completion_prompt;
+use crate::provider_openai_compatible::completion::options::{
     parse_openai_compatible_completion_provider_options, OpenAICompatibleCompletionProviderOptions,
 };
 
@@ -26,7 +26,7 @@ pub struct OpenAICompatibleCompletionConfig<T: HttpTransport> {
 }
 
 pub struct OpenAICompatibleCompletionLanguageModel<
-    T: HttpTransport = crate::transport_reqwest::ReqwestTransport,
+    T: HttpTransport = crate::reqwest_transport::ReqwestTransport,
 > {
     model_id: String,
     cfg: OpenAICompatibleCompletionConfig<T>,
@@ -188,11 +188,11 @@ impl<T: HttpTransport> OpenAICompatibleCompletionLanguageModel<T> {
     }
 }
 
-impl OpenAICompatibleCompletionLanguageModel<crate::transport_reqwest::ReqwestTransport> {
+impl OpenAICompatibleCompletionLanguageModel<crate::reqwest_transport::ReqwestTransport> {
     pub fn builder(
         model_id: impl Into<String>,
-    ) -> crate::providers::openai_compatible::provider::OpenAICompatibleCompletionBuilder {
-        crate::providers::openai_compatible::provider::OpenAICompatibleCompletionBuilder::new(
+    ) -> crate::provider_openai_compatible::provider::OpenAICompatibleCompletionBuilder {
+        crate::provider_openai_compatible::provider::OpenAICompatibleCompletionBuilder::new(
             model_id,
         )
     }
@@ -213,7 +213,7 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for OpenAICompatibleCompletio
     async fn do_generate(
         &self,
         options: v2t::CallOptions,
-    ) -> Result<crate::core::GenerateResponse, SdkError> {
+    ) -> Result<crate::ai_sdk_core::GenerateResponse, SdkError> {
         let stream_resp = self.do_stream(options).await?;
         collect_stream_to_response(stream_resp, StreamCollectorConfig::default()).await
     }
@@ -221,8 +221,8 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for OpenAICompatibleCompletio
     async fn do_stream(
         &self,
         options: v2t::CallOptions,
-    ) -> Result<crate::core::StreamResponse, SdkError> {
-        let options = crate::core::request_builder::defaults::build_call_options(
+    ) -> Result<crate::ai_sdk_core::StreamResponse, SdkError> {
+        let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
             options,
             &self.cfg.provider_scope_name,
             self.cfg.default_options.as_ref(),
@@ -239,19 +239,19 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for OpenAICompatibleCompletio
         let url = self.build_request_url();
         let headers = self.cfg.headers.clone();
 
-        crate::providers::openai_compatible::stream::start_streaming(
+        crate::provider_openai_compatible::stream::start_streaming(
             &self.cfg.http,
             url,
             headers,
             body,
             &self.cfg.transport_cfg,
-            crate::providers::openai_compatible::stream::StreamSettings {
+            crate::provider_openai_compatible::stream::StreamSettings {
                 warnings,
                 include_raw: options.include_raw_chunks,
                 include_usage: self.cfg.include_usage,
                 provider_scope_name: self.cfg.provider_scope_name.clone(),
             },
-            crate::providers::openai_compatible::stream::StreamMode::Completion,
+            crate::provider_openai_compatible::stream::StreamMode::Completion,
         )
         .await
     }

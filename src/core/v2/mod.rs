@@ -1,7 +1,7 @@
 //! Vercel-compatible LanguageModel interface (formerly V2) and helpers.
 
-use crate::core::SdkError;
-use crate::types::v2 as v2t;
+use crate::ai_sdk_core::SdkError;
+use crate::ai_sdk_types::v2 as v2t;
 use futures_core::Stream;
 use std::pin::Pin;
 
@@ -36,7 +36,7 @@ pub trait LanguageModelTurnSession: Send {
     async fn do_stream(
         &mut self,
         options: v2t::CallOptions,
-    ) -> Result<StreamResponse, crate::core::SdkError>;
+    ) -> Result<StreamResponse, crate::ai_sdk_core::SdkError>;
 }
 
 pub type BoxedLanguageModelTurnSession<'a> = Box<dyn LanguageModelTurnSession + 'a>;
@@ -66,7 +66,7 @@ impl<M: LanguageModel + ?Sized> LanguageModelTurnSession
     async fn do_stream(
         &mut self,
         options: v2t::CallOptions,
-    ) -> Result<StreamResponse, crate::core::SdkError> {
+    ) -> Result<StreamResponse, crate::ai_sdk_core::SdkError> {
         self.model.do_stream(options).await
     }
 }
@@ -90,11 +90,11 @@ pub trait LanguageModel: Send + Sync {
     async fn do_generate(
         &self,
         options: v2t::CallOptions,
-    ) -> Result<GenerateResponse, crate::core::SdkError>;
+    ) -> Result<GenerateResponse, crate::ai_sdk_core::SdkError>;
     async fn do_stream(
         &self,
         options: v2t::CallOptions,
-    ) -> Result<StreamResponse, crate::core::SdkError>;
+    ) -> Result<StreamResponse, crate::ai_sdk_core::SdkError>;
 
     fn new_turn_session(&self) -> BoxedLanguageModelTurnSession<'_> {
         Box::new(StatelessLanguageModelTurnSession::new(self))

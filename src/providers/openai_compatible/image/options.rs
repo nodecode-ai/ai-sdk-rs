@@ -1,5 +1,5 @@
-use crate::types::image::ImageOptions as ImageCallOptions;
-use crate::types::v2 as v2t;
+use crate::ai_sdk_types::image::ImageOptions as ImageCallOptions;
+use crate::ai_sdk_types::v2 as v2t;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -48,5 +48,5 @@ pub fn apply_provider_defaults(
     provider_scope_name: &str,
     defaults: Option<&v2t::ProviderOptions>,
 ) -> ImageCallOptions {
-    crate::core::request_builder::defaults::build_image_options(opts, provider_scope_name, defaults)
+    crate::ai_sdk_core::request_builder::defaults::build_image_options(opts, provider_scope_name, defaults)
 }
