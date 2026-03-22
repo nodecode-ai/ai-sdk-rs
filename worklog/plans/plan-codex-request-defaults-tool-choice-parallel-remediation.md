@@ -93,8 +93,8 @@
   - a companion test proves explicit caller-provided values still serialize as requested
   - no production serializer change lands in this slice
 
-- [ ] `RD1` Move Codex request defaults onto one serializer-owned helper.
-  Lineage commit: `<pending>`
+- [x] `RD1` Move Codex request defaults onto one serializer-owned helper.
+  Lineage commit: `12fcaae`
   Commit subject: `fix(openai): default codex request tool fields`
   Lineage parent: `RD0`
   Scope:
