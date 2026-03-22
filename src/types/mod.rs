@@ -87,6 +87,27 @@ impl ToolArguments {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultCompletionEffect {
+    SessionMetadata,
+    SpawnAgent,
+    Wait,
+    CloseAgent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolResultArtifact {
+    pub path: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inline_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
 /// Content parts that can appear in a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -127,6 +148,18 @@ pub enum ContentPart {
         is_error: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_call: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_presentation_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot_baseline_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_effect: Option<ToolResultCompletionEffect>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<ToolResultArtifact>,
     },
     /// Image content
     Image { data: Vec<u8>, mime_type: String },
@@ -208,6 +241,61 @@ impl ChatMessage {
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContentPart, ToolResultArtifact, ToolResultCompletionEffect};
+    use serde_json::json;
+
+    #[test]
+    fn tool_result_round_trips_nodecode_metadata_fields() {
+        let part = ContentPart::ToolResult {
+            tool_use_id: "call_123".to_string(),
+            content: "ok".to_string(),
+            is_error: Some(false),
+            metadata: Some(json!({"status": "ok"})),
+            display_name: Some("tasks".to_string()),
+            display_call: Some("tasks({\"limit\":1})".to_string()),
+            tool_presentation_kind: Some("edit".to_string()),
+            snapshot_baseline_hash: Some("abc123".to_string()),
+            completion_effect: Some(ToolResultCompletionEffect::SessionMetadata),
+            artifact: Some(ToolResultArtifact {
+                path: "/tmp/out.txt".to_string(),
+                kind: "file".to_string(),
+                bytes: Some(12),
+                max_inline_bytes: Some(4096),
+                source_path: Some("/workspace/out.txt".to_string()),
+            }),
+        };
+
+        let value = serde_json::to_value(&part).expect("tool result should serialize");
+        assert_eq!(value["display_name"], "tasks");
+        assert_eq!(value["completion_effect"], "session_metadata");
+        assert_eq!(value["artifact"]["path"], "/tmp/out.txt");
+
+        let parsed: ContentPart =
+            serde_json::from_value(value).expect("tool result should deserialize");
+        match parsed {
+            ContentPart::ToolResult {
+                display_name,
+                completion_effect,
+                artifact,
+                ..
+            } => {
+                assert_eq!(display_name.as_deref(), Some("tasks"));
+                assert_eq!(
+                    completion_effect,
+                    Some(ToolResultCompletionEffect::SessionMetadata)
+                );
+                assert_eq!(
+                    artifact.expect("artifact should deserialize").source_path.as_deref(),
+                    Some("/workspace/out.txt")
+                );
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
     }
 }
 
