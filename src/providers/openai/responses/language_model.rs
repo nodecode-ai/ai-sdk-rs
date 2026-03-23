@@ -173,6 +173,16 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
         self.config.endpoint_url()
     }
 
+    fn compact_endpoint_url(&self) -> String {
+        let endpoint = self.endpoint_url();
+        if let Ok(mut url) = Url::parse(&endpoint) {
+            let path = format!("{}/compact", url.path().trim_end_matches('/'));
+            url.set_path(&path);
+            return url.to_string();
+        }
+        format!("{}/compact", endpoint.trim_end_matches('/'))
+    }
+
     async fn take_preconnected_websocket(&self) -> Option<Box<dyn JsonStreamWebsocketConnection>> {
         let pending = {
             let mut state = self.websocket_preconnect.lock().unwrap();
@@ -255,6 +265,42 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             hdrs.insert(k.to_lowercase(), v.clone());
         }
         hdrs
+    }
+
+    pub async fn compact_history_json(&self, options: v2t::CallOptions) -> Result<Value, SdkError> {
+        let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
+            options,
+            &self.config.provider_scope_name,
+            self.config.default_options.as_ref(),
+        );
+        let (body, _warnings) = build_request_body(&options, &self.model_id, &self.config)?;
+        let compact_body = build_compaction_request_body(body)?;
+        let url = self.compact_endpoint_url();
+        let hdrs = self.request_headers(&options.headers);
+        let headers: Vec<(String, String)> = hdrs
+            .into_iter()
+            .map(|(k, v)| (Self::canonicalize_header(&k), v))
+            .collect();
+        let (json, _res_headers) = self
+            .http
+            .post_json(&url, &headers, &compact_body, &self.transport_cfg)
+            .await
+            .map_err(map_transport_error)?;
+
+        if let Some(error) = json.get("error").filter(|v| !v.is_null()) {
+            let message = error
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| error.to_string());
+            return Err(SdkError::Upstream {
+                status: 400,
+                message,
+                source: None,
+            });
+        }
+
+        Ok(json)
     }
 
     async fn send(
@@ -5548,6 +5594,35 @@ fn json_object_keys(value: &Value) -> Vec<String> {
         .as_object()
         .map(|map| map.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+fn build_compaction_request_body(body: Value) -> Result<Value, SdkError> {
+    let body_obj = body.as_object().ok_or_else(|| SdkError::InvalidArgument {
+        message: "openai responses request body must be an object".into(),
+    })?;
+
+    let mut compact = Map::new();
+    for key in [
+        "model",
+        "instructions",
+        "input",
+        "tools",
+        "parallel_tool_calls",
+        "reasoning",
+        "text",
+    ] {
+        if let Some(value) = body_obj.get(key) {
+            compact.insert(key.to_string(), value.clone());
+        }
+    }
+
+    if !compact.contains_key("model") || !compact.contains_key("input") {
+        return Err(SdkError::InvalidArgument {
+            message: "openai compact request body requires model and input".into(),
+        });
+    }
+
+    Ok(Value::Object(compact))
 }
 
 impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {

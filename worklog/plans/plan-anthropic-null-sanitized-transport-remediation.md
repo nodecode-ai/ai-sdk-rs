@@ -63,6 +63,8 @@
 
 - Planned linear commit lineage:
 - `HEAD -> AN0 -> AN1 -> AN2`
+- Actual landed git order:
+- `bad3157 -> 3ecef89 -> ea3dc76 -> 22d6b68 (concurrent unrelated commit) -> 44b53d8`
 
 ## Execution Order
 
@@ -97,7 +99,7 @@
   - no unrelated Anthropic request-shaping refactor lands in this slice
 
 - [x] `AN2` Validate the surviving Anthropic null-sanitized path.
-  Lineage commit: `<self-referential final plan-update commit>`
+  Lineage commit: `44b53d8`
   Commit subject: `test(anthropic): validate null-sanitized transport path`
   Lineage parent: `AN1`
   Scope:
