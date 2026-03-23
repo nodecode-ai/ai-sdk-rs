@@ -1874,6 +1874,53 @@ async fn request_body_includes_provider_tools_and_tool_choice() {
 }
 
 #[tokio::test]
+async fn request_body_includes_priority_service_tier_when_requested() {
+    let prompt = vec![v2t::PromptMessage::User {
+        content: vec![v2t::UserPart::Text {
+            text: "Hello".into(),
+            provider_options: None,
+        }],
+        provider_options: None,
+    }];
+    let mut provider_options = v2t::ProviderOptions::new();
+    provider_options.insert(
+        "openai".into(),
+        HashMap::from([("serviceTier".into(), json!("priority"))]),
+    );
+    let opts = v2t::CallOptions {
+        prompt,
+        provider_options,
+        ..Default::default()
+    };
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    let body = transport.last_body().expect("request body");
+    assert_eq!(
+        body.get("service_tier").and_then(|value| value.as_str()),
+        Some("priority")
+    );
+}
+
+#[tokio::test]
 async fn request_body_function_tool_strict_true_passthrough() {
     let body =
         request_body_for_function_tool(function_tool_for_strict_passthrough(Some(true))).await;
