@@ -2511,6 +2511,240 @@ async fn request_body_includes_provider_tool_outputs() {
 }
 
 #[tokio::test]
+async fn request_body_serializes_provider_local_tool_calls_and_outputs() {
+    let prompt = vec![
+        v2t::PromptMessage::Assistant {
+            content: vec![
+                v2t::AssistantPart::ToolCall(v2t::ToolCallPart {
+                    tool_call_id: "call-local".into(),
+                    tool_name: "local_shell".into(),
+                    input: json!({
+                        "action": {
+                            "command": ["pwd"],
+                            "timeoutMs": 1000,
+                            "user": "mike",
+                            "workingDirectory": "/tmp/worktree",
+                            "env": { "FOO": "bar" }
+                        }
+                    })
+                    .to_string(),
+                    provider_executed: false,
+                    provider_metadata: None,
+                    dynamic: false,
+                    provider_options: None,
+                }),
+                v2t::AssistantPart::ToolCall(v2t::ToolCallPart {
+                    tool_call_id: "call-shell".into(),
+                    tool_name: "shell".into(),
+                    input: json!({
+                        "action": {
+                            "commands": ["ls -la"],
+                            "timeoutMs": 2000,
+                            "maxOutputLength": 4096
+                        }
+                    })
+                    .to_string(),
+                    provider_executed: false,
+                    provider_metadata: None,
+                    dynamic: false,
+                    provider_options: None,
+                }),
+                v2t::AssistantPart::ToolCall(v2t::ToolCallPart {
+                    tool_call_id: "call-apply".into(),
+                    tool_name: "apply_patch".into(),
+                    input: json!({
+                        "callId": "call-apply",
+                        "operation": {
+                            "type": "replace",
+                            "path": "src/main.rs",
+                            "diff": "-old\n+new\n"
+                        }
+                    })
+                    .to_string(),
+                    provider_executed: false,
+                    provider_metadata: None,
+                    dynamic: false,
+                    provider_options: None,
+                }),
+            ],
+            provider_options: None,
+        },
+        v2t::PromptMessage::Tool {
+            content: vec![
+                v2t::ToolMessagePart::ToolResult(v2t::ToolResultPart {
+                    r#type: v2t::ToolResultPartType::ToolResult,
+                    tool_call_id: "call-local".into(),
+                    tool_name: "local_shell".into(),
+                    output: v2t::ToolResultOutput::Json {
+                        value: json!({
+                            "output": [
+                                {
+                                    "stdout": "pwd\n",
+                                    "stderr": "",
+                                    "outcome": { "type": "exit", "exitCode": 0 }
+                                }
+                            ]
+                        }),
+                    },
+                    provider_options: None,
+                }),
+                v2t::ToolMessagePart::ToolResult(v2t::ToolResultPart {
+                    r#type: v2t::ToolResultPartType::ToolResult,
+                    tool_call_id: "call-shell".into(),
+                    tool_name: "shell".into(),
+                    output: v2t::ToolResultOutput::Json {
+                        value: json!({
+                            "output": [
+                                {
+                                    "stdout": "ok\n",
+                                    "stderr": "",
+                                    "outcome": { "type": "exit", "exitCode": 0 }
+                                },
+                                {
+                                    "stdout": "",
+                                    "stderr": "",
+                                    "outcome": { "type": "timeout" }
+                                }
+                            ]
+                        }),
+                    },
+                    provider_options: None,
+                }),
+                v2t::ToolMessagePart::ToolResult(v2t::ToolResultPart {
+                    r#type: v2t::ToolResultPartType::ToolResult,
+                    tool_call_id: "call-apply".into(),
+                    tool_name: "apply_patch".into(),
+                    output: v2t::ToolResultOutput::Json {
+                        value: json!({
+                            "status": "completed",
+                            "output": "patched"
+                        }),
+                    },
+                    provider_options: None,
+                }),
+            ],
+            provider_options: None,
+        },
+    ];
+    let opts = v2t::CallOptions {
+        prompt,
+        tools: vec![
+            v2t::Tool::Provider(v2t::ProviderTool {
+                r#type: v2t::ProviderToolType::Provider,
+                id: "openai.local_shell".into(),
+                name: "local_shell".into(),
+                args: json!({}),
+            }),
+            v2t::Tool::Provider(v2t::ProviderTool {
+                r#type: v2t::ProviderToolType::Provider,
+                id: "openai.shell".into(),
+                name: "shell".into(),
+                args: json!({}),
+            }),
+            v2t::Tool::Provider(v2t::ProviderTool {
+                r#type: v2t::ProviderToolType::Provider,
+                id: "openai.apply_patch".into(),
+                name: "apply_patch".into(),
+                args: json!({}),
+            }),
+        ],
+        ..Default::default()
+    };
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://api.openai.com/v1".into(),
+        endpoint_path: "/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new();
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let _ = model.do_stream(opts).await.expect("stream response");
+    let body = transport.last_body().expect("request body");
+    assert_eq!(
+        body.get("input"),
+        Some(&json!([
+            {
+                "type": "local_shell_call",
+                "call_id": "call-local",
+                "action": {
+                    "type": "exec",
+                    "command": ["pwd"],
+                    "timeout_ms": 1000,
+                    "user": "mike",
+                    "working_directory": "/tmp/worktree",
+                    "env": { "FOO": "bar" }
+                }
+            },
+            {
+                "type": "shell_call",
+                "call_id": "call-shell",
+                "status": "completed",
+                "action": {
+                    "commands": ["ls -la"],
+                    "timeout_ms": 2000,
+                    "max_output_length": 4096
+                }
+            },
+            {
+                "type": "apply_patch_call",
+                "call_id": "call-apply",
+                "status": "completed",
+                "operation": {
+                    "type": "replace",
+                    "path": "src/main.rs",
+                    "diff": "-old\n+new\n"
+                }
+            },
+            {
+                "type": "local_shell_call_output",
+                "call_id": "call-local",
+                "output": [
+                    {
+                        "stdout": "pwd\n",
+                        "stderr": "",
+                        "outcome": { "type": "exit", "exitCode": 0 }
+                    }
+                ]
+            },
+            {
+                "type": "shell_call_output",
+                "call_id": "call-shell",
+                "output": [
+                    {
+                        "stdout": "ok\n",
+                        "stderr": "",
+                        "outcome": { "type": "exit", "exit_code": 0 }
+                    },
+                    {
+                        "stdout": "",
+                        "stderr": "",
+                        "outcome": { "type": "timeout" }
+                    }
+                ]
+            },
+            {
+                "type": "apply_patch_call_output",
+                "call_id": "call-apply",
+                "status": "completed",
+                "output": "patched"
+            }
+        ]))
+    );
+}
+
+#[tokio::test]
 async fn request_defaults_do_not_override_explicit_reasoning_effort() {
     let prompt = vec![v2t::PromptMessage::User {
         content: vec![v2t::UserPart::Text {

@@ -480,9 +480,36 @@ async fn stream_mcp_approval_turn1_fixture() {
     let parts = collect_parts("openai-mcp-tool-approval.1", "gpt-5-mini", tools, None).await;
 
     assert_ok_stream(&parts);
-    assert!(parts
+    let call = parts
         .iter()
-        .any(|part| matches!(part, v2t::StreamPart::ToolApprovalRequest { .. })));
+        .find_map(|part| match part {
+            v2t::StreamPart::ToolCall(call) if call.tool_name == "mcp.create_short_url" => {
+                Some(call)
+            }
+            _ => None,
+        })
+        .expect("mcp approval tool call");
+    assert!(call.provider_executed);
+    assert_eq!(
+        call.input,
+        "{\"alias\":\"\",\"description\":\"Shortened link for ai-sdk.dev\",\"max_clicks\":100,\"password\":\"\",\"url\":\"https://ai-sdk.dev/\"}"
+    );
+    let (approval_id, tool_call_id) = parts
+        .iter()
+        .find_map(|part| match part {
+            v2t::StreamPart::ToolApprovalRequest {
+                approval_id,
+                tool_call_id,
+                ..
+            } => Some((approval_id.as_str(), tool_call_id.as_str())),
+            _ => None,
+        })
+        .expect("tool approval request");
+    assert_eq!(
+        approval_id,
+        "mcpr_04a97b4fce127879006949a83ac9308195a7f7b69ea82e91fe"
+    );
+    assert_eq!(tool_call_id, call.tool_call_id);
 }
 
 #[tokio::test]
@@ -647,17 +674,43 @@ async fn stream_apply_patch_fixture() {
     assert_ok_stream(&parts);
 
     let inputs = tool_input_starts(&parts, "apply_patch");
-    assert!(!inputs.is_empty());
+    assert_eq!(inputs.len(), 1);
     assert!(inputs.iter().all(|exec| !*exec));
 
     let calls = tool_calls(&parts, "apply_patch");
-    assert!(!calls.is_empty());
+    assert_eq!(calls.len(), 1);
     assert!(calls.iter().all(|call| !call.provider_executed));
-    for call in calls {
-        let input: Value = serde_json::from_str(&call.input).expect("tool input json");
-        assert!(input.get("callId").is_some());
-        assert!(input.get("operation").is_some());
-    }
+    let expected_diff = concat!(
+        "+## Shopping Checklist\n",
+        "+\n",
+        "+- [ ] Milk\n",
+        "+- [ ] Bread\n",
+        "+- [ ] Eggs\n",
+        "+- [ ] Fresh fruit\n",
+        "+- [ ] Coffee\n"
+    );
+    let input: Value = serde_json::from_str(&calls[0].input).expect("tool input json");
+    assert_eq!(
+        input,
+        json!({
+            "callId": "call_kA46f91ZwocQyMCKyyZqRyC5",
+            "operation": {
+                "type": "create_file",
+                "path": "shopping-checklist.md",
+                "diff": expected_diff,
+            }
+        })
+    );
+    assert_eq!(
+        calls[0]
+            .provider_metadata
+            .as_ref()
+            .and_then(|meta| meta.get("openai"))
+            .and_then(|meta| meta.get("itemId")),
+        Some(&json!(
+            "apc_0372d86dfc1762fe00692741f3f3dc8190879cba489ff2fc8b"
+        ))
+    );
 }
 
 #[tokio::test]
@@ -678,8 +731,30 @@ async fn stream_apply_patch_delete_fixture() {
     assert_ok_stream(&parts);
 
     let inputs = tool_input_starts(&parts, "apply_patch");
-    assert!(!inputs.is_empty());
+    assert_eq!(inputs.len(), 1);
     assert!(inputs.iter().all(|exec| !*exec));
+
+    let calls = tool_calls(&parts, "apply_patch");
+    assert_eq!(calls.len(), 1);
+    let input: Value = serde_json::from_str(&calls[0].input).expect("tool input json");
+    assert_eq!(
+        input,
+        json!({
+            "callId": "call_delete_1",
+            "operation": {
+                "type": "delete_file",
+                "path": "obsolete.txt"
+            }
+        })
+    );
+    assert_eq!(
+        calls[0]
+            .provider_metadata
+            .as_ref()
+            .and_then(|meta| meta.get("openai"))
+            .and_then(|meta| meta.get("itemId")),
+        Some(&json!("apc_delete_001"))
+    );
 }
 
 #[tokio::test]
