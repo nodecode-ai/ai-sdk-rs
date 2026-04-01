@@ -39,11 +39,14 @@ cd ai-sdk-rs
 export OPENAI_API_KEY=sk-...
 
 # 3) run the examples
-# Text (one-shot):
+# Text (one-shot, v2 request path):
 cargo run -p generate-text
 
 # Streaming (SSE-style event stream mapped to stdout/stderr):
 cargo run -p generate-stream
+
+# Optional: reasoning summary on the same v2/OpenAI Responses path
+# cargo run -p openai-reasoning-summary
 
 # 4) Optionally try Google AI Studio (Gemini)
 # export GEMINI_API_KEY=...

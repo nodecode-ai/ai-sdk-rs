@@ -1,6 +1,7 @@
 use anyhow::Result;
-use ai_sdk_rs::core::{ChatMessage, ChatRequest, LanguageModel};
-use ai_sdk_rs::providers::openai_compatible::OpenAICompatible as OpenAI;
+use ai_sdk_rs::core::types as v2t;
+use ai_sdk_rs::core::LanguageModel;
+use ai_sdk_rs::providers::openai::OpenAIResponsesLanguageModel;
 
 // Run with:
 //   OPENAI_API_KEY=sk-... cargo run -p generate-text
@@ -18,8 +19,7 @@ use ai_sdk_rs::providers::openai_compatible::OpenAICompatible as OpenAI;
 // });
 // console.log(text);
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn build_model() -> Result<OpenAIResponsesLanguageModel> {
     let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
     let base_url = std::env::var("OPENAI_BASE_URL").ok();
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
@@ -29,19 +29,53 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let mut provider = OpenAI::new(model);
-    if let Some(b) = base_url { provider = provider.with_base_url(b); }
-    provider = provider.with_api_key(api_key);
+    let mut builder = OpenAIResponsesLanguageModel::builder(model);
+    if let Some(base_url) = base_url {
+        builder = builder.with_base_url(base_url);
+    }
 
-    let req = ChatRequest::new(
-        provider.id(),
-        vec![
-            ChatMessage::system("You are a friendly assistant!"),
-            ChatMessage::user("Why is the sky blue?"),
+    Ok(builder.with_api_key(api_key).build()?)
+}
+
+fn build_options() -> v2t::CallOptions {
+    v2t::CallOptions {
+        prompt: vec![
+            v2t::PromptMessage::System {
+                content: "You are a friendly assistant!".into(),
+                provider_options: None,
+            },
+            v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "Why is the sky blue?".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            },
         ],
-    );
+        ..Default::default()
+    }
+}
 
-    let text = provider.generate(req).await?;
+fn collect_text(content: &[v2t::Content]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            v2t::Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let model = build_model()?;
+    let response = model.do_generate(build_options()).await?;
+    let text = collect_text(&response.content);
+
+    if text.is_empty() {
+        anyhow::bail!("model returned no text content");
+    }
+
     println!("{}", text);
     Ok(())
 }
