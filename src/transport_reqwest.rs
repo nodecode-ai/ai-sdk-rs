@@ -31,9 +31,11 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::debug;
 
 #[derive(Clone)]
-pub struct ReqwestTransport {
+pub struct LegacyReqwestTransport {
     client: Client,
 }
+
+pub use crate::transport_hyper::HyperTransport as ReqwestTransport;
 
 type ReqwestWebsocketStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -43,7 +45,7 @@ struct ReqwestJsonStreamWebsocketConnection {
     closed: Arc<AtomicBool>,
 }
 
-impl ReqwestTransport {
+impl LegacyReqwestTransport {
     fn json_request_body<'a>(body: &'a Value, cfg: &TransportConfig) -> Cow<'a, Value> {
         if cfg.strip_null_fields {
             Cow::Owned(crate::core::json::without_null_fields(body))
@@ -334,7 +336,7 @@ impl JsonStreamWebsocketConnection for ReqwestJsonStreamWebsocketConnection {
     }
 }
 
-impl Default for ReqwestTransport {
+impl Default for LegacyReqwestTransport {
     fn default() -> Self {
         Self::new(&TransportConfig::default())
     }
@@ -368,7 +370,7 @@ fn request_context(
 }
 
 #[async_trait]
-impl HttpTransport for ReqwestTransport {
+impl HttpTransport for LegacyReqwestTransport {
     type StreamResponse = (TransportStream, Vec<(String, String)>);
 
     fn into_stream(resp: Self::StreamResponse) -> (TransportStream, Vec<(String, String)>) {
@@ -771,7 +773,7 @@ mod tests {
     #[test]
     fn try_new_returns_transport_error_when_client_build_fails() {
         let cfg = TransportConfig::default();
-        let err = match ReqwestTransport::try_new_with_builder(
+        let err = match LegacyReqwestTransport::try_new_with_builder(
             &cfg,
             Client::builder().user_agent("bad\nagent"),
         ) {
@@ -792,7 +794,9 @@ mod tests {
     #[test]
     fn new_with_builder_does_not_panic_when_client_build_fails() {
         let cfg = TransportConfig::default();
-        let _transport =
-            ReqwestTransport::new_with_builder(&cfg, Client::builder().user_agent("bad\nagent"));
+        let _transport = LegacyReqwestTransport::new_with_builder(
+            &cfg,
+            Client::builder().user_agent("bad\nagent"),
+        );
     }
 }

@@ -9,7 +9,8 @@ mod transport_websocket_common;
 pub mod types;
 
 pub mod transports {
-    pub use crate::transport_reqwest as reqwest;
+    pub use crate::transport_hyper as hyper;
+    pub use crate::transport_hyper as reqwest;
 }
 
 pub use crate::core as ai_sdk_core;
@@ -31,5 +32,6 @@ pub use crate::providers::openai as ai_sdk_providers_openai;
 pub use crate::providers::openai_compatible as provider_openai_compatible;
 pub use crate::providers::openai_compatible as ai_sdk_providers_openai_compatible;
 pub use crate::streaming_sse as ai_sdk_streaming_sse;
-pub use crate::transport_reqwest as reqwest_transport;
+pub use crate::transport_hyper as hyper_transport;
+pub use crate::transport_hyper as reqwest_transport;
 pub use crate::types as ai_sdk_types;

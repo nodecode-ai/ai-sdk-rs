@@ -57,6 +57,8 @@ pub struct HyperTransport {
     client: HyperClient,
 }
 
+pub use HyperTransport as ReqwestTransport;
+
 #[derive(Clone)]
 struct ProxyAwareConnector {
     http: HttpConnector,

@@ -119,7 +119,7 @@
   - websocket/common helpers are no longer entangled with reqwest-only HTTP code
 
 - [x] `HT2` Add the hyper transport side-by-side under the existing trait contract.
-  Lineage commit: `<self; backfill after landing HT2>`
+  Lineage commit: `52022d7b659f41d158b705bf56d02b93fa0488ec`
   Commit subject: `feat(transport): add hyper http owner`
   Lineage parent: `HT1`
   Scope:
@@ -131,8 +131,8 @@
   - hyper-backed behavior matches the locked trait-level parity seam
   - default aliases still point at reqwest in this slice
 
-- [ ] `HT3` Switch default aliases and generic defaults to hyper after parity proof.
-  Lineage commit: `<pending>`
+- [x] `HT3` Switch default aliases and generic defaults to hyper after parity proof.
+  Lineage commit: `<self; backfill after landing HT3>`
   Commit subject: `refactor(transport): switch default http owner to hyper`
   Lineage parent: `HT2`
   Scope:

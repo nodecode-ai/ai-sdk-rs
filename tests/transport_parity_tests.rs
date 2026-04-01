@@ -3,8 +3,8 @@ use ::ai_sdk_rs::ai_sdk_core::transport::{
     set_transport_observer, HttpTransport, MultipartForm, TransportBody, TransportConfig,
     TransportEvent, TransportObserver,
 };
-use ::ai_sdk_rs::reqwest_transport::ReqwestTransport;
 use ::ai_sdk_rs::transport_hyper::HyperTransport;
+use ::ai_sdk_rs::transport_reqwest::LegacyReqwestTransport;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use serde_json::{json, Value};
@@ -191,8 +191,8 @@ fn test_transport_config() -> TransportConfig {
     }
 }
 
-fn reqwest_transport(cfg: &TransportConfig) -> ReqwestTransport {
-    ReqwestTransport::try_new(cfg).expect("build reqwest transport")
+fn reqwest_transport(cfg: &TransportConfig) -> LegacyReqwestTransport {
+    LegacyReqwestTransport::try_new(cfg).expect("build reqwest transport")
 }
 
 fn hyper_transport(cfg: &TransportConfig) -> HyperTransport {
