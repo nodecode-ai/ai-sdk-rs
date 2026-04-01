@@ -22,7 +22,6 @@ struct OpenAIApplyPatchState {
 #[derive(Debug, Clone)]
 struct OpenAICodeInterpreterState {
     tool_call_id: String,
-    container_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -510,7 +509,6 @@ pub(super) fn build_stream_mapper_config(
                     output_index,
                     OpenAICodeInterpreterState {
                         tool_call_id: tool_call_id.to_string(),
-                        container_id: container_id.clone(),
                     },
                 );
                 state.has_tool_calls = true;

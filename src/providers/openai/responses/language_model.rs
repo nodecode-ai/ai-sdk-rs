@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -8,8 +8,7 @@ use crate::ai_sdk_core::transport::{
     HttpTransport, JsonStreamWebsocketConnection, TransportConfig,
 };
 use crate::ai_sdk_core::{
-    map_events_to_parts, EventMapperConfig, EventMapperHooks, EventMapperState, GenerateResponse,
-    LanguageModel, LanguageModelTurnSession, StreamResponse,
+    map_events_to_parts, GenerateResponse, LanguageModel, LanguageModelTurnSession, StreamResponse,
 };
 use crate::ai_sdk_streaming_sse::{PipelineBuilder, ProviderChunk, SseEvent};
 use crate::ai_sdk_types::v2 as v2t;
@@ -1613,6 +1612,8 @@ pub(super) fn normalize_object_schema(schema: &serde_json::Value) -> serde_json:
     }
 }
 
+/* Legacy in-file provider-tools copy removed.
+   Live owner: src/providers/openai/responses/provider_tools.rs
 #[allow(dead_code)]
 mod legacy_provider_tools_request_side {
     use super::*;
@@ -2133,6 +2134,7 @@ mod legacy_provider_tools_request_side {
         mapping
     }
 }
+*/
 
 fn extract_approval_request_id_to_tool_call_id(
     prompt: &[v2t::PromptMessage],
@@ -2159,6 +2161,8 @@ fn extract_approval_request_id_to_tool_call_id(
     mapping
 }
 
+/* Legacy in-file provider-tools output reconstruction copy removed.
+   Live owner: src/providers/openai/responses/provider_tools.rs
 #[allow(dead_code)]
 mod legacy_provider_tools_output_side {
     use super::legacy_provider_tools_request_side::{
@@ -2790,6 +2794,7 @@ mod legacy_provider_tools_output_side {
         })
     }
 }
+*/
 
 pub(super) fn escape_json_delta(delta: &str) -> String {
     if delta
@@ -3354,6 +3359,8 @@ impl ProviderChunk for OpenAIResponsesChunk {
     }
 }
 
+/* Legacy in-file stream-hook state removed.
+   Live owner: src/providers/openai/responses/stream_hooks.rs
 #[derive(Debug, Clone)]
 struct OpenAIApplyPatchState {
     tool_call_id: String,
@@ -3401,6 +3408,7 @@ struct OpenAIStreamExtras {
     emitted_tool_calls: HashSet<String>,
     tool_name_mapping: ToolNameMapping,
 }
+*/
 
 pub(super) fn openai_item_metadata(
     item_id: &str,
@@ -3416,6 +3424,8 @@ pub(super) fn openai_item_metadata(
     outer
 }
 
+/* Legacy in-file stream-hook assembly removed.
+   Live owner: src/providers/openai/responses/stream_hooks.rs
 fn build_stream_mapper_config(
     warnings: Vec<v2t::CallWarning>,
     tool_name_mapping: ToolNameMapping,
@@ -4251,6 +4261,7 @@ fn build_stream_mapper_config(
         hooks,
     }
 }
+*/
 
 pub(super) fn map_finish_reason(hint: Option<&str>, has_function_calls: bool) -> v2t::FinishReason {
     match hint {
