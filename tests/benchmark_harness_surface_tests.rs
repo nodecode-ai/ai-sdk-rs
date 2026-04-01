@@ -1,5 +1,11 @@
 use std::path::PathBuf;
 
+pub mod ai_sdk_rs {
+    pub use ::ai_sdk_rs::core;
+    pub use ::ai_sdk_rs::providers;
+    pub use ::ai_sdk_rs::types;
+}
+
 #[path = "../benches/support/mod.rs"]
 mod bench_support;
 
@@ -125,4 +131,45 @@ fn benchmarking_docs_call_out_the_current_scope_and_ci_policy() {
             "expected docs/benchmarking.md to contain: {expected}",
         );
     }
+}
+
+#[test]
+fn openai_fixture_tests_reuse_the_shared_benchmark_support_owner() {
+    let test_source = include_str!("../crates/providers/openai/tests/stream_fixture_tests.rs");
+
+    assert!(
+        test_source.contains("#[path = \"../../../../benches/support/mod.rs\"]"),
+        "expected stream fixture tests to import the shared benchmark support owner",
+    );
+
+    for removed in [
+        "struct FixtureTransport",
+        "struct FixtureStreamResponse",
+        "fn read_fixture_chunks(",
+        "fn test_config() -> OpenAIConfig",
+    ] {
+        assert!(
+            !test_source.contains(removed),
+            "expected stream fixture tests to stop defining {removed}",
+        );
+    }
+}
+
+#[test]
+fn benchmark_entrypoints_register_openai_scenarios_through_shared_support() {
+    let openai_bench = include_str!("../benches/openai_responses.rs");
+    let streaming_bench = include_str!("../benches/streaming_pipeline.rs");
+
+    assert!(
+        openai_bench.contains("support::openai_request_scenarios()"),
+        "expected openai_responses bench to register request scenarios through support",
+    );
+    assert!(
+        openai_bench.contains("support::openai_stream_fixtures()"),
+        "expected openai_responses bench to register stream fixtures through support",
+    );
+    assert!(
+        streaming_bench.contains("support::openai_stream_fixtures()"),
+        "expected streaming_pipeline bench to register stream fixtures through support",
+    );
 }

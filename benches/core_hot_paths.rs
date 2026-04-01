@@ -11,6 +11,12 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 use futures_util::{stream, TryStreamExt};
 use serde_json::json;
 
+pub mod ai_sdk_rs {
+    pub use ::ai_sdk_rs::core;
+    pub use ::ai_sdk_rs::providers;
+    pub use ::ai_sdk_rs::types;
+}
+
 #[path = "support/mod.rs"]
 mod support;
 

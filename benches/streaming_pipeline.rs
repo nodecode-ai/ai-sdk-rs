@@ -5,19 +5,21 @@ use ai_sdk_rs::streaming_sse::SseDecoder;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use futures_util::TryStreamExt;
 
+pub mod ai_sdk_rs {
+    pub use ::ai_sdk_rs::core;
+    pub use ::ai_sdk_rs::providers;
+    pub use ::ai_sdk_rs::streaming_sse;
+    pub use ::ai_sdk_rs::types;
+}
+
 #[path = "support/mod.rs"]
 mod support;
 
 fn bench_sse_decoder(c: &mut Criterion) {
-    let fixtures = [
-        "openai-web-search-tool.1",
-        "openai-mcp-tool-approval.1",
-        "openai-code-interpreter-tool.1",
-    ];
     let mut group = c.benchmark_group("streaming/sse_decoder");
     group.sample_size(30);
 
-    for fixture in fixtures {
+    for &fixture in support::openai_stream_fixtures() {
         let chunks = support::stream_fixture_chunks(fixture);
         group.throughput(Throughput::Bytes(
             chunks.iter().map(|chunk| chunk.len()).sum::<usize>() as u64,
@@ -41,16 +43,11 @@ fn bench_sse_decoder(c: &mut Criterion) {
 
 fn bench_streaming_end_to_end(c: &mut Criterion) {
     let runtime = support::benchmark_runtime();
-    let fixtures = [
-        "openai-web-search-tool.1",
-        "openai-mcp-tool-approval.1",
-        "openai-code-interpreter-tool.1",
-    ];
     let mut group = c.benchmark_group("streaming/end_to_end");
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(8));
 
-    for fixture in fixtures {
+    for &fixture in support::openai_stream_fixtures() {
         let model = support::openai_model_with_stream_fixture("gpt-5.1-mini", fixture);
         let options = support::stream_call_options(fixture);
         group.throughput(Throughput::Bytes(

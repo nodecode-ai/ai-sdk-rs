@@ -1,69 +1,18 @@
-use crate::ai_sdk_core::error::TransportError;
-use crate::ai_sdk_core::transport::{HttpTransport, TransportConfig};
 use crate::ai_sdk_core::LanguageModel;
-use crate::ai_sdk_providers_openai::config::OpenAIConfig;
-use crate::ai_sdk_providers_openai::responses::language_model::OpenAIResponsesLanguageModel;
 use crate::ai_sdk_types::v2 as v2t;
-use async_trait::async_trait;
-use bytes::Bytes;
-use futures_core::Stream;
-use futures_util::{stream, TryStreamExt};
+use futures_util::TryStreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Clone)]
-struct FixtureTransport {
-    chunks: Arc<Vec<Bytes>>,
+pub mod ai_sdk_rs {
+    pub use crate::core;
+    pub use crate::providers;
+    pub use crate::types;
 }
 
-struct FixtureStreamResponse {
-    chunks: Arc<Vec<Bytes>>,
-}
-
-impl FixtureTransport {
-    fn from_fixture(name: &str) -> Self {
-        Self {
-            chunks: Arc::new(read_fixture_chunks(name)),
-        }
-    }
-}
-
-fn read_fixture_chunks(name: &str) -> Vec<Bytes> {
-    let fixture_name = format!("{name}.chunks.txt");
-    let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join(&fixture_name),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("crates")
-            .join("providers")
-            .join("openai")
-            .join("tests")
-            .join("fixtures")
-            .join(&fixture_name),
-    ];
-    let path = candidates
-        .iter()
-        .find(|p| p.exists())
-        .cloned()
-        .unwrap_or_else(|| candidates[0].clone());
-    let raw = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("missing fixture {path:?}"));
-    let mut chunks = Vec::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        chunks.push(Bytes::from(format!("data: {trimmed}\n\n")));
-    }
-    chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
-    chunks
-}
+#[path = "../../../../benches/support/mod.rs"]
+mod benchmark_support;
 
 fn openai_error_fixture_message() -> String {
     serde_json::from_str::<Value>(include_str!("fixtures/openai-error.1.json"))
@@ -73,58 +22,6 @@ fn openai_error_fixture_message() -> String {
         .and_then(Value::as_str)
         .expect("openai error fixture message")
         .to_owned()
-}
-
-#[async_trait]
-impl HttpTransport for FixtureTransport {
-    type StreamResponse = FixtureStreamResponse;
-
-    fn into_stream(
-        resp: Self::StreamResponse,
-    ) -> (
-        Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
-        Vec<(String, String)>,
-    ) {
-        let chunks = (*resp.chunks).clone();
-        (Box::pin(stream::iter(chunks.into_iter().map(Ok))), vec![])
-    }
-
-    async fn post_json_stream(
-        &self,
-        _url: &str,
-        _headers: &[(String, String)],
-        _body: &Value,
-        _cfg: &TransportConfig,
-    ) -> Result<Self::StreamResponse, TransportError> {
-        Ok(FixtureStreamResponse {
-            chunks: self.chunks.clone(),
-        })
-    }
-
-    async fn post_json(
-        &self,
-        _url: &str,
-        _headers: &[(String, String)],
-        _body: &Value,
-        _cfg: &TransportConfig,
-    ) -> Result<(Value, Vec<(String, String)>), TransportError> {
-        Err(TransportError::Other("post_json unused".into()))
-    }
-}
-
-fn test_config() -> OpenAIConfig {
-    OpenAIConfig {
-        provider_name: "openai.responses".into(),
-        provider_scope_name: "openai".into(),
-        base_url: "https://api.openai.com/v1".into(),
-        endpoint_path: "/responses".into(),
-        headers: vec![],
-        query_params: vec![],
-        supported_urls: HashMap::new(),
-        file_id_prefixes: Some(vec!["file-".into()]),
-        default_options: None,
-        request_defaults: None,
-    }
 }
 
 fn provider_tool(id: &str, name: &str, args: Value) -> v2t::Tool {
@@ -152,13 +49,7 @@ async fn collect_parts_with_raw(
     provider_options: Option<v2t::ProviderOptions>,
     include_raw_chunks: bool,
 ) -> Vec<v2t::StreamPart> {
-    let transport = FixtureTransport::from_fixture(fixture);
-    let model = OpenAIResponsesLanguageModel::new(
-        model_id,
-        test_config(),
-        transport,
-        TransportConfig::default(),
-    );
+    let model = benchmark_support::openai_model_with_stream_fixture(model_id, fixture);
     let opts = v2t::CallOptions {
         prompt: vec![v2t::PromptMessage::User {
             content: vec![v2t::UserPart::Text {

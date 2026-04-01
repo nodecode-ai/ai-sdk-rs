@@ -23,8 +23,9 @@
 ## Current Shape
 
 - The current workspace benchmark scaffold lives under `benches/` with three Criterion binaries: `openai_responses`, `streaming_pipeline`, and `core_hot_paths`.
-- `benches/support/mod.rs` currently owns runtime setup, fixture loading, OpenAI fixture transport, and OpenAI-specific call-option builders, so the shared support layer is already carrying both generic benchmark plumbing and provider-specific construction.
-- `crates/providers/openai/tests/stream_fixture_tests.rs` duplicates `FixtureTransport` and fixture chunk loading instead of reusing a single replay-support owner.
+- The shared offline harness owner now lives under `benches/support/**`, with `fixture_replay.rs` owning replay transport and fixture loading while `openai_responses.rs` owns the current OpenAI-only scenario registrations and model/config wiring.
+- `benches/openai_responses.rs` and `benches/streaming_pipeline.rs` now register OpenAI scenarios through the shared support owner instead of carrying inline fixture inventories.
+- `crates/providers/openai/tests/stream_fixture_tests.rs` now reuses the shared benchmark support owner instead of copying its own replay transport and fixture loader.
 - `docs/benchmarking.md` documents an offline Criterion scaffold and compile-only CI, but not provider-family coverage rules, scale/adversarial scenario expectations, or a local regression-comparison workflow.
 - Only OpenAI fixture files are present under `crates/providers/openai/tests/fixtures/**`, so the suite has no checked-in benchmark corpus for Anthropic, Google, Google Vertex, Amazon Bedrock, Azure, Gateway, or OpenAI-compatible provider families.
 
@@ -104,7 +105,7 @@
 ## Atomic Slices
 
 - [x] `BH0` Lock the current benchmark-harness seam with focused replay and inventory proofs.
-  Lineage commit: `<self; backfill after landing BH0>`
+  Lineage commit: `0bb6269dcadc08986886e7605080952cf2afc5fa`
   Commit subject: `test(bench): lock offline harness seam`
   Lineage parent: `HEAD`
   Scope:
@@ -116,8 +117,8 @@
   - the suite's current provider-family gaps are explicit in checked-in evidence
   - no benchmark-harness ownership refactor lands in this slice
 
-- [ ] `BH1` Extract one shared offline harness owner and remove duplicated replay support.
-  Lineage commit: `<pending>`
+- [x] `BH1` Extract one shared offline harness owner and remove duplicated replay support.
+  Lineage commit: `<self; backfill after landing BH1>`
   Commit subject: `refactor(bench): centralize offline harness support`
   Lineage parent: `BH0`
   Scope:
