@@ -43,6 +43,13 @@ pub struct AnthropicMessagesLanguageModel<
     cfg: AnthropicMessagesConfig<T>,
 }
 
+struct BuiltAnthropicRequest {
+    body: JsonValue,
+    warnings: Vec<v2t::CallWarning>,
+    betas: HashSet<String>,
+    uses_json_response_tool: bool,
+}
+
 impl<T: HttpTransport> AnthropicMessagesLanguageModel<T> {
     pub fn new(model_id: AnthropicMessagesModelId, cfg: AnthropicMessagesConfig<T>) -> Self {
         Self { model_id, cfg }
@@ -57,16 +64,7 @@ impl<T: HttpTransport> AnthropicMessagesLanguageModel<T> {
     fn build_request_body(
         &self,
         options: &v2t::CallOptions,
-    ) -> Result<
-        (
-            JsonValue,
-            Vec<v2t::CallWarning>,
-            Option<AnthropicProviderOptions>,
-            std::collections::HashSet<String>,
-            bool,
-        ),
-        SdkError,
-    > {
+    ) -> Result<BuiltAnthropicRequest, SdkError> {
         let mut warnings: Vec<v2t::CallWarning> = vec![];
 
         // Unsupported knobs parity
@@ -1276,13 +1274,12 @@ impl<T: HttpTransport> AnthropicMessagesLanguageModel<T> {
             body.get("thinking")
         );
 
-        Ok((
+        Ok(BuiltAnthropicRequest {
             body,
             warnings,
-            provider_opts,
             betas,
-            json_response_tool.is_some(),
-        ))
+            uses_json_response_tool: json_response_tool.is_some(),
+        })
     }
 }
 
@@ -1335,7 +1332,12 @@ impl<T: HttpTransport + Send + Sync> LanguageModel for AnthropicMessagesLanguage
             &self.cfg.provider_scope_name,
             self.cfg.default_options.as_ref(),
         );
-        let (body, warnings, _opts, betas, uses_json_tool) = self.build_request_body(&options)?;
+        let BuiltAnthropicRequest {
+            body,
+            warnings,
+            betas,
+            uses_json_response_tool: uses_json_tool,
+        } = self.build_request_body(&options)?;
         let url = self.build_request_url(true);
         let mut headers: Vec<(String, String)> = self
             .cfg
@@ -1569,114 +1571,8 @@ impl AnthropicChunk {
                         push_anthropic_usage(&mut out, usage);
                     }
                 }
-                "content_block_delta" => {
-                    if v.get("delta")
-                        .and_then(|d| d.get("type").and_then(|s| s.as_str()))
-                        == Some("text_delta")
-                    {
-                        if let Some(txt) = v
-                            .get("delta")
-                            .and_then(|d| d.get("text").and_then(|s| s.as_str()))
-                        {
-                            out.push(ProviderEvent::TextDelta {
-                                delta: txt.to_string(),
-                            });
-                        }
-                    }
-                    if v.get("delta")
-                        .and_then(|d| d.get("type").and_then(|s| s.as_str()))
-                        == Some("thinking_delta")
-                    {
-                        if let Some(thinking) = v
-                            .get("delta")
-                            .and_then(|d| d.get("thinking").and_then(|s| s.as_str()))
-                        {
-                            if !thinking.is_empty() {
-                                out.push(ProviderEvent::ReasoningDelta {
-                                    delta: thinking.to_string(),
-                                });
-                            }
-                        }
-                    }
-                    if v.get("delta")
-                        .and_then(|d| d.get("type").and_then(|s| s.as_str()))
-                        == Some("signature_delta")
-                    {
-                        if let Some(sig) = v
-                            .get("delta")
-                            .and_then(|d| d.get("signature").and_then(|s| s.as_str()))
-                        {
-                            out.push(ProviderEvent::Data {
-                                key: "reasoning_signature".to_string(),
-                                value: json!({"signature": sig}),
-                            });
-                        }
-                    }
-                    if v.get("delta")
-                        .and_then(|d| d.get("type").and_then(|s| s.as_str()))
-                        == Some("input_json_delta")
-                    {
-                        let idx = v.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
-                        let arg = v
-                            .get("delta")
-                            .and_then(|d| {
-                                d.get("partial_json")
-                                    .or_else(|| d.get("json"))
-                                    .or_else(|| d.get("delta"))
-                            })
-                            .and_then(|s| s.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        if let Some(idx) = idx {
-                            if let Some(state) = self.tool_calls.get(&idx) {
-                                out.push(ProviderEvent::ToolCallDelta {
-                                    id: state.id.clone(),
-                                    args_json: arg,
-                                });
-                            } else {
-                                self.pending_deltas.entry(idx).or_default().push(arg);
-                            }
-                        }
-                    }
-                }
-                "content_block_start" => {
-                    let idx = v.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
-                    if let Some(cb) = v.get("content_block") {
-                        match cb.get("type").and_then(|s| s.as_str()) {
-                            Some("tool_use") => {
-                                let id =
-                                    cb.get("id").and_then(|s| s.as_str()).map(|s| s.to_string());
-                                let name = cb
-                                    .get("name")
-                                    .and_then(|s| s.as_str())
-                                    .map(|s| s.to_string());
-                                if let (Some(idx), Some(id), Some(name)) = (idx, id, name) {
-                                    self.tool_calls
-                                        .insert(idx, AnthropicToolCallState { id: id.clone() });
-                                    out.push(ProviderEvent::ToolCallStart {
-                                        id: id.clone(),
-                                        name,
-                                    });
-                                    if let Some(pending) = self.pending_deltas.remove(&idx) {
-                                        for delta in pending {
-                                            out.push(ProviderEvent::ToolCallDelta {
-                                                id: id.clone(),
-                                                args_json: delta,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            Some("thinking") | Some("redacted_thinking") => {
-                                let rid = idx
-                                    .map(|i| i.to_string())
-                                    .unwrap_or_else(|| "0".to_string());
-                                out.push(ProviderEvent::ReasoningStart { id: rid });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                "content_block_delta" => self.push_content_block_delta(v, &mut out),
+                "content_block_start" => self.push_content_block_start(v, &mut out),
                 "message_stop" => {
                     out.extend(self.drain_tool_calls());
                     out.push(ProviderEvent::Done);
@@ -1685,6 +1581,119 @@ impl AnthropicChunk {
             }
         }
         out
+    }
+
+    fn push_content_block_delta(&mut self, v: &JsonValue, out: &mut Vec<ProviderEvent>) {
+        let Some(delta) = v.get("delta") else {
+            return;
+        };
+
+        match delta.get("type").and_then(|s| s.as_str()) {
+            Some("text_delta") => {
+                if let Some(text) = delta.get("text").and_then(|s| s.as_str()) {
+                    out.push(ProviderEvent::TextDelta {
+                        delta: text.to_string(),
+                    });
+                }
+            }
+            Some("thinking_delta") => {
+                if let Some(thinking) = delta.get("thinking").and_then(|s| s.as_str()) {
+                    if !thinking.is_empty() {
+                        out.push(ProviderEvent::ReasoningDelta {
+                            delta: thinking.to_string(),
+                        });
+                    }
+                }
+            }
+            Some("signature_delta") => {
+                if let Some(signature) = delta.get("signature").and_then(|s| s.as_str()) {
+                    out.push(ProviderEvent::Data {
+                        key: "reasoning_signature".to_string(),
+                        value: json!({"signature": signature}),
+                    });
+                }
+            }
+            Some("input_json_delta") => self.push_tool_call_delta(v, delta, out),
+            _ => {}
+        }
+    }
+
+    fn push_tool_call_delta(
+        &mut self,
+        v: &JsonValue,
+        delta: &JsonValue,
+        out: &mut Vec<ProviderEvent>,
+    ) {
+        let idx = v.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
+        let arg = delta
+            .get("partial_json")
+            .or_else(|| delta.get("json"))
+            .or_else(|| delta.get("delta"))
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        if let Some(idx) = idx {
+            if let Some(state) = self.tool_calls.get(&idx) {
+                out.push(ProviderEvent::ToolCallDelta {
+                    id: state.id.clone(),
+                    args_json: arg,
+                });
+            } else {
+                self.pending_deltas.entry(idx).or_default().push(arg);
+            }
+        }
+    }
+
+    fn push_content_block_start(&mut self, v: &JsonValue, out: &mut Vec<ProviderEvent>) {
+        let idx = v.get("index").and_then(|i| i.as_u64()).map(|i| i as usize);
+        let Some(content_block) = v.get("content_block") else {
+            return;
+        };
+
+        match content_block.get("type").and_then(|s| s.as_str()) {
+            Some("tool_use") => self.push_tool_call_start(idx, content_block, out),
+            Some("thinking") | Some("redacted_thinking") => {
+                let id = idx
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "0".to_string());
+                out.push(ProviderEvent::ReasoningStart { id });
+            }
+            _ => {}
+        }
+    }
+
+    fn push_tool_call_start(
+        &mut self,
+        idx: Option<usize>,
+        content_block: &JsonValue,
+        out: &mut Vec<ProviderEvent>,
+    ) {
+        let id = content_block
+            .get("id")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        let name = content_block
+            .get("name")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+
+        if let (Some(idx), Some(id), Some(name)) = (idx, id, name) {
+            self.tool_calls
+                .insert(idx, AnthropicToolCallState { id: id.clone() });
+            out.push(ProviderEvent::ToolCallStart {
+                id: id.clone(),
+                name,
+            });
+            if let Some(pending) = self.pending_deltas.remove(&idx) {
+                for delta in pending {
+                    out.push(ProviderEvent::ToolCallDelta {
+                        id: id.clone(),
+                        args_json: delta,
+                    });
+                }
+            }
+        }
     }
 }
 
