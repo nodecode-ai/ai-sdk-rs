@@ -62,3 +62,18 @@ uuid = { version = "1", default-features = false, features = ["std", "v4", "serd
 default = ["reqwest", "stream"]
 reqwest = []
 stream = []
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
+
+[[bench]]
+name = "openai_responses"
+harness = false
+
+[[bench]]
+name = "streaming_pipeline"
+harness = false
+
+[[bench]]
+name = "core_hot_paths"
+harness = false

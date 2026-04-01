@@ -22,5 +22,8 @@ jobs:
       - name: Cargo test
         run: cargo test --workspace
 
+      - name: Cargo bench (compile only)
+        run: cargo bench --workspace --no-run
+
       - name: Cargo package (ai-sdk-rs)
         run: cargo package -p ai-sdk-rs --allow-dirty
