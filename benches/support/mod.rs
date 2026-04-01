@@ -5,12 +5,18 @@ pub use super::ai_sdk_rs;
 
 mod fixture_replay;
 mod openai_responses;
+mod provider_matrix;
 
 pub use fixture_replay::{FixtureStreamResponse, FixtureTransport};
 pub use openai_responses::{
     minimal_text_response, openai_model_with_json_response, openai_model_with_stream_fixture,
     openai_request_scenarios, openai_responses_config, openai_stream_fixtures, simple_call_options,
     stream_call_options, stream_fixture_chunks, stream_fixture_size_bytes, tool_heavy_call_options,
+};
+pub use provider_matrix::{
+    provider_matrix_families, run_anthropic_stream, run_azure_generate, run_bedrock_generate,
+    run_gateway_generate, run_google_generate, run_google_vertex_generate,
+    run_openai_compatible_stream, run_openai_generate,
 };
 
 pub fn benchmark_runtime() -> tokio::runtime::Runtime {

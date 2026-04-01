@@ -77,3 +77,7 @@ harness = false
 [[bench]]
 name = "core_hot_paths"
 harness = false
+
+[[bench]]
+name = "provider_matrix"
+harness = false

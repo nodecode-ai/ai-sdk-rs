@@ -19,11 +19,12 @@
 - `openai_responses`: request translation plus end-to-end `do_stream` on real captured chunks.
 - `streaming_pipeline`: SSE decoder and streaming replay benchmarks.
 - `core_hot_paths`: provider-agnostic utility and normalization benchmarks.
+- `provider_matrix`: one shared-harness request or streaming scenario for OpenAI, Azure, Anthropic, Google, Google Vertex, Bedrock, Gateway, and OpenAI-compatible families.
 
 ## Current limits
 
-- Real captured benchmark fixtures currently exist only for the OpenAI Responses path under `crates/providers/openai/tests/fixtures/`.
-- No Anthropic, Google, Google Vertex, Amazon Bedrock, Azure, Gateway, or OpenAI-compatible benchmark fixtures are checked in yet.
+- The provider matrix now covers all supported provider families, but only the OpenAI path currently uses captured production fixture files under `crates/providers/openai/tests/fixtures/`.
+- Anthropic, Gateway, and OpenAI-compatible matrix scenarios still rely on checked-in representative wire-shape fixtures rather than broader captured corpora, and several non-OpenAI families still benchmark minimal synthetic responses instead of captured production transcripts.
 - CI only proves that the current offline scaffold compiles with `cargo bench --workspace --no-run`; local report inspection is still the only regression workflow.
 
 ## Commands
@@ -33,6 +34,7 @@ cargo bench
 cargo bench --bench openai_responses
 cargo bench --bench streaming_pipeline
 cargo bench --bench core_hot_paths
+cargo bench --bench provider_matrix
 ```
 
 Criterion reports are written under `target/criterion/`.

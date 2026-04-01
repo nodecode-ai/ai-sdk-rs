@@ -33,35 +33,6 @@ fn non_empty_fixture_lines(fixture_name: &str) -> Vec<String> {
         .collect()
 }
 
-fn providers_with_checked_in_chunk_fixtures() -> Vec<String> {
-    let providers_dir = repo_root().join("crates").join("providers");
-    let mut owners = std::fs::read_dir(providers_dir)
-        .expect("providers directory")
-        .filter_map(|entry| {
-            let entry = entry.expect("provider entry");
-            let fixture_dir = entry.path().join("tests").join("fixtures");
-            if !fixture_dir.is_dir() {
-                return None;
-            }
-
-            let has_chunk_fixture = std::fs::read_dir(&fixture_dir)
-                .expect("fixture directory")
-                .filter_map(Result::ok)
-                .any(|fixture| {
-                    fixture.file_type().map(|ty| ty.is_file()).unwrap_or(false)
-                        && fixture
-                            .file_name()
-                            .to_string_lossy()
-                            .ends_with(".chunks.txt")
-                });
-
-            has_chunk_fixture.then(|| entry.file_name().to_string_lossy().into_owned())
-        })
-        .collect::<Vec<_>>();
-    owners.sort();
-    owners
-}
-
 #[test]
 fn replay_support_wraps_fixture_lines_as_sse_events_and_appends_done() {
     let fixture_name = "openai-web-search-tool.1";
@@ -96,11 +67,16 @@ fn cargo_manifest_pins_the_current_offline_bench_inventory() {
 
     assert_eq!(
         manifest.matches("[[bench]]").count(),
-        3,
-        "BH0 locks the current three-binary benchmark scaffold before refactors",
+        4,
+        "BH2 expands the benchmark inventory with one provider-matrix target",
     );
 
-    for bench_name in ["openai_responses", "streaming_pipeline", "core_hot_paths"] {
+    for bench_name in [
+        "openai_responses",
+        "streaming_pipeline",
+        "core_hot_paths",
+        "provider_matrix",
+    ] {
         assert!(
             manifest.contains(&format!("name = \"{bench_name}\"")),
             "expected Cargo.toml to keep the current benchmark target {bench_name}",
@@ -109,11 +85,20 @@ fn cargo_manifest_pins_the_current_offline_bench_inventory() {
 }
 
 #[test]
-fn checked_in_stream_fixture_inventory_is_currently_openai_only() {
+fn provider_matrix_covers_every_supported_provider_family() {
     assert_eq!(
-        providers_with_checked_in_chunk_fixtures(),
-        vec!["openai".to_string()],
-        "BH0 should make the current single-provider fixture gap explicit before expanding coverage",
+        bench_support::provider_matrix_families(),
+        &[
+            "openai",
+            "azure",
+            "anthropic",
+            "google",
+            "google-vertex",
+            "bedrock",
+            "gateway",
+            "openai-compatible",
+        ],
+        "BH2 should register one shared-harness scenario for every supported provider family",
     );
 }
 
@@ -122,8 +107,8 @@ fn benchmarking_docs_call_out_the_current_scope_and_ci_policy() {
     let docs = include_str!("../docs/benchmarking.md");
 
     for expected in [
-        "Real captured benchmark fixtures currently exist only for the OpenAI Responses path",
-        "No Anthropic, Google, Google Vertex, Amazon Bedrock, Azure, Gateway, or OpenAI-compatible benchmark fixtures are checked in yet.",
+        "The provider matrix now covers all supported provider families",
+        "Anthropic, Gateway, and OpenAI-compatible matrix scenarios still rely on checked-in representative wire-shape fixtures",
         "CI only proves that the current offline scaffold compiles with `cargo bench --workspace --no-run`",
     ] {
         assert!(
@@ -171,5 +156,15 @@ fn benchmark_entrypoints_register_openai_scenarios_through_shared_support() {
     assert!(
         streaming_bench.contains("support::openai_stream_fixtures()"),
         "expected streaming_pipeline bench to register stream fixtures through support",
+    );
+
+    let provider_matrix_bench = include_str!("../benches/provider_matrix.rs");
+    assert!(
+        provider_matrix_bench.contains("support::run_openai_generate"),
+        "expected provider_matrix bench to execute shared support adapters",
+    );
+    assert!(
+        provider_matrix_bench.contains("support::run_google_vertex_generate"),
+        "expected provider_matrix bench to execute shared google vertex adapters",
     );
 }

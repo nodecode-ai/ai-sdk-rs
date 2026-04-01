@@ -22,12 +22,12 @@
 
 ## Current Shape
 
-- The current workspace benchmark scaffold lives under `benches/` with three Criterion binaries: `openai_responses`, `streaming_pipeline`, and `core_hot_paths`.
+- The current workspace benchmark scaffold lives under `benches/` with four Criterion binaries: `openai_responses`, `streaming_pipeline`, `core_hot_paths`, and `provider_matrix`.
 - The shared offline harness owner now lives under `benches/support/**`, with `fixture_replay.rs` owning replay transport and fixture loading while `openai_responses.rs` owns the current OpenAI-only scenario registrations and model/config wiring.
 - `benches/openai_responses.rs` and `benches/streaming_pipeline.rs` now register OpenAI scenarios through the shared support owner instead of carrying inline fixture inventories.
 - `crates/providers/openai/tests/stream_fixture_tests.rs` now reuses the shared benchmark support owner instead of copying its own replay transport and fixture loader.
-- `docs/benchmarking.md` documents an offline Criterion scaffold and compile-only CI, but not provider-family coverage rules, scale/adversarial scenario expectations, or a local regression-comparison workflow.
-- Only OpenAI fixture files are present under `crates/providers/openai/tests/fixtures/**`, so the suite has no checked-in benchmark corpus for Anthropic, Google, Google Vertex, Amazon Bedrock, Azure, Gateway, or OpenAI-compatible provider families.
+- The scaffold now has a fourth Criterion binary, `provider_matrix`, which exercises one shared-harness request or streaming path for OpenAI, Azure, Anthropic, Google, Google Vertex, Bedrock, Gateway, and OpenAI-compatible families.
+- `docs/benchmarking.md` now documents the provider matrix alongside the remaining limits: only OpenAI currently uses captured production fixture files, while several non-OpenAI families still rely on representative synthetic or test-derived fixtures.
 
 ## Findings Being Addressed
 
@@ -118,7 +118,7 @@
   - no benchmark-harness ownership refactor lands in this slice
 
 - [x] `BH1` Extract one shared offline harness owner and remove duplicated replay support.
-  Lineage commit: `<self; backfill after landing BH1>`
+  Lineage commit: `501c63136bd08e271191436fa9fc1d98f390a687`
   Commit subject: `refactor(bench): centralize offline harness support`
   Lineage parent: `BH0`
   Scope:
@@ -134,8 +134,8 @@
   - OpenAI fixture tests stop copying replay support that now belongs to the shared harness owner
   - bench entrypoints are thinner and no longer mix generic support with provider-specific wiring
 
-- [ ] `BH2` Add one provider-family scenario matrix on the shared harness.
-  Lineage commit: `<pending>`
+- [x] `BH2` Add one provider-family scenario matrix on the shared harness.
+  Lineage commit: `<self; backfill after landing BH2>`
   Commit subject: `bench(providers): add shared harness provider matrix`
   Lineage parent: `BH1`
   Scope:
