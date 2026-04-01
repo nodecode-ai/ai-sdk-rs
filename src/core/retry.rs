@@ -92,30 +92,6 @@ pub trait Retryable {
     }
 }
 
-// Optional implementations for common error types when feature is enabled
-#[cfg(feature = "reqwest")]
-impl Retryable for reqwest::Error {
-    fn is_retryable(&self) -> bool {
-        self.is_timeout()
-            || self.is_connect()
-            || self
-                .status()
-                .is_none_or(|s| s.is_server_error() || s.as_u16() == 429)
-    }
-
-    fn retry_after_ms(&self) -> Option<u64> {
-        // Check for rate limit status
-        if let Some(status) = self.status() {
-            if status.as_u16() == 429 {
-                // Try to extract retry-after from error details if available
-                // For now, return None as reqwest doesn't expose headers from errors
-                return None;
-            }
-        }
-        None
-    }
-}
-
 impl Retryable for std::io::Error {
     fn is_retryable(&self) -> bool {
         use std::io::ErrorKind::*;

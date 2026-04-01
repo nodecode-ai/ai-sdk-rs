@@ -4,7 +4,6 @@ use ::ai_sdk_rs::ai_sdk_core::transport::{
     TransportEvent, TransportObserver,
 };
 use ::ai_sdk_rs::transport_hyper::HyperTransport;
-use ::ai_sdk_rs::transport_reqwest::LegacyReqwestTransport;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use serde_json::{json, Value};
@@ -189,10 +188,6 @@ fn test_transport_config() -> TransportConfig {
         idle_read_timeout: Duration::from_secs(2),
         strip_null_fields: true,
     }
-}
-
-fn reqwest_transport(cfg: &TransportConfig) -> LegacyReqwestTransport {
-    LegacyReqwestTransport::try_new(cfg).expect("build reqwest transport")
 }
 
 fn hyper_transport(cfg: &TransportConfig) -> HyperTransport {
@@ -660,46 +655,6 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn reqwest_transport_locks_post_json_stream_contract() {
-    let _guard = test_lock();
-    let cfg = test_transport_config();
-    let transport = reqwest_transport(&cfg);
-    assert_post_json_stream_contract(&transport, &cfg).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn reqwest_transport_locks_post_json_contract() {
-    let _guard = test_lock();
-    let cfg = test_transport_config();
-    let transport = reqwest_transport(&cfg);
-    assert_post_json_contract(&transport, &cfg).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn reqwest_transport_preserves_retry_after_contract() {
-    let _guard = test_lock();
-    let cfg = test_transport_config();
-    let transport = reqwest_transport(&cfg);
-    assert_retry_after_contract(&transport, &cfg).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn reqwest_transport_locks_multipart_contract() {
-    let _guard = test_lock();
-    let cfg = test_transport_config();
-    let transport = reqwest_transport(&cfg);
-    assert_post_multipart_contract(&transport, &cfg).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn reqwest_transport_locks_get_bytes_contract() {
-    let _guard = test_lock();
-    let cfg = test_transport_config();
-    let transport = reqwest_transport(&cfg);
-    assert_get_bytes_contract(&transport, &cfg).await;
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -132,7 +132,7 @@
   - default aliases still point at reqwest in this slice
 
 - [x] `HT3` Switch default aliases and generic defaults to hyper after parity proof.
-  Lineage commit: `<self; backfill after landing HT3>`
+  Lineage commit: `44d721cc3a16184d5c42e79e80f293d751ee9190`
   Commit subject: `refactor(transport): switch default http owner to hyper`
   Lineage parent: `HT2`
   Scope:
@@ -144,8 +144,8 @@
   - reqwest remains side-by-side only as a temporary fallback owner in this slice
   - all provider/model default generic surfaces compile and test against the new default owner
 
-- [ ] `HT4` Remove reqwest last and refresh final validation evidence.
-  Lineage commit: `<pending>`
+- [x] `HT4` Remove reqwest last and refresh final validation evidence.
+  Lineage commit: `<self; backfill after landing HT4>`
   Commit subject: `refactor(transport): remove reqwest owner`
   Lineage parent: `HT3`
   Scope:
