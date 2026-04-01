@@ -4,6 +4,7 @@ use ::ai_sdk_rs::ai_sdk_core::transport::{
     TransportEvent, TransportObserver,
 };
 use ::ai_sdk_rs::reqwest_transport::ReqwestTransport;
+use ::ai_sdk_rs::transport_hyper::HyperTransport;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use serde_json::{json, Value};
@@ -192,6 +193,10 @@ fn test_transport_config() -> TransportConfig {
 
 fn reqwest_transport(cfg: &TransportConfig) -> ReqwestTransport {
     ReqwestTransport::try_new(cfg).expect("build reqwest transport")
+}
+
+fn hyper_transport(cfg: &TransportConfig) -> HyperTransport {
+    HyperTransport::try_new(cfg).expect("build hyper transport")
 }
 
 async fn assert_post_json_stream_contract<T: HttpTransport>(transport: &T, cfg: &TransportConfig) {
@@ -694,5 +699,45 @@ async fn reqwest_transport_locks_get_bytes_contract() {
     let _guard = test_lock();
     let cfg = test_transport_config();
     let transport = reqwest_transport(&cfg);
+    assert_get_bytes_contract(&transport, &cfg).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hyper_transport_locks_post_json_stream_contract() {
+    let _guard = test_lock();
+    let cfg = test_transport_config();
+    let transport = hyper_transport(&cfg);
+    assert_post_json_stream_contract(&transport, &cfg).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hyper_transport_locks_post_json_contract() {
+    let _guard = test_lock();
+    let cfg = test_transport_config();
+    let transport = hyper_transport(&cfg);
+    assert_post_json_contract(&transport, &cfg).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hyper_transport_preserves_retry_after_contract() {
+    let _guard = test_lock();
+    let cfg = test_transport_config();
+    let transport = hyper_transport(&cfg);
+    assert_retry_after_contract(&transport, &cfg).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hyper_transport_locks_multipart_contract() {
+    let _guard = test_lock();
+    let cfg = test_transport_config();
+    let transport = hyper_transport(&cfg);
+    assert_post_multipart_contract(&transport, &cfg).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hyper_transport_locks_get_bytes_contract() {
+    let _guard = test_lock();
+    let cfg = test_transport_config();
+    let transport = hyper_transport(&cfg);
     assert_get_bytes_contract(&transport, &cfg).await;
 }

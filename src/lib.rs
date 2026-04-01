@@ -3,6 +3,7 @@ pub mod provider;
 pub mod providers;
 pub mod streaming_sse;
 mod transport_http_common;
+pub mod transport_hyper;
 pub mod transport_reqwest;
 mod transport_websocket_common;
 pub mod types;

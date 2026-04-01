@@ -106,7 +106,7 @@
   - no production transport-owner change lands in this slice
 
 - [x] `HT1` Extract shared HTTP and websocket/common helpers without changing the owner.
-  Lineage commit: `<self; backfill after landing HT1>`
+  Lineage commit: `b070ad12035430bceb57c9052529c91eb5260ffb`
   Commit subject: `refactor(transport): extract shared helpers`
   Lineage parent: `HT0`
   Scope:
@@ -118,8 +118,8 @@
   - helper extraction does not change transport behavior
   - websocket/common helpers are no longer entangled with reqwest-only HTTP code
 
-- [ ] `HT2` Add the hyper transport side-by-side under the existing trait contract.
-  Lineage commit: `<pending>`
+- [x] `HT2` Add the hyper transport side-by-side under the existing trait contract.
+  Lineage commit: `<self; backfill after landing HT2>`
   Commit subject: `feat(transport): add hyper http owner`
   Lineage parent: `HT1`
   Scope:
