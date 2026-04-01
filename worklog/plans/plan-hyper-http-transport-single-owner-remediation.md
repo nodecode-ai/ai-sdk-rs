@@ -95,7 +95,7 @@
 ## Atomic Slices
 
 - [x] `HT0` Lock the transport parity seam with focused tests.
-  Lineage commit: `<self; backfill after landing HT0>`
+  Lineage commit: `67df66cb868c7021f5bf94291c60d3973babf374`
   Commit subject: `test(transport): lock http parity seam`
   Lineage parent: `HEAD`
   Scope:
@@ -105,8 +105,8 @@
   - tests pin the pre-refactor transport contract explicitly
   - no production transport-owner change lands in this slice
 
-- [ ] `HT1` Extract shared HTTP and websocket/common helpers without changing the owner.
-  Lineage commit: `<pending>`
+- [x] `HT1` Extract shared HTTP and websocket/common helpers without changing the owner.
+  Lineage commit: `<self; backfill after landing HT1>`
   Commit subject: `refactor(transport): extract shared helpers`
   Lineage parent: `HT0`
   Scope:
