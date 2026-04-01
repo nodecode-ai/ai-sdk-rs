@@ -8,8 +8,7 @@ use futures_util::StreamExt;
 //   OPENAI_API_KEY=sk-... OPENAI_MODEL=<reasoning-model> cargo run -p openai-reasoning-summary
 // Notes:
 // - Choose a reasoning-capable OPENAI_MODEL (e.g., o3, o4-mini, gpt-5 variants).
-// - This example requests a reasoning summary via provider_overrides built
-//   using the typed OpenAIOverridesBuilder.
+// - This example requests a reasoning summary via `provider_options["openai"]`.
 
 #[tokio::main]
 async fn main() -> Result<()> {

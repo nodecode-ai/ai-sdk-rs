@@ -2,7 +2,8 @@ use serde_json::{json, Map, Value};
 
 /// Builder for OpenAI Responses API provider overrides.
 ///
-/// Produces a JSON object intended for `metadata.provider_overrides` in `ChatRequest`.
+/// Produces the per-provider JSON object to place under
+/// `CallOptions::provider_options["openai"]`.
 /// Only sets fields you opt into; does shallow merging on the provider side.
 #[derive(Debug, Default, Clone)]
 pub struct OpenAIOverridesBuilder {
@@ -139,7 +140,7 @@ impl OpenAIOverridesBuilder {
         self
     }
 
-    /// Build the overrides object to place under `metadata.provider_overrides`.
+    /// Build the overrides object to place under `provider_options["openai"]`.
     pub fn build(self) -> Value {
         Value::Object(self.obj)
     }

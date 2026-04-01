@@ -1,7 +1,7 @@
-//! Unified type definitions for AI SDK chat protocols
+//! Unified type definitions for normalized AI SDK content and streaming.
 //!
-//! This crate provides the core types used across both ai-sdk-rs and clixode
-//! for representing chat messages, requests, and streaming events.
+//! This crate provides the shared types used across ai-sdk-rs for
+//! provider-normalized content, events, usage, embeddings, images, and v2 calls.
 
 pub mod embedding;
 pub mod image;
@@ -10,16 +10,6 @@ pub mod usage;
 pub mod v2;
 
 use serde::{Deserialize, Serialize};
-
-/// Basic roles for chat messages.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
 
 /// Represents the streaming state of tool arguments.
 ///
@@ -196,54 +186,6 @@ impl ContentPart {
     }
 }
 
-/// A chat message with role and content parts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: Role,
-    pub parts: Vec<ContentPart>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-// Helpers for convenience
-impl ChatMessage {
-    pub fn system<S: Into<String>>(s: S) -> Self {
-        Self {
-            role: Role::System,
-            parts: vec![ContentPart::Text { text: s.into() }],
-            name: None,
-        }
-    }
-
-    pub fn user<S: Into<String>>(s: S) -> Self {
-        Self {
-            role: Role::User,
-            parts: vec![ContentPart::Text { text: s.into() }],
-            name: None,
-        }
-    }
-
-    pub fn assistant<S: Into<String>>(s: S) -> Self {
-        Self {
-            role: Role::Assistant,
-            parts: vec![ContentPart::Text { text: s.into() }],
-            name: None,
-        }
-    }
-
-    /// Concatenate all Text parts into a single String.
-    pub fn text(&self) -> String {
-        self.parts
-            .iter()
-            .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ContentPart, ToolResultArtifact, ToolResultCompletionEffect};
@@ -290,49 +232,14 @@ mod tests {
                     Some(ToolResultCompletionEffect::SessionMetadata)
                 );
                 assert_eq!(
-                    artifact.expect("artifact should deserialize").source_path.as_deref(),
+                    artifact
+                        .expect("artifact should deserialize")
+                        .source_path
+                        .as_deref(),
                     Some("/workspace/out.txt")
                 );
             }
             other => panic!("expected tool result, got {other:?}"),
-        }
-    }
-}
-
-/// JSON Schema specification for a tool.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ToolSpec {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub json_schema: serde_json::Value,
-}
-
-/// Normalized chat request that providers accept.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatRequest {
-    pub model: String,
-    pub messages: Vec<ChatMessage>,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub max_output_tokens: Option<u32>,
-    #[serde(default)]
-    pub metadata: serde_json::Value,
-    #[serde(default)]
-    pub tools: Vec<ToolSpec>,
-}
-
-impl ChatRequest {
-    pub fn new(model: impl Into<String>, messages: Vec<ChatMessage>) -> Self {
-        Self {
-            model: model.into(),
-            messages,
-            temperature: None,
-            max_output_tokens: None,
-            metadata: serde_json::Value::Null,
-            tools: vec![],
         }
     }
 }
@@ -433,4 +340,4 @@ impl TokenUsage {
 pub mod catalog;
 
 // Re-export commonly used types at the crate root
-pub use self::{ContentPart as MessageContent, Role as MessageRole};
+pub use self::ContentPart as MessageContent;
