@@ -1,3 +1,5 @@
+#![deny(clippy::type_complexity)]
+
 use crate::core::error::TransportError;
 use crate::core::json::without_null_fields;
 use crate::core::transport::{HttpTransport, MultipartForm, MultipartValue, TransportConfig};
@@ -17,16 +19,52 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HeaderList(Vec<(String, String)>);
+
+impl HeaderList {
+    fn into_pairs(self) -> Vec<(String, String)> {
+        self.0
+    }
+}
+
+impl From<Vec<(String, String)>> for HeaderList {
+    fn from(headers: Vec<(String, String)>) -> Self {
+        Self(headers)
+    }
+}
+
+impl From<HeaderList> for Vec<(String, String)> {
+    fn from(headers: HeaderList) -> Self {
+        headers.into_pairs()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DownloadPayload {
+    bytes: Vec<u8>,
+    headers: HeaderList,
+}
+
+impl DownloadPayload {
+    fn new(bytes: Vec<u8>, headers: Vec<(String, String)>) -> Self {
+        Self {
+            bytes,
+            headers: headers.into(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TestTransport {
     json_response: Arc<Mutex<serde_json::Value>>,
     multipart_response: Arc<Mutex<serde_json::Value>>,
-    response_headers: Arc<Mutex<Vec<(String, String)>>>,
+    response_headers: Arc<Mutex<HeaderList>>,
     last_body: Arc<Mutex<Option<serde_json::Value>>>,
-    last_headers: Arc<Mutex<Option<Vec<(String, String)>>>>,
+    last_headers: Arc<Mutex<Option<HeaderList>>>,
     last_url: Arc<Mutex<Option<String>>>,
     last_form: Arc<Mutex<Option<MultipartForm>>>,
-    download_payload: Arc<Mutex<Option<(Vec<u8>, Vec<(String, String)>)>>>,
+    download_payload: Arc<Mutex<Option<DownloadPayload>>>,
 }
 
 impl TestTransport {
@@ -34,7 +72,7 @@ impl TestTransport {
         Self {
             json_response: Arc::new(Mutex::new(response_json.clone())),
             multipart_response: Arc::new(Mutex::new(response_json)),
-            response_headers: Arc::new(Mutex::new(vec![])),
+            response_headers: Arc::new(Mutex::new(HeaderList::default())),
             last_body: Arc::new(Mutex::new(None)),
             last_headers: Arc::new(Mutex::new(None)),
             last_url: Arc::new(Mutex::new(None)),
@@ -44,7 +82,7 @@ impl TestTransport {
     }
 
     fn with_response_headers(self, headers: Vec<(String, String)>) -> Self {
-        *self.response_headers.lock().unwrap() = headers;
+        *self.response_headers.lock().unwrap() = headers.into();
         self
     }
 
@@ -54,7 +92,7 @@ impl TestTransport {
     }
 
     fn with_download_payload(self, bytes: Vec<u8>, headers: Vec<(String, String)>) -> Self {
-        *self.download_payload.lock().unwrap() = Some((bytes, headers));
+        *self.download_payload.lock().unwrap() = Some(DownloadPayload::new(bytes, headers));
         self
     }
 
@@ -63,7 +101,11 @@ impl TestTransport {
     }
 
     fn last_headers(&self) -> Option<Vec<(String, String)>> {
-        self.last_headers.lock().unwrap().clone()
+        self.last_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .map(HeaderList::into_pairs)
     }
 
     fn last_url(&self) -> Option<String> {
@@ -76,7 +118,7 @@ impl TestTransport {
 }
 
 struct TestStreamResponse {
-    headers: Vec<(String, String)>,
+    headers: HeaderList,
     chunks: Vec<Result<Bytes, TransportError>>,
 }
 
@@ -90,7 +132,7 @@ impl HttpTransport for TestTransport {
         Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
         Vec<(String, String)>,
     ) {
-        (Box::pin(stream::iter(resp.chunks)), resp.headers)
+        (Box::pin(stream::iter(resp.chunks)), resp.headers.into())
     }
 
     async fn post_json_stream(
@@ -116,11 +158,11 @@ impl HttpTransport for TestTransport {
             body.clone()
         };
         *self.last_body.lock().unwrap() = Some(cleaned);
-        *self.last_headers.lock().unwrap() = Some(headers.to_vec());
+        *self.last_headers.lock().unwrap() = Some(headers.to_vec().into());
         *self.last_url.lock().unwrap() = Some(url.to_string());
         Ok((
             self.json_response.lock().unwrap().clone(),
-            self.response_headers.lock().unwrap().clone(),
+            self.response_headers.lock().unwrap().clone().into(),
         ))
     }
 
@@ -131,12 +173,12 @@ impl HttpTransport for TestTransport {
         form: &MultipartForm,
         _cfg: &TransportConfig,
     ) -> Result<(serde_json::Value, Vec<(String, String)>), TransportError> {
-        *self.last_headers.lock().unwrap() = Some(headers.to_vec());
+        *self.last_headers.lock().unwrap() = Some(headers.to_vec().into());
         *self.last_url.lock().unwrap() = Some(url.to_string());
         *self.last_form.lock().unwrap() = Some(form.clone());
         Ok((
             self.multipart_response.lock().unwrap().clone(),
-            self.response_headers.lock().unwrap().clone(),
+            self.response_headers.lock().unwrap().clone().into(),
         ))
     }
 
@@ -152,7 +194,7 @@ impl HttpTransport for TestTransport {
             .unwrap()
             .clone()
             .ok_or_else(|| TransportError::Other("download payload not set".into()))?;
-        Ok((Bytes::from(payload.0), payload.1))
+        Ok((Bytes::from(payload.bytes), payload.headers.into()))
     }
 }
 
