@@ -123,12 +123,14 @@ fn build_google_vertex(
     Ok(Arc::new(lm))
 }
 
-inventory::submit! {
-    ProviderRegistration {
+pub(crate) fn provider_registrations() -> &'static [ProviderRegistration] {
+    static REGISTRATIONS: &[ProviderRegistration] = &[ProviderRegistration {
         id: "google-vertex",
         sdk_type: SdkType::GoogleVertex,
         matches: Some(match_google_vertex),
         build: build_google_vertex,
         reasoning_scope: None,
-    }
+    }];
+
+    REGISTRATIONS
 }

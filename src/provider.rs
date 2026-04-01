@@ -1,9 +1,7 @@
-//! Provider builder types and registration for ai-sdk-rs.
+//! Provider builder types and explicit registration for ai-sdk-rs.
 //!
-//! This crate defines lightweight credentials/settings types and an optional
-//! registration mechanism that provider crates can use to self-register
-//! builders. The factory crate can then either consume registered builders or
-//! fall back to sdk_type-based construction.
+//! This crate defines lightweight credentials/settings types plus one
+//! canonical registry that enumerates provider builders directly.
 
 use crate::core::options as sdkopt;
 use crate::core::request_builder::defaults::provider_defaults_from_json;
@@ -60,11 +58,13 @@ impl Credentials {
 }
 
 /// Optional registration of provider builders.
-///
-/// Providers may `inventory::submit!` a registration to avoid factory matches.
 pub mod registry {
     use super::*;
-    use crate::types::catalog::SdkType;
+
+    pub type ProviderMatchFn = fn(&ProviderDefinition) -> bool;
+    pub type ProviderBuildFn =
+        fn(&ProviderDefinition, &str, &Credentials) -> Result<Arc<dyn LanguageModel>, SdkError>;
+    pub type ReasoningScopeFn = fn(&ReasoningScopeContext) -> Option<Vec<String>>;
 
     /// Static registration record for a provider builder.
     pub struct ProviderRegistration {
@@ -74,22 +74,27 @@ pub mod registry {
         pub sdk_type: SdkType,
         /// A predicate that decides if this builder wants to handle the given definition.
         /// If `None`, the factory will match by `id` vs `def.sdk_type`.
-        pub matches: Option<fn(&ProviderDefinition) -> bool>,
+        pub matches: Option<ProviderMatchFn>,
         /// Build a language model given the definition, model id and credentials.
-        pub build: fn(
-            def: &ProviderDefinition,
-            model: &str,
-            creds: &Credentials,
-        ) -> Result<Arc<dyn LanguageModel>, SdkError>,
+        pub build: ProviderBuildFn,
         /// Optional reasoning scope alias resolver.
-        pub reasoning_scope: Option<fn(&ReasoningScopeContext) -> Option<Vec<String>>>,
+        pub reasoning_scope: Option<ReasoningScopeFn>,
     }
 
-    inventory::collect!(ProviderRegistration);
-
-    /// Iterate over all registered builders.
-    pub fn iter() -> inventory::iter<ProviderRegistration> {
-        inventory::iter::<ProviderRegistration>
+    /// Iterate over all explicitly registered builders.
+    pub fn iter() -> impl Iterator<Item = &'static ProviderRegistration> {
+        [
+            crate::providers::amazon_bedrock::provider::provider_registrations(),
+            crate::providers::anthropic::provider::provider_registrations(),
+            crate::providers::azure::provider::provider_registrations(),
+            crate::providers::gateway::provider::provider_registrations(),
+            crate::providers::google::provider::provider_registrations(),
+            crate::providers::google_vertex::provider::provider_registrations(),
+            crate::providers::openai::provider::provider_registrations(),
+            crate::providers::openai_compatible::provider::provider_registrations(),
+        ]
+        .into_iter()
+        .flat_map(|registrations| registrations.iter())
     }
 }
 

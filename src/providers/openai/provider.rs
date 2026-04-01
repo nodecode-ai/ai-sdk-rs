@@ -251,12 +251,14 @@ fn build_openai(
     Ok(Arc::new(builder.build()?))
 }
 
-inventory::submit! {
-    ProviderRegistration {
+pub(crate) fn provider_registrations() -> &'static [ProviderRegistration] {
+    static REGISTRATIONS: &[ProviderRegistration] = &[ProviderRegistration {
         id: "openai",
         sdk_type: SdkType::OpenAI,
         matches: Some(match_openai),
         build: build_openai,
         reasoning_scope: None,
-    }
+    }];
+
+    REGISTRATIONS
 }

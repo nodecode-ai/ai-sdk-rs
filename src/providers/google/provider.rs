@@ -94,12 +94,14 @@ fn build_google(
     Ok(Arc::new(lm))
 }
 
-inventory::submit! {
-    ProviderRegistration {
+pub(crate) fn provider_registrations() -> &'static [ProviderRegistration] {
+    static REGISTRATIONS: &[ProviderRegistration] = &[ProviderRegistration {
         id: "google",
         sdk_type: SdkType::Google,
         matches: Some(match_google),
         build: build_google,
         reasoning_scope: None,
-    }
+    }];
+
+    REGISTRATIONS
 }

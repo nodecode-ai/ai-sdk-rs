@@ -647,67 +647,95 @@ pub fn build_openai_compatible_image(
     Ok(Arc::new(builder.build()?))
 }
 
-inventory::submit! {
-    ProviderRegistration {
-        id: "openai-compatible",
-        sdk_type: SdkType::OpenAICompatible,
-        matches: Some(match_openai_compatible),
-        build: build_openai_compatible_chat,
-        reasoning_scope: None,
-    }
-}
+pub(crate) fn provider_registrations() -> &'static [ProviderRegistration] {
+    static REGISTRATIONS: &[ProviderRegistration] = &[
+        ProviderRegistration {
+            id: "openai-compatible",
+            sdk_type: SdkType::OpenAICompatible,
+            matches: Some(match_openai_compatible),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "groq",
+            sdk_type: SdkType::Groq,
+            matches: Some(match_groq),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "xai",
+            sdk_type: SdkType::OpenAICompatible,
+            matches: Some(match_openai_compatible),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "deepseek",
+            sdk_type: SdkType::OpenAICompatible,
+            matches: Some(match_openai_compatible),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "mistral",
+            sdk_type: SdkType::OpenAICompatible,
+            matches: Some(match_openai_compatible),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "togetherai",
+            sdk_type: SdkType::OpenAICompatible,
+            matches: Some(match_openai_compatible),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "fireworks-ai",
+            sdk_type: SdkType::OpenAICompatible,
+            matches: Some(match_openai_compatible),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "deepinfra",
+            sdk_type: SdkType::OpenAICompatible,
+            matches: Some(match_openai_compatible),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "openrouter",
+            sdk_type: SdkType::OpenAICompatible,
+            matches: Some(match_openai_compatible),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "perplexity",
+            sdk_type: SdkType::OpenAICompatible,
+            matches: Some(match_openai_compatible),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "openai-compatible-chat",
+            sdk_type: SdkType::OpenAICompatibleChat,
+            matches: Some(match_openai_compatible_chat),
+            build: build_openai_compatible_chat,
+            reasoning_scope: None,
+        },
+        ProviderRegistration {
+            id: "openai-compatible-completion",
+            sdk_type: SdkType::OpenAICompatibleCompletion,
+            matches: Some(match_openai_compatible_completion),
+            build: build_openai_compatible_completion,
+            reasoning_scope: None,
+        },
+    ];
 
-inventory::submit! {
-    ProviderRegistration {
-        id: "groq",
-        sdk_type: SdkType::Groq,
-        matches: Some(match_groq),
-        build: build_openai_compatible_chat,
-        reasoning_scope: None,
-    }
-}
-
-macro_rules! register_openai_compatible_alias {
-    ($id:literal) => {
-        inventory::submit! {
-            ProviderRegistration {
-                id: $id,
-                sdk_type: SdkType::OpenAICompatible,
-                matches: Some(match_openai_compatible),
-                build: build_openai_compatible_chat,
-                reasoning_scope: None,
-            }
-        }
-    };
-}
-
-register_openai_compatible_alias!("xai");
-register_openai_compatible_alias!("deepseek");
-register_openai_compatible_alias!("mistral");
-register_openai_compatible_alias!("togetherai");
-register_openai_compatible_alias!("fireworks-ai");
-register_openai_compatible_alias!("deepinfra");
-register_openai_compatible_alias!("openrouter");
-register_openai_compatible_alias!("perplexity");
-
-inventory::submit! {
-    ProviderRegistration {
-        id: "openai-compatible-chat",
-        sdk_type: SdkType::OpenAICompatibleChat,
-        matches: Some(match_openai_compatible_chat),
-        build: build_openai_compatible_chat,
-        reasoning_scope: None,
-    }
-}
-
-inventory::submit! {
-    ProviderRegistration {
-        id: "openai-compatible-completion",
-        sdk_type: SdkType::OpenAICompatibleCompletion,
-        matches: Some(match_openai_compatible_completion),
-        build: build_openai_compatible_completion,
-        reasoning_scope: None,
-    }
+    REGISTRATIONS
 }
 
 fn parse_provider_settings(def: &ProviderDefinition) -> (bool, bool) {

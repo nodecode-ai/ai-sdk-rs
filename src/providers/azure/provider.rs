@@ -7,9 +7,9 @@ use crate::ai_sdk_provider::{
     build_provider_transport_config, filter_provider_bootstrap_headers,
     registry::ProviderRegistration, Credentials,
 };
+use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 use crate::provider_openai::config::OpenAIConfig;
 use crate::provider_openai::responses::language_model::OpenAIResponsesLanguageModel;
-use crate::ai_sdk_types::catalog::{ProviderDefinition, SdkType};
 use tracing::info;
 
 const TRACE_PREFIX: &str = "[AZURE]";
@@ -253,12 +253,14 @@ fn build_azure(
     Ok(Arc::new(lm))
 }
 
-inventory::submit! {
-    ProviderRegistration {
+pub(crate) fn provider_registrations() -> &'static [ProviderRegistration] {
+    static REGISTRATIONS: &[ProviderRegistration] = &[ProviderRegistration {
         id: "azure",
         sdk_type: SdkType::Azure,
         matches: Some(match_azure),
         build: build_azure,
         reasoning_scope: None,
-    }
+    }];
+
+    REGISTRATIONS
 }

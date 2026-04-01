@@ -9,7 +9,6 @@ use crate::provider::{
 };
 use crate::types::catalog::{ProviderDefinition, SdkType};
 use crate::types::v2 as v2t;
-use inventory::submit;
 use serde_json::Value as JsonValue;
 use tracing::info;
 
@@ -172,12 +171,14 @@ fn infer_region_from_url(url: &str) -> Option<String> {
     None
 }
 
-submit! {
-    ProviderRegistration {
+pub(crate) fn provider_registrations() -> &'static [ProviderRegistration] {
+    static REGISTRATIONS: &[ProviderRegistration] = &[ProviderRegistration {
         id: "amazon-bedrock",
         sdk_type: SdkType::AmazonBedrock,
         matches: Some(match_bedrock),
         build: build_bedrock,
         reasoning_scope: Some(bedrock_reasoning_scope),
-    }
+    }];
+
+    REGISTRATIONS
 }

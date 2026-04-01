@@ -283,12 +283,14 @@ fn anthropic_reasoning_scope(_ctx: &ReasoningScopeContext) -> Option<Vec<String>
     Some(vec!["anthropic".to_string()])
 }
 
-inventory::submit! {
-    ProviderRegistration {
+pub(crate) fn provider_registrations() -> &'static [ProviderRegistration] {
+    static REGISTRATIONS: &[ProviderRegistration] = &[ProviderRegistration {
         id: "anthropic",
         sdk_type: SdkType::Anthropic,
         matches: Some(match_anthropic),
         build: build_anthropic,
         reasoning_scope: Some(anthropic_reasoning_scope),
-    }
+    }];
+
+    REGISTRATIONS
 }

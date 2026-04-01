@@ -148,12 +148,14 @@ fn build_gateway(
     Ok(Arc::new(lm))
 }
 
-inventory::submit! {
-    ProviderRegistration {
+pub(crate) fn provider_registrations() -> &'static [ProviderRegistration] {
+    static REGISTRATIONS: &[ProviderRegistration] = &[ProviderRegistration {
         id: "gateway",
         sdk_type: SdkType::Gateway,
         matches: Some(match_gateway),
         build: build_gateway,
         reasoning_scope: None,
-    }
+    }];
+
+    REGISTRATIONS
 }
