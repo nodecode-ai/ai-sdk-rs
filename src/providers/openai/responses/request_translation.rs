@@ -8,9 +8,9 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use super::language_model::{
-    build_openai_provider_tool, build_tool_name_mapping, normalize_object_schema,
-    should_use_codex_oauth_websocket_transport, ResponseTransportMode, ToolNameMapping,
+    normalize_object_schema, should_use_codex_oauth_websocket_transport, ResponseTransportMode,
 };
+use super::provider_tools::{build_openai_provider_tool, build_tool_name_mapping, ToolNameMapping};
 use crate::provider_openai::config::OpenAIConfig;
 
 const TOP_LOGPROBS_MAX: u32 = 20;
