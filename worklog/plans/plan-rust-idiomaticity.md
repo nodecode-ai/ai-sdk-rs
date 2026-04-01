@@ -69,7 +69,7 @@
 ## Lineage Chain
 
 - Planned linear commit lineage:
-  `HEAD -> A0 -> A1 -> A2 -> A3 -> A4`
+  `HEAD -> A0 -> A1 -> A2 -> A3 -> A4 -> A5`
 
 ## Execution Order
 
@@ -78,6 +78,7 @@
 - Replace the remaining tuple-heavy test transport helpers.
 - Alias the surviving anthropic message pipeline return type.
 - Final validation and plan update.
+- Commit the explicit self-referential final plan state.
 
 ## Atomic Slices
 
@@ -132,8 +133,8 @@
   - the anthropic message pipeline no longer emits `type_complexity`.
   - runtime behavior remains unchanged.
 
-- [ ] `A4` Validate the surviving explicit path and refresh checked-in evidence.
-  Lineage commit: `<self-referential: fill after landing A4 commit>`
+- [x] `A4` Validate the surviving explicit path and refresh checked-in evidence.
+  Lineage commit: `d2be4dbd2d9970685b495d482095febf2a593dd7`
   Commit subject: `test(core): validate surviving provider registry path`
   Lineage parent: `A3`
   Scope:
@@ -142,6 +143,17 @@
   Gate:
   - targeted validation passes `cargo clippy --tests --message-format short -- -W clippy::type_complexity` with zero type complexity warnings.
   - plan reads properly and hashes are filled.
+
+- [x] `A5` Commit the explicit self-referential final plan state.
+  Lineage commit: `<self-referential final plan commit>`
+  Commit subject: `docs(plan): finalize rust idiomaticity lineage evidence`
+  Lineage parent: `A4`
+  Scope:
+  - `worklog/plans/plan-rust-idiomaticity.md`
+  Gate:
+  - plan captures the landed `A0` through `A4` hashes directly.
+  - the final self-referential state is explicit in the committed plan file.
+  - `validate_plan_lineage.py` passes.
 
 ## Acceptance Criteria
 
