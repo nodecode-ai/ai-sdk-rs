@@ -626,7 +626,7 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
             .build(stream);
         let mut parts = map_events_to_parts(
             Box::pin(pipeline),
-            build_stream_mapper_config(
+            super::stream_hooks::build_stream_mapper_config(
                 Vec::new(),
                 build_tool_name_mapping(&[]),
                 HashMap::new(),
@@ -904,7 +904,7 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
             .build(map_transport_stream(stream));
         let parts = map_events_to_parts(
             Box::pin(pipeline),
-            build_stream_mapper_config(
+            super::stream_hooks::build_stream_mapper_config(
                 warnings,
                 tool_name_mapping,
                 approval_request_id_map,
@@ -1127,7 +1127,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
             .build(stream);
         let parts = map_events_to_parts(
             Box::pin(pipeline),
-            build_stream_mapper_config(
+            super::stream_hooks::build_stream_mapper_config(
                 warnings,
                 tool_name_mapping,
                 approval_request_id_map,
@@ -1485,7 +1485,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
             .await?;
         let parts = map_events_to_parts(
             stream,
-            build_stream_mapper_config(
+            super::stream_hooks::build_stream_mapper_config(
                 warnings,
                 tool_name_mapping,
                 approval_request_id_map,
@@ -1503,7 +1503,7 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
 
 // ----- Helpers: request building and SSE mapping -----
 
-fn parse_openai_usage(u: &serde_json::Value) -> Option<TokenUsage> {
+pub(super) fn parse_openai_usage(u: &serde_json::Value) -> Option<TokenUsage> {
     let obj = u.as_object()?;
     let input = obj
         .get("input_tokens")
@@ -1578,7 +1578,7 @@ fn parse_openai_reasoning_tokens(u: &serde_json::Value) -> Option<u64> {
         .and_then(|v| v.as_u64())
 }
 
-fn apply_openai_usage_details(u: &serde_json::Value, usage: &mut v2t::Usage) {
+pub(super) fn apply_openai_usage_details(u: &serde_json::Value, usage: &mut v2t::Usage) {
     if let Some(cached) = parse_openai_cached_input_tokens(u) {
         usage.cached_input_tokens = Some(cached);
     }
@@ -2791,7 +2791,7 @@ mod legacy_provider_tools_output_side {
     }
 }
 
-fn escape_json_delta(delta: &str) -> String {
+pub(super) fn escape_json_delta(delta: &str) -> String {
     if delta
         .as_bytes()
         .iter()
@@ -3402,7 +3402,7 @@ struct OpenAIStreamExtras {
     tool_name_mapping: ToolNameMapping,
 }
 
-fn openai_item_metadata(
+pub(super) fn openai_item_metadata(
     item_id: &str,
     extras: impl IntoIterator<Item = (String, serde_json::Value)>,
 ) -> v2t::ProviderMetadata {
@@ -4252,7 +4252,7 @@ fn build_stream_mapper_config(
     }
 }
 
-fn map_finish_reason(hint: Option<&str>, has_function_calls: bool) -> v2t::FinishReason {
+pub(super) fn map_finish_reason(hint: Option<&str>, has_function_calls: bool) -> v2t::FinishReason {
     match hint {
         None => {
             if has_function_calls {
