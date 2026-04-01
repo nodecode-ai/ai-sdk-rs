@@ -28,6 +28,8 @@
 - `crates/providers/openai/tests/stream_fixture_tests.rs` now reuses the shared benchmark support owner instead of copying its own replay transport and fixture loader.
 - The scaffold now has a fourth Criterion binary, `provider_matrix`, which exercises one shared-harness request or streaming path for OpenAI, Azure, Anthropic, Google, Google Vertex, Bedrock, Gateway, and OpenAI-compatible families.
 - `docs/benchmarking.md` now documents the provider matrix alongside the remaining limits: only OpenAI currently uses captured production fixture files, while several non-OpenAI families still rely on representative synthetic or test-derived fixtures.
+- `benches/core_hot_paths.rs` now pulls its JSON, event-mapping, stream-collection, and provider-parse workloads from the shared support owner instead of hardcoding only tiny happy-path samples inline.
+- The shared support tree now owns deterministic scale and adversarial generators for large JSON envelopes, interleaved tool/event streams, fragmented SSE chunk boundaries, malformed OpenAI-compatible frames, and scaled Anthropic or Gateway replay paths.
 
 ## Findings Being Addressed
 
@@ -135,7 +137,7 @@
   - bench entrypoints are thinner and no longer mix generic support with provider-specific wiring
 
 - [x] `BH2` Add one provider-family scenario matrix on the shared harness.
-  Lineage commit: `<self; backfill after landing BH2>`
+  Lineage commit: `b2a560702832c18bae7ab7c7ce6222587d849828`
   Commit subject: `bench(providers): add shared harness provider matrix`
   Lineage parent: `BH1`
   Scope:
@@ -149,8 +151,8 @@
   - provider-specific bench logic is reduced to adapter or scenario declarations rather than custom replay infrastructure
   - the suite no longer depends on OpenAI as the only real-world fixture corpus
 
-- [ ] `BH3` Add provider-parse, scale, and adversarial workloads through the same harness.
-  Lineage commit: `<pending>`
+- [x] `BH3` Add provider-parse, scale, and adversarial workloads through the same harness.
+  Lineage commit: `<self; backfill after landing BH3>`
   Commit subject: `bench(core): add parse and scale scenarios`
   Lineage parent: `BH2`
   Scope:

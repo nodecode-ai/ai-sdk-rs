@@ -6,7 +6,7 @@
 
 - Request translation and non-stream `do_generate` overhead on the OpenAI Responses path.
 - Streaming decode and normalization using captured SSE fixtures from real provider traffic.
-- Core hot paths that are shared across providers: loose JSON parsing, event-to-part mapping, and stream collection.
+- Core hot paths that are shared across providers: loose JSON parsing, event-to-part mapping, stream collection, and provider-specific parse workloads under large or adversarial inputs.
 
 ## Why offline fixtures
 
@@ -25,6 +25,7 @@
 
 - The provider matrix now covers all supported provider families, but only the OpenAI path currently uses captured production fixture files under `crates/providers/openai/tests/fixtures/`.
 - Anthropic, Gateway, and OpenAI-compatible matrix scenarios still rely on checked-in representative wire-shape fixtures rather than broader captured corpora, and several non-OpenAI families still benchmark minimal synthetic responses instead of captured production transcripts.
+- The scale and adversarial suite now covers large payloads, malformed frames, and fragmented chunk boundaries on the shared harness, but it still stops short of live-provider traffic, memory profiling, or concurrent replay baselines.
 - CI only proves that the current offline scaffold compiles with `cargo bench --workspace --no-run`; local report inspection is still the only regression workflow.
 
 ## Commands

@@ -109,6 +109,7 @@ fn benchmarking_docs_call_out_the_current_scope_and_ci_policy() {
     for expected in [
         "The provider matrix now covers all supported provider families",
         "Anthropic, Gateway, and OpenAI-compatible matrix scenarios still rely on checked-in representative wire-shape fixtures",
+        "The scale and adversarial suite now covers large payloads, malformed frames, and fragmented chunk boundaries",
         "CI only proves that the current offline scaffold compiles with `cargo bench --workspace --no-run`",
     ] {
         assert!(
@@ -166,5 +167,15 @@ fn benchmark_entrypoints_register_openai_scenarios_through_shared_support() {
     assert!(
         provider_matrix_bench.contains("support::run_google_vertex_generate"),
         "expected provider_matrix bench to execute shared google vertex adapters",
+    );
+
+    let core_hot_paths_bench = include_str!("../benches/core_hot_paths.rs");
+    assert!(
+        core_hot_paths_bench.contains("support::provider_parse_scenarios()"),
+        "expected core_hot_paths bench to execute shared provider parse scenarios",
+    );
+    assert!(
+        core_hot_paths_bench.contains("support::json_parse_scenarios()"),
+        "expected core_hot_paths bench to execute shared scale/adversarial parse scenarios",
     );
 }
