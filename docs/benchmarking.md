@@ -55,6 +55,16 @@ bash scripts/benchmark-save-baseline.sh main core_hot_paths provider_matrix
 bash scripts/benchmark-compare-baseline.sh main core_hot_paths provider_matrix
 ```
 
+## Smoke checks
+
+Run these when you want a fast execution pass on the surviving high-value paths instead of a full local benchmark session:
+
+```bash
+cargo bench --bench core_hot_paths -- provider_parse_hot_paths --sample-size 10 --measurement-time 1
+cargo bench --bench provider_matrix -- concurrent_replay --sample-size 10 --measurement-time 1
+cargo bench --bench openai_responses -- openai/do_stream --sample-size 10 --measurement-time 1
+```
+
 Criterion reports are written under `target/criterion/`.
 
 ## CI policy

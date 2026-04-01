@@ -32,6 +32,7 @@
 - The shared support tree now owns deterministic scale and adversarial generators for large JSON envelopes, interleaved tool/event streams, fragmented SSE chunk boundaries, malformed OpenAI-compatible frames, and scaled Anthropic or Gateway replay paths.
 - `benches/provider_matrix.rs` now also registers shared concurrent replay and backpressure scenarios instead of keeping the matrix limited to single-stream request or stream passes.
 - The local regression-comparison path now lives in `scripts/benchmark-save-baseline.sh` and `scripts/benchmark-compare-baseline.sh`, while CI remains explicitly compile-only in `.github/workflows/release-check.yml`.
+- Targeted smoke validation has now executed the surviving parse-stress, concurrent replay, and original OpenAI stream paths directly via Criterion on the shared harness instead of stopping at compile-only checks.
 
 ## Findings Being Addressed
 
@@ -169,7 +170,7 @@
   - synthetic benchmark loads are no longer limited to trivially small happy-path samples
 
 - [x] `BH4` Add concurrent replay scenarios and local regression-comparison workflow.
-  Lineage commit: `<self; backfill after landing BH4>`
+  Lineage commit: `7a6fea06ac55cacc08cc549ce5eb92e752bafac1`
   Commit subject: `bench(workflow): add concurrent replay baselines`
   Lineage parent: `BH3`
   Scope:
@@ -183,8 +184,8 @@
   - developers have one explicit local workflow for capturing and comparing benchmark baselines
   - CI policy stays compile-only unless a deterministic dedicated runner is introduced explicitly
 
-- [ ] `BH5` Validate the surviving offline benchmark harness owner.
-  Lineage commit: `<pending>`
+- [x] `BH5` Validate the surviving offline benchmark harness owner.
+  Lineage commit: `<self; backfill after landing BH5>`
   Commit subject: `test(bench): validate single harness owner`
   Lineage parent: `BH4`
   Scope:
