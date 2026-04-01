@@ -30,6 +30,8 @@
 - `docs/benchmarking.md` now documents the provider matrix alongside the remaining limits: only OpenAI currently uses captured production fixture files, while several non-OpenAI families still rely on representative synthetic or test-derived fixtures.
 - `benches/core_hot_paths.rs` now pulls its JSON, event-mapping, stream-collection, and provider-parse workloads from the shared support owner instead of hardcoding only tiny happy-path samples inline.
 - The shared support tree now owns deterministic scale and adversarial generators for large JSON envelopes, interleaved tool/event streams, fragmented SSE chunk boundaries, malformed OpenAI-compatible frames, and scaled Anthropic or Gateway replay paths.
+- `benches/provider_matrix.rs` now also registers shared concurrent replay and backpressure scenarios instead of keeping the matrix limited to single-stream request or stream passes.
+- The local regression-comparison path now lives in `scripts/benchmark-save-baseline.sh` and `scripts/benchmark-compare-baseline.sh`, while CI remains explicitly compile-only in `.github/workflows/release-check.yml`.
 
 ## Findings Being Addressed
 
@@ -152,7 +154,7 @@
   - the suite no longer depends on OpenAI as the only real-world fixture corpus
 
 - [x] `BH3` Add provider-parse, scale, and adversarial workloads through the same harness.
-  Lineage commit: `<self; backfill after landing BH3>`
+  Lineage commit: `c73a113d8c5706e3eed79ff759392e9265e38136`
   Commit subject: `bench(core): add parse and scale scenarios`
   Lineage parent: `BH2`
   Scope:
@@ -166,8 +168,8 @@
   - scale and adversarial scenarios are represented with checked-in fixtures or deterministic generators
   - synthetic benchmark loads are no longer limited to trivially small happy-path samples
 
-- [ ] `BH4` Add concurrent replay scenarios and local regression-comparison workflow.
-  Lineage commit: `<pending>`
+- [x] `BH4` Add concurrent replay scenarios and local regression-comparison workflow.
+  Lineage commit: `<self; backfill after landing BH4>`
   Commit subject: `bench(workflow): add concurrent replay baselines`
   Lineage parent: `BH3`
   Scope:

@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 pub mod ai_sdk_rs {
     pub use ::ai_sdk_rs::core;
@@ -52,9 +52,26 @@ fn bench_provider_stream_matrix(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_concurrent_replay_matrix(c: &mut Criterion) {
+    let runtime = support::benchmark_runtime();
+    let mut group = c.benchmark_group("providers/concurrent_replay");
+    group.sample_size(10);
+
+    for scenario in support::concurrent_replay_scenarios() {
+        group.throughput(Throughput::Bytes(scenario.bytes));
+        group.bench_function(BenchmarkId::from_parameter(scenario.name), |b| {
+            let run = scenario.run;
+            b.to_async(&runtime).iter(run);
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_provider_generate_matrix,
-    bench_provider_stream_matrix
+    bench_provider_stream_matrix,
+    bench_concurrent_replay_matrix
 );
 criterion_main!(benches);

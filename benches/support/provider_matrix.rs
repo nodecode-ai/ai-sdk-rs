@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{future::join_all, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 
 use super::ai_sdk_rs::core::transport::TransportConfig;
@@ -50,6 +50,12 @@ pub struct StreamCollectionScenario {
 }
 
 pub struct AsyncProviderParseScenario {
+    pub name: &'static str,
+    pub bytes: u64,
+    pub run: fn() -> ScenarioFuture,
+}
+
+pub struct AsyncConcurrentReplayScenario {
     pub name: &'static str,
     pub bytes: u64,
     pub run: fn() -> ScenarioFuture,
@@ -141,6 +147,31 @@ pub fn provider_parse_scenarios() -> Vec<AsyncProviderParseScenario> {
             name: "openai_compatible_adversarial",
             bytes: bytes_len(openai_compatible_adversarial_chunks()),
             run: || Box::pin(run_openai_compatible_adversarial_stream()),
+        },
+    ]
+}
+
+pub fn concurrent_replay_scenarios() -> Vec<AsyncConcurrentReplayScenario> {
+    vec![
+        AsyncConcurrentReplayScenario {
+            name: "openai_parallel_4",
+            bytes: bytes_len(openai_fragmented_fixture_chunks()) * 4,
+            run: || Box::pin(run_openai_parallel_replay()),
+        },
+        AsyncConcurrentReplayScenario {
+            name: "anthropic_parallel_4",
+            bytes: bytes_len(anthropic_scale_chunks()) * 4,
+            run: || Box::pin(run_anthropic_parallel_replay()),
+        },
+        AsyncConcurrentReplayScenario {
+            name: "gateway_backpressure_4",
+            bytes: bytes_len(gateway_scale_chunks()) * 4,
+            run: || Box::pin(run_gateway_backpressure_replay()),
+        },
+        AsyncConcurrentReplayScenario {
+            name: "openai_compatible_backpressure_4",
+            bytes: bytes_len(openai_compatible_adversarial_chunks()) * 4,
+            run: || Box::pin(run_openai_compatible_backpressure_replay()),
         },
     ]
 }
@@ -573,7 +604,7 @@ fn openai_compatible_stream_chunks() -> Vec<Bytes> {
     ]
 }
 
-async fn run_openai_fragmented_fixture_stream() {
+async fn collect_openai_fragmented_fixture_parts() -> Vec<v2t::StreamPart> {
     let model = OpenAIResponsesLanguageModel::new(
         "gpt-5.1-mini",
         openai_responses_config(),
@@ -587,15 +618,19 @@ async fn run_openai_fragmented_fixture_stream() {
         .do_stream(stream_call_options("openai-mcp-tool-approval.1"))
         .await
         .expect("openai fragmented fixture stream");
-    let parts = response
+    response
         .stream
         .try_collect::<Vec<_>>()
         .await
-        .expect("openai fragmented fixture parts");
+        .expect("openai fragmented fixture parts")
+}
+
+async fn run_openai_fragmented_fixture_stream() {
+    let parts = collect_openai_fragmented_fixture_parts().await;
     std::hint::black_box(parts);
 }
 
-async fn run_anthropic_scale_stream() {
+async fn collect_anthropic_scale_parts() -> Vec<v2t::StreamPart> {
     let cfg = AnthropicMessagesConfig {
         provider_name: "anthropic",
         provider_scope_name: "anthropic".into(),
@@ -611,15 +646,19 @@ async fn run_anthropic_scale_stream() {
         .do_stream(v2t::CallOptions::new(matrix_prompt()))
         .await
         .expect("anthropic scale stream");
-    let parts = response
+    response
         .stream
         .try_collect::<Vec<_>>()
         .await
-        .expect("anthropic scale parts");
+        .expect("anthropic scale parts")
+}
+
+async fn run_anthropic_scale_stream() {
+    let parts = collect_anthropic_scale_parts().await;
     std::hint::black_box(parts);
 }
 
-async fn run_gateway_scale_stream() {
+async fn collect_gateway_scale_parts(backpressure: bool) -> Vec<v2t::StreamPart> {
     let cfg = GatewayConfig {
         provider_name: "gateway",
         provider_scope_name: "gateway".into(),
@@ -647,15 +686,23 @@ async fn run_gateway_scale_stream() {
         .do_stream(options)
         .await
         .expect("gateway scale stream");
-    let parts = response
-        .stream
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("gateway scale parts");
+    if backpressure {
+        collect_stream_with_yields(response.stream, 32).await
+    } else {
+        response
+            .stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("gateway scale parts")
+    }
+}
+
+async fn run_gateway_scale_stream() {
+    let parts = collect_gateway_scale_parts(false).await;
     std::hint::black_box(parts);
 }
 
-async fn run_openai_compatible_adversarial_stream() {
+async fn collect_openai_compatible_adversarial_parts(backpressure: bool) -> Vec<v2t::StreamPart> {
     let cfg = OpenAICompatibleChatConfig {
         provider_scope_name: "openai-compatible".into(),
         base_url: "https://compat.example/v1".into(),
@@ -687,12 +734,57 @@ async fn run_openai_compatible_adversarial_stream() {
         .do_stream(options)
         .await
         .expect("openai-compatible adversarial stream");
-    let parts = response
-        .stream
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("openai-compatible adversarial parts");
+    if backpressure {
+        collect_stream_with_yields(response.stream, 24).await
+    } else {
+        response
+            .stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("openai-compatible adversarial parts")
+    }
+}
+
+async fn run_openai_compatible_adversarial_stream() {
+    let parts = collect_openai_compatible_adversarial_parts(false).await;
     std::hint::black_box(parts);
+}
+
+async fn run_openai_parallel_replay() {
+    let responses = join_all((0..4).map(|_| collect_openai_fragmented_fixture_parts())).await;
+    std::hint::black_box(responses);
+}
+
+async fn run_anthropic_parallel_replay() {
+    let responses = join_all((0..4).map(|_| collect_anthropic_scale_parts())).await;
+    std::hint::black_box(responses);
+}
+
+async fn run_gateway_backpressure_replay() {
+    let responses = join_all((0..4).map(|_| collect_gateway_scale_parts(true))).await;
+    std::hint::black_box(responses);
+}
+
+async fn run_openai_compatible_backpressure_replay() {
+    let responses = join_all((0..4).map(|_| collect_openai_compatible_adversarial_parts(true))).await;
+    std::hint::black_box(responses);
+}
+
+async fn collect_stream_with_yields(
+    stream: super::ai_sdk_rs::core::PartStream,
+    yield_every: usize,
+) -> Vec<v2t::StreamPart> {
+    let mut parts = Vec::new();
+    let mut seen = 0usize;
+    futures_util::pin_mut!(stream);
+    while let Some(part) = stream.next().await {
+        parts.push(part.expect("stream part"));
+        seen += 1;
+        if seen % yield_every == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    parts
 }
 
 fn small_provider_events() -> Vec<Event> {

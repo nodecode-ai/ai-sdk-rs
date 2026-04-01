@@ -7,6 +7,7 @@
 - Request translation and non-stream `do_generate` overhead on the OpenAI Responses path.
 - Streaming decode and normalization using captured SSE fixtures from real provider traffic.
 - Core hot paths that are shared across providers: loose JSON parsing, event-to-part mapping, stream collection, and provider-specific parse workloads under large or adversarial inputs.
+- Concurrent replay and backpressure-oriented scenarios on the shared provider matrix harness.
 
 ## Why offline fixtures
 
@@ -36,6 +37,22 @@ cargo bench --bench openai_responses
 cargo bench --bench streaming_pipeline
 cargo bench --bench core_hot_paths
 cargo bench --bench provider_matrix
+```
+
+## Local baselines
+
+Use the shared scripts when you want a repeatable local save/compare workflow across the full offline suite:
+
+```bash
+bash scripts/benchmark-save-baseline.sh main
+bash scripts/benchmark-compare-baseline.sh main
+```
+
+Pass explicit bench names after the baseline if you only want a subset, for example:
+
+```bash
+bash scripts/benchmark-save-baseline.sh main core_hot_paths provider_matrix
+bash scripts/benchmark-compare-baseline.sh main core_hot_paths provider_matrix
 ```
 
 Criterion reports are written under `target/criterion/`.

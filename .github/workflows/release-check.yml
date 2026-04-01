@@ -22,7 +22,7 @@ jobs:
       - name: Cargo test
         run: cargo test --workspace
 
-      - name: Cargo bench (compile only)
+      - name: Cargo bench (compile only, local baselines live outside CI)
         run: cargo bench --workspace --no-run
 
       - name: Cargo package (ai-sdk-rs)
