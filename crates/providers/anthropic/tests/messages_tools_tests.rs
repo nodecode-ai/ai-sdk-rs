@@ -1,3 +1,5 @@
+#![deny(clippy::type_complexity)]
+
 use crate::ai_sdk_core::error::TransportError;
 use crate::ai_sdk_core::json::without_null_fields;
 use crate::ai_sdk_core::transport::{
@@ -19,6 +21,27 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HeaderList(Vec<(String, String)>);
+
+impl HeaderList {
+    fn into_pairs(self) -> Vec<(String, String)> {
+        self.0
+    }
+}
+
+impl From<Vec<(String, String)>> for HeaderList {
+    fn from(headers: Vec<(String, String)>) -> Self {
+        Self(headers)
+    }
+}
+
+impl From<HeaderList> for Vec<(String, String)> {
+    fn from(headers: HeaderList) -> Self {
+        headers.into_pairs()
+    }
+}
 
 #[derive(Default)]
 struct RecordingObserver {
@@ -66,7 +89,7 @@ fn transport_observer() -> Arc<RecordingObserver> {
 #[derive(Clone, Default)]
 struct TestTransport {
     last_body: Arc<Mutex<Option<serde_json::Value>>>,
-    last_headers: Arc<Mutex<Option<Vec<(String, String)>>>>,
+    last_headers: Arc<Mutex<Option<HeaderList>>>,
     stream_chunks: Arc<Vec<Bytes>>,
 }
 
@@ -84,12 +107,16 @@ impl TestTransport {
     }
 
     fn last_headers(&self) -> Option<Vec<(String, String)>> {
-        self.last_headers.lock().unwrap().clone()
+        self.last_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .map(HeaderList::into_pairs)
     }
 }
 
 struct TestStreamResponse {
-    headers: Vec<(String, String)>,
+    headers: HeaderList,
     chunks: Vec<Result<Bytes, TransportError>>,
 }
 
@@ -103,7 +130,7 @@ impl HttpTransport for TestTransport {
         Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
         Vec<(String, String)>,
     ) {
-        (Box::pin(stream::iter(resp.chunks)), resp.headers)
+        (Box::pin(stream::iter(resp.chunks)), resp.headers.into())
     }
 
     async fn post_json_stream(
@@ -119,9 +146,9 @@ impl HttpTransport for TestTransport {
             body.clone()
         };
         *self.last_body.lock().unwrap() = Some(sent_body);
-        *self.last_headers.lock().unwrap() = Some(headers.to_vec());
+        *self.last_headers.lock().unwrap() = Some(headers.to_vec().into());
         Ok(TestStreamResponse {
-            headers: vec![],
+            headers: HeaderList::default(),
             chunks: self.stream_chunks.iter().cloned().map(Ok).collect(),
         })
     }
@@ -240,6 +267,250 @@ fn sse_chunk(event: Option<&str>, payload: serde_json::Value) -> Bytes {
     }
     chunk.push_str(&format!("data: {payload}\n\n"));
     Bytes::from(chunk)
+}
+
+fn stream_part_index<F>(parts: &[v2t::StreamPart], label: &str, predicate: F) -> usize
+where
+    F: Fn(&v2t::StreamPart) -> bool,
+{
+    parts
+        .iter()
+        .position(predicate)
+        .unwrap_or_else(|| panic!("missing {label}"))
+}
+
+fn is_reasoning_start(part: &v2t::StreamPart) -> bool {
+    matches!(part, v2t::StreamPart::ReasoningStart { id, .. } if id == "0")
+}
+
+fn is_reasoning_delta(part: &v2t::StreamPart) -> bool {
+    matches!(
+        part,
+        v2t::StreamPart::ReasoningDelta { id, delta, .. } if id == "0" && delta == "ponder"
+    )
+}
+
+fn is_reasoning_signature(part: &v2t::StreamPart) -> bool {
+    matches!(
+        part,
+        v2t::StreamPart::ReasoningSignature { signature, .. } if signature == "sig-1"
+    )
+}
+
+fn is_text_start(part: &v2t::StreamPart) -> bool {
+    matches!(part, v2t::StreamPart::TextStart { id, .. } if id == "text-1")
+}
+
+fn is_text_delta(part: &v2t::StreamPart) -> bool {
+    matches!(part, v2t::StreamPart::TextDelta { id, delta, .. } if id == "text-1" && delta == "hello")
+}
+
+fn is_tool_input_start(part: &v2t::StreamPart) -> bool {
+    matches!(
+        part,
+        v2t::StreamPart::ToolInputStart { id, tool_name, provider_executed, .. }
+            if id == "tool-1" && tool_name == "weather" && !provider_executed
+    )
+}
+
+fn is_tool_input_delta(part: &v2t::StreamPart) -> bool {
+    matches!(
+        part,
+        v2t::StreamPart::ToolInputDelta { id, delta, provider_executed, .. }
+            if id == "tool-1" && delta == "{\"city\":\"SF\"}" && !provider_executed
+    )
+}
+
+fn is_tool_input_end(part: &v2t::StreamPart) -> bool {
+    matches!(
+        part,
+        v2t::StreamPart::ToolInputEnd { id, provider_executed, .. }
+            if id == "tool-1" && !provider_executed
+    )
+}
+
+fn is_tool_call(part: &v2t::StreamPart) -> bool {
+    matches!(
+        part,
+        v2t::StreamPart::ToolCall(call)
+            if call.tool_call_id == "tool-1"
+                && call.tool_name == "weather"
+                && call.input == "{\"city\":\"SF\"}"
+                && !call.provider_executed
+    )
+}
+
+fn is_text_end(part: &v2t::StreamPart) -> bool {
+    matches!(part, v2t::StreamPart::TextEnd { id, .. } if id == "text-1")
+}
+
+fn is_reasoning_end(part: &v2t::StreamPart) -> bool {
+    matches!(part, v2t::StreamPart::ReasoningEnd { id, .. } if id == "0")
+}
+
+fn is_finish(part: &v2t::StreamPart) -> bool {
+    matches!(
+        part,
+        v2t::StreamPart::Finish {
+            usage,
+            finish_reason,
+            ..
+        } if usage.input_tokens == Some(2)
+            && usage.output_tokens == Some(3)
+            && usage.total_tokens == Some(5)
+            && matches!(finish_reason, v2t::FinishReason::ToolCalls)
+    )
+}
+
+#[derive(Debug)]
+struct SharedEventMapperIndices {
+    reasoning_start: usize,
+    reasoning_delta: usize,
+    reasoning_signature: usize,
+    text_start: usize,
+    text_delta: usize,
+    tool_input_start: usize,
+    tool_input_delta: usize,
+    tool_input_end: usize,
+    tool_call: usize,
+    text_end: usize,
+    reasoning_end: usize,
+    finish: usize,
+}
+
+fn shared_event_mapper_chunks() -> Vec<Bytes> {
+    vec![
+        sse_chunk(
+            Some("message_start"),
+            json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 2,
+                        "output_tokens": 0
+                    }
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_start"),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking"}
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_delta"),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": "ponder"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_delta"),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": "sig-1"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_delta"),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "text_delta",
+                    "text": "hello"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_start"),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool-1",
+                    "name": "weather"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("content_block_delta"),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{\"city\":\"SF\"}"
+                }
+            }),
+        ),
+        sse_chunk(
+            Some("message_delta"),
+            json!({
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 3
+                }
+            }),
+        ),
+        sse_chunk(Some("message_stop"), json!({"type": "message_stop"})),
+    ]
+}
+
+fn locate_shared_event_mapper_indices(parts: &[v2t::StreamPart]) -> SharedEventMapperIndices {
+    SharedEventMapperIndices {
+        reasoning_start: stream_part_index(parts, "reasoning start", is_reasoning_start),
+        reasoning_delta: stream_part_index(parts, "reasoning delta", is_reasoning_delta),
+        reasoning_signature: stream_part_index(
+            parts,
+            "reasoning signature",
+            is_reasoning_signature,
+        ),
+        text_start: stream_part_index(parts, "text start", is_text_start),
+        text_delta: stream_part_index(parts, "text delta", is_text_delta),
+        tool_input_start: stream_part_index(parts, "tool input start", is_tool_input_start),
+        tool_input_delta: stream_part_index(parts, "tool input delta", is_tool_input_delta),
+        tool_input_end: stream_part_index(parts, "tool input end", is_tool_input_end),
+        tool_call: stream_part_index(parts, "tool call", is_tool_call),
+        text_end: stream_part_index(parts, "text end", is_text_end),
+        reasoning_end: stream_part_index(parts, "reasoning end", is_reasoning_end),
+        finish: stream_part_index(parts, "finish", is_finish),
+    }
+}
+
+fn assert_shared_event_mapper_sequence(parts: &[v2t::StreamPart]) {
+    assert!(matches!(
+        &parts[0],
+        v2t::StreamPart::StreamStart { warnings } if warnings.is_empty()
+    ));
+
+    let indices = locate_shared_event_mapper_indices(parts);
+    assert!(indices.reasoning_start < indices.reasoning_delta);
+    assert!(indices.reasoning_delta < indices.reasoning_signature);
+    assert!(indices.reasoning_signature < indices.text_start);
+    assert!(indices.text_start < indices.text_delta);
+    assert!(indices.text_delta < indices.tool_input_start);
+    assert!(indices.tool_input_start < indices.tool_input_delta);
+    assert!(indices.tool_input_delta < indices.tool_input_end);
+    assert!(indices.tool_input_end < indices.tool_call);
+    assert!(indices.tool_call < indices.finish);
+    assert!(indices.text_start < indices.text_end);
+    assert!(indices.reasoning_start < indices.reasoning_end);
+    assert!(indices.text_end < indices.finish);
+    assert!(indices.reasoning_end < indices.finish);
 }
 
 #[tokio::test]
@@ -505,95 +776,7 @@ async fn registry_built_anthropic_stream_payload_is_null_free_on_wire() {
 
 #[tokio::test]
 async fn shared_event_mapper_streams_reasoning_text_tool_and_finish() {
-    let transport = TestTransport::with_stream_chunks(vec![
-        sse_chunk(
-            Some("message_start"),
-            json!({
-                "type": "message_start",
-                "message": {
-                    "usage": {
-                        "input_tokens": 2,
-                        "output_tokens": 0
-                    }
-                }
-            }),
-        ),
-        sse_chunk(
-            Some("content_block_start"),
-            json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "thinking"}
-            }),
-        ),
-        sse_chunk(
-            Some("content_block_delta"),
-            json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {
-                    "type": "thinking_delta",
-                    "thinking": "ponder"
-                }
-            }),
-        ),
-        sse_chunk(
-            Some("content_block_delta"),
-            json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {
-                    "type": "signature_delta",
-                    "signature": "sig-1"
-                }
-            }),
-        ),
-        sse_chunk(
-            Some("content_block_delta"),
-            json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {
-                    "type": "text_delta",
-                    "text": "hello"
-                }
-            }),
-        ),
-        sse_chunk(
-            Some("content_block_start"),
-            json!({
-                "type": "content_block_start",
-                "index": 1,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": "tool-1",
-                    "name": "weather"
-                }
-            }),
-        ),
-        sse_chunk(
-            Some("content_block_delta"),
-            json!({
-                "type": "content_block_delta",
-                "index": 1,
-                "delta": {
-                    "type": "input_json_delta",
-                    "partial_json": "{\"city\":\"SF\"}"
-                }
-            }),
-        ),
-        sse_chunk(
-            Some("message_delta"),
-            json!({
-                "type": "message_delta",
-                "usage": {
-                    "input_tokens": 2,
-                    "output_tokens": 3
-                }
-            }),
-        ),
-        sse_chunk(Some("message_stop"), json!({"type": "message_stop"})),
-    ]);
+    let transport = TestTransport::with_stream_chunks(shared_event_mapper_chunks());
     let model = build_model(transport);
 
     let response = model
@@ -606,127 +789,5 @@ async fn shared_event_mapper_streams_reasoning_text_tool_and_finish() {
         .await
         .expect("collect stream parts");
 
-    assert!(matches!(
-        &parts[0],
-        v2t::StreamPart::StreamStart { warnings } if warnings.is_empty()
-    ));
-
-    let reasoning_start_idx = parts
-        .iter()
-        .position(|part| matches!(part, v2t::StreamPart::ReasoningStart { id, .. } if id == "0"))
-        .expect("reasoning start");
-    let reasoning_delta_idx = parts
-        .iter()
-        .position(|part| {
-            matches!(
-                part,
-                v2t::StreamPart::ReasoningDelta { id, delta, .. }
-                    if id == "0" && delta == "ponder"
-            )
-        })
-        .expect("reasoning delta");
-    let reasoning_signature_idx = parts
-        .iter()
-        .position(|part| {
-            matches!(
-                part,
-                v2t::StreamPart::ReasoningSignature { signature, .. } if signature == "sig-1"
-            )
-        })
-        .expect("reasoning signature");
-    let text_start_idx = parts
-        .iter()
-        .position(|part| matches!(part, v2t::StreamPart::TextStart { id, .. } if id == "text-1"))
-        .expect("text start");
-    let text_delta_idx = parts
-        .iter()
-        .position(|part| {
-            matches!(
-                part,
-                v2t::StreamPart::TextDelta { id, delta, .. }
-                    if id == "text-1" && delta == "hello"
-            )
-        })
-        .expect("text delta");
-    let tool_input_start_idx = parts
-        .iter()
-        .position(|part| {
-            matches!(
-                part,
-                v2t::StreamPart::ToolInputStart { id, tool_name, provider_executed, .. }
-                    if id == "tool-1" && tool_name == "weather" && !provider_executed
-            )
-        })
-        .expect("tool input start");
-    let tool_input_delta_idx = parts
-        .iter()
-        .position(|part| {
-            matches!(
-                part,
-                v2t::StreamPart::ToolInputDelta { id, delta, provider_executed, .. }
-                    if id == "tool-1" && delta == "{\"city\":\"SF\"}" && !provider_executed
-            )
-        })
-        .expect("tool input delta");
-    let tool_input_end_idx = parts
-        .iter()
-        .position(|part| {
-            matches!(
-                part,
-                v2t::StreamPart::ToolInputEnd { id, provider_executed, .. }
-                    if id == "tool-1" && !provider_executed
-            )
-        })
-        .expect("tool input end");
-    let tool_call_idx = parts
-        .iter()
-        .position(|part| {
-            matches!(
-                part,
-                v2t::StreamPart::ToolCall(call)
-                    if call.tool_call_id == "tool-1"
-                        && call.tool_name == "weather"
-                        && call.input == "{\"city\":\"SF\"}"
-                        && !call.provider_executed
-            )
-        })
-        .expect("tool call");
-    let text_end_idx = parts
-        .iter()
-        .position(|part| matches!(part, v2t::StreamPart::TextEnd { id, .. } if id == "text-1"))
-        .expect("text end");
-    let reasoning_end_idx = parts
-        .iter()
-        .position(|part| matches!(part, v2t::StreamPart::ReasoningEnd { id, .. } if id == "0"))
-        .expect("reasoning end");
-    let finish_idx = parts
-        .iter()
-        .position(|part| {
-            matches!(
-                part,
-                v2t::StreamPart::Finish {
-                    usage,
-                    finish_reason,
-                    ..
-                } if usage.input_tokens == Some(2)
-                    && usage.output_tokens == Some(3)
-                    && usage.total_tokens == Some(5)
-                    && matches!(finish_reason, v2t::FinishReason::ToolCalls)
-            )
-        })
-        .expect("finish");
-
-    assert!(reasoning_start_idx < reasoning_delta_idx);
-    assert!(reasoning_delta_idx < reasoning_signature_idx);
-    assert!(reasoning_signature_idx < text_start_idx);
-    assert!(text_start_idx < text_delta_idx);
-    assert!(text_delta_idx < tool_input_start_idx);
-    assert!(tool_input_start_idx < tool_input_delta_idx);
-    assert!(tool_input_delta_idx < tool_input_end_idx);
-    assert!(tool_input_end_idx < tool_call_idx);
-    assert!(tool_call_idx < finish_idx);
-    assert!(text_start_idx < text_end_idx);
-    assert!(reasoning_start_idx < reasoning_end_idx);
-    assert!(text_end_idx < finish_idx);
-    assert!(reasoning_end_idx < finish_idx);
+    assert_shared_event_mapper_sequence(&parts);
 }

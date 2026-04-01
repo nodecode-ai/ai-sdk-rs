@@ -1,3 +1,5 @@
+#![deny(clippy::type_complexity)]
+
 use crate::core::error::TransportError;
 use crate::core::json::without_null_fields;
 use crate::core::transport::{HttpTransport, TransportConfig};
@@ -18,20 +20,41 @@ use std::sync::{Arc, Mutex};
 
 const DEFAULT_MAX_EMBEDDINGS_PER_CALL: usize = 2048;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HeaderList(Vec<(String, String)>);
+
+impl HeaderList {
+    fn into_pairs(self) -> Vec<(String, String)> {
+        self.0
+    }
+}
+
+impl From<Vec<(String, String)>> for HeaderList {
+    fn from(headers: Vec<(String, String)>) -> Self {
+        Self(headers)
+    }
+}
+
+impl From<HeaderList> for Vec<(String, String)> {
+    fn from(headers: HeaderList) -> Self {
+        headers.into_pairs()
+    }
+}
+
 #[derive(Clone)]
 struct TestTransport {
     response_json: Arc<Mutex<serde_json::Value>>,
-    response_headers: Arc<Mutex<Vec<(String, String)>>>,
+    response_headers: Arc<Mutex<HeaderList>>,
     stream_chunks: Arc<Mutex<Vec<Result<Bytes, TransportError>>>>,
     last_body: Arc<Mutex<Option<serde_json::Value>>>,
-    last_headers: Arc<Mutex<Option<Vec<(String, String)>>>>,
+    last_headers: Arc<Mutex<Option<HeaderList>>>,
 }
 
 impl TestTransport {
     fn new(response_json: serde_json::Value) -> Self {
         Self {
             response_json: Arc::new(Mutex::new(response_json)),
-            response_headers: Arc::new(Mutex::new(vec![])),
+            response_headers: Arc::new(Mutex::new(HeaderList::default())),
             stream_chunks: Arc::new(Mutex::new(vec![])),
             last_body: Arc::new(Mutex::new(None)),
             last_headers: Arc::new(Mutex::new(None)),
@@ -39,7 +62,7 @@ impl TestTransport {
     }
 
     fn with_response_headers(self, headers: Vec<(String, String)>) -> Self {
-        *self.response_headers.lock().unwrap() = headers;
+        *self.response_headers.lock().unwrap() = headers.into();
         self
     }
 
@@ -48,12 +71,16 @@ impl TestTransport {
     }
 
     fn last_headers(&self) -> Option<Vec<(String, String)>> {
-        self.last_headers.lock().unwrap().clone()
+        self.last_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .map(HeaderList::into_pairs)
     }
 }
 
 struct TestStreamResponse {
-    headers: Vec<(String, String)>,
+    headers: HeaderList,
     chunks: Vec<Result<Bytes, TransportError>>,
 }
 
@@ -67,7 +94,7 @@ impl HttpTransport for TestTransport {
         Pin<Box<dyn Stream<Item = Result<Bytes, TransportError>> + Send>>,
         Vec<(String, String)>,
     ) {
-        (Box::pin(stream::iter(resp.chunks)), resp.headers)
+        (Box::pin(stream::iter(resp.chunks)), resp.headers.into())
     }
 
     async fn post_json_stream(
@@ -83,7 +110,7 @@ impl HttpTransport for TestTransport {
             body.clone()
         };
         *self.last_body.lock().unwrap() = Some(cleaned);
-        *self.last_headers.lock().unwrap() = Some(headers.to_vec());
+        *self.last_headers.lock().unwrap() = Some(headers.to_vec().into());
         let mut guard = self.stream_chunks.lock().unwrap();
         let chunks = std::mem::take(&mut *guard);
         Ok(TestStreamResponse {
@@ -105,10 +132,10 @@ impl HttpTransport for TestTransport {
             body.clone()
         };
         *self.last_body.lock().unwrap() = Some(cleaned);
-        *self.last_headers.lock().unwrap() = Some(headers.to_vec());
+        *self.last_headers.lock().unwrap() = Some(headers.to_vec().into());
         Ok((
             self.response_json.lock().unwrap().clone(),
-            self.response_headers.lock().unwrap().clone(),
+            self.response_headers.lock().unwrap().clone().into(),
         ))
     }
 }
