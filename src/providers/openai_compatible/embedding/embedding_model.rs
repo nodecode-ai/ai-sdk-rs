@@ -153,9 +153,7 @@ impl OpenAICompatibleEmbeddingModel<crate::reqwest_transport::ReqwestTransport> 
     pub fn builder(
         model_id: impl Into<String>,
     ) -> crate::provider_openai_compatible::provider::OpenAICompatibleEmbeddingBuilder {
-        crate::provider_openai_compatible::provider::OpenAICompatibleEmbeddingBuilder::new(
-            model_id,
-        )
+        crate::provider_openai_compatible::provider::OpenAICompatibleEmbeddingBuilder::new(model_id)
     }
 }
 

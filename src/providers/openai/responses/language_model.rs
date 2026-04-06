@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::marker::PhantomData;
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -15,17 +16,16 @@ use crate::ai_sdk_types::v2 as v2t;
 use crate::ai_sdk_types::{Event, TokenUsage};
 use futures_core::Stream;
 use futures_util::{stream, StreamExt};
-use governor::clock::DefaultClock;
-use governor::state::{InMemoryState, NotKeyed};
-use governor::{Quota, RateLimiter};
 use serde_json::{json, Map, Value};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
+use tokio::time::{sleep_until, Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 
 use super::provider_tools::{
     build_tool_name_mapping, provider_tool_data_from_output_item, provider_tool_parts_from_data,
-    ToolNameMapping,
+    ProviderToolParts, ToolNameMapping,
 };
 use super::request_translation::{
     build_request_body, parse_openai_provider_options, OpenAIProviderOptionsParsed,
@@ -36,6 +36,7 @@ use crate::provider_openai::error::map_transport_error;
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, SdkError>> + Send>>;
 type ByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, SdkError>> + Send>>;
 type RawByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, TransportError>> + Send>>;
+type SessionWebsocketRequest = (Value, Value, ByteStream, Vec<(String, String)>, bool, bool);
 
 const OPENAI_WS_BETA_HEADER: &str = "OpenAI-Beta";
 const OPENAI_WS_BETA_VALUE: &str = "responses_websockets=2026-02-06";
@@ -109,6 +110,73 @@ struct OpenAIResponsesTurnSession<'a, T: HttpTransport> {
     model: &'a OpenAIResponsesLanguageModel<T>,
     websocket: Option<Box<dyn JsonStreamWebsocketConnection>>,
     state: Arc<Mutex<OpenAIResponsesTurnSessionState>>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct DefaultClock;
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct InMemoryState;
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct NotKeyed;
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct Quota {
+    interval: Duration,
+}
+
+impl Quota {
+    #[doc(hidden)]
+    pub fn per_second(rps: NonZeroU32) -> Self {
+        Self {
+            interval: Duration::from_secs_f64(1.0 / f64::from(rps.get())),
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct RateLimiter<K = NotKeyed, S = InMemoryState, C = DefaultClock> {
+    interval: Duration,
+    next_ready: AsyncMutex<Instant>,
+    marker: PhantomData<(K, S, C)>,
+}
+
+impl RateLimiter<NotKeyed, InMemoryState, DefaultClock> {
+    #[doc(hidden)]
+    pub fn direct(quota: Quota) -> Self {
+        Self {
+            interval: quota.interval,
+            next_ready: AsyncMutex::new(Instant::now()),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<K, S, C> RateLimiter<K, S, C> {
+    #[doc(hidden)]
+    pub async fn until_ready(&self) {
+        let scheduled = {
+            let mut next_ready = self.next_ready.lock().await;
+            reserve_rate_limiter_slot(&mut next_ready, Instant::now(), self.interval)
+        };
+        sleep_until(scheduled).await;
+    }
+}
+
+fn reserve_rate_limiter_slot(
+    next_ready: &mut Instant,
+    now: Instant,
+    interval: Duration,
+) -> Instant {
+    let scheduled = if *next_ready > now { *next_ready } else { now };
+    *next_ready = scheduled + interval;
+    scheduled
 }
 
 pub struct OpenAIResponsesLanguageModel<
@@ -306,6 +374,25 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
         Ok(json)
     }
 
+    async fn post_response_json(
+        &self,
+        body: &Value,
+        extra_headers: &HashMap<String, String>,
+    ) -> Result<Value, SdkError> {
+        let url = self.endpoint_url();
+        let headers: Vec<(String, String)> = self
+            .request_headers(extra_headers)
+            .into_iter()
+            .map(|(key, value)| (Self::canonicalize_header(&key), value))
+            .collect();
+        let (json, _response_headers) = self
+            .http
+            .post_json(&url, &headers, body, &self.transport_cfg)
+            .await
+            .map_err(map_transport_error)?;
+        Ok(json)
+    }
+
     async fn send(
         &self,
         body: serde_json::Value,
@@ -318,66 +405,90 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             let _ = l.until_ready().await;
         }
 
-        let primary = self.send_once(&hdrs, &body, requested).await;
-        match primary {
+        match self.send_once(&hdrs, &body, requested).await {
             Ok((stream, res_headers)) => {
-                if requested == ResponseTransportMode::Websocket {
-                    match prefetch_stream(stream).await {
-                        Ok(stream) => Ok((
-                            stream,
-                            response_headers_with_transport(
-                                res_headers,
-                                requested,
-                                requested,
-                                None,
-                            ),
-                        )),
-                        Err(err)
-                            if transport.fallback_http
-                                && should_fallback_to_http_after_websocket_error(&err) =>
-                        {
-                            let (stream, res_headers) = self
-                                .send_once(&hdrs, &body, ResponseTransportMode::Http)
-                                .await?;
-                            Ok((
-                                map_transport_stream(stream),
-                                response_headers_with_transport(
-                                    res_headers,
-                                    requested,
-                                    ResponseTransportMode::Http,
-                                    Some(requested),
-                                ),
-                            ))
-                        }
-                        Err(err) => Err(err),
-                    }
-                } else {
-                    Ok((
-                        map_transport_stream(stream),
-                        response_headers_with_transport(res_headers, requested, requested, None),
-                    ))
-                }
+                self.finish_send(
+                    stream,
+                    res_headers,
+                    requested,
+                    transport.fallback_http,
+                    &hdrs,
+                    &body,
+                )
+                .await
             }
-            Err(err)
-                if requested == ResponseTransportMode::Websocket
-                    && transport.fallback_http
-                    && should_fallback_to_http_after_websocket_error(&err) =>
-            {
-                let (stream, res_headers) = self
-                    .send_once(&hdrs, &body, ResponseTransportMode::Http)
-                    .await?;
-                Ok((
-                    map_transport_stream(stream),
-                    response_headers_with_transport(
-                        res_headers,
-                        requested,
-                        ResponseTransportMode::Http,
-                        Some(requested),
-                    ),
-                ))
+            Err(err) => {
+                self.handle_send_error(err, requested, transport.fallback_http, &hdrs, &body)
+                    .await
+            }
+        }
+    }
+
+    async fn finish_send(
+        &self,
+        stream: RawByteStream,
+        res_headers: Vec<(String, String)>,
+        requested: ResponseTransportMode,
+        fallback_http: bool,
+        headers: &BTreeMap<String, String>,
+        body: &serde_json::Value,
+    ) -> Result<(ByteStream, v2t::Headers), SdkError> {
+        if requested != ResponseTransportMode::Websocket {
+            return Ok(map_raw_transport_response(
+                stream,
+                res_headers,
+                requested,
+                requested,
+                None,
+            ));
+        }
+
+        match prefetch_stream(stream).await {
+            Ok(stream) => Ok((
+                stream,
+                response_headers_with_transport(res_headers, requested, requested, None),
+            )),
+            Err(err) if fallback_http && should_fallback_to_http_after_websocket_error(&err) => {
+                self.send_http_fallback(headers, body, requested).await
             }
             Err(err) => Err(err),
         }
+    }
+
+    async fn handle_send_error(
+        &self,
+        err: SdkError,
+        requested: ResponseTransportMode,
+        fallback_http: bool,
+        headers: &BTreeMap<String, String>,
+        body: &serde_json::Value,
+    ) -> Result<(ByteStream, v2t::Headers), SdkError> {
+        if requested == ResponseTransportMode::Websocket
+            && fallback_http
+            && should_fallback_to_http_after_websocket_error(&err)
+        {
+            return self.send_http_fallback(headers, body, requested).await;
+        }
+
+        Err(err)
+    }
+
+    async fn send_http_fallback(
+        &self,
+        headers: &BTreeMap<String, String>,
+        body: &serde_json::Value,
+        requested: ResponseTransportMode,
+    ) -> Result<(ByteStream, v2t::Headers), SdkError> {
+        let (stream, res_headers) = self
+            .send_once(headers, body, ResponseTransportMode::Http)
+            .await?;
+        Ok(map_raw_transport_response(
+            stream,
+            res_headers,
+            requested,
+            ResponseTransportMode::Http,
+            Some(requested),
+        ))
     }
 
     async fn send_once(
@@ -413,6 +524,59 @@ impl<T: HttpTransport> OpenAIResponsesLanguageModel<T> {
             }
             Err(te) => Err(map_transport_error(te)),
         }
+    }
+}
+
+fn map_raw_transport_response(
+    stream: RawByteStream,
+    headers: Vec<(String, String)>,
+    requested: ResponseTransportMode,
+    effective: ResponseTransportMode,
+    fallback_from: Option<ResponseTransportMode>,
+) -> (ByteStream, v2t::Headers) {
+    (
+        map_transport_stream(stream),
+        response_headers_with_transport(headers, requested, effective, fallback_from),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reserve_rate_limiter_slot, OpenAIResponsesLanguageModel};
+    use tokio::time::{Duration, Instant};
+
+    #[test]
+    fn rate_limiter_slot_is_immediate_when_idle() {
+        let base = Instant::now();
+        let interval = Duration::from_millis(100);
+        let mut next_ready = base;
+
+        let scheduled = reserve_rate_limiter_slot(&mut next_ready, base, interval);
+
+        assert_eq!(scheduled, base);
+        assert_eq!(next_ready, base + interval);
+    }
+
+    #[test]
+    fn rate_limiter_slot_queues_when_previous_slot_is_reserved() {
+        let base = Instant::now();
+        let interval = Duration::from_millis(100);
+        let mut next_ready = base + interval;
+
+        let scheduled =
+            reserve_rate_limiter_slot(&mut next_ready, base + Duration::from_millis(40), interval);
+
+        assert_eq!(scheduled, base + interval);
+        assert_eq!(next_ready, base + Duration::from_millis(200));
+    }
+
+    #[test]
+    fn zero_rps_keeps_rate_limiter_disabled() {
+        let model =
+            OpenAIResponsesLanguageModel::<crate::reqwest_transport::ReqwestTransport>::default()
+                .with_rate_limit_per_sec(0);
+
+        assert!(model.limiter.is_none());
     }
 }
 
@@ -917,6 +1081,59 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
             response_headers: Some(response_headers),
         })
     }
+
+    async fn stream_http_on_websocket_error(
+        &mut self,
+        err: SdkError,
+        transport_selection: ResponseTransportSelection,
+        body: Value,
+        include_raw: bool,
+        extra_headers: &HashMap<String, String>,
+        warnings: Vec<v2t::CallWarning>,
+        tool_name_mapping: ToolNameMapping,
+        approval_request_id_map: HashMap<String, String>,
+        store_for_stream: bool,
+        logprobs_enabled: bool,
+    ) -> Result<StreamResponse, SdkError> {
+        if transport_selection.fallback_http && should_fallback_to_http_after_websocket_error(&err)
+        {
+            self.activate_http_fallback("websocket_http_fallback");
+            self.stream_http_request(
+                body,
+                include_raw,
+                transport_selection.requested,
+                extra_headers,
+                warnings,
+                tool_name_mapping,
+                approval_request_id_map,
+                store_for_stream,
+                logprobs_enabled,
+            )
+            .await
+        } else {
+            Err(err)
+        }
+    }
+
+    async fn send_session_websocket_request_with_prewarm(
+        &mut self,
+        body: &Value,
+        websocket_headers: &[(String, String)],
+    ) -> Result<SessionWebsocketRequest, SdkError> {
+        if !self.should_prewarm_websocket(body) {
+            return self.send_session_websocket_request(body.clone()).await;
+        }
+
+        match self.send_session_websocket_request(body.clone()).await {
+            Ok(result) => Ok(result),
+            Err(SdkError::RateLimited { .. }) => {
+                self.ensure_websocket_connection(websocket_headers).await?;
+                self.prewarm_websocket_session(body).await?;
+                self.send_session_websocket_request(body.clone()).await
+            }
+            Err(err) => Err(err),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -984,16 +1201,13 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
         let websocket_headers = self.websocket_headers(&options.headers);
         let reused = match self.ensure_websocket_connection(&websocket_headers).await {
             Ok(reused) => reused,
-            Err(err)
-                if transport_selection.fallback_http
-                    && should_fallback_to_http_after_websocket_error(&err) =>
-            {
-                self.activate_http_fallback("websocket_http_fallback");
+            Err(err) => {
                 return self
-                    .stream_http_request(
+                    .stream_http_on_websocket_error(
+                        err,
+                        transport_selection,
                         body,
                         options.include_raw_chunks,
-                        transport_selection.requested,
                         &options.headers,
                         warnings,
                         tool_name_mapping,
@@ -1003,83 +1217,6 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
                     )
                     .await;
             }
-            Err(err) => return Err(err),
-        };
-        let should_prewarm = self.should_prewarm_websocket(&body);
-        let websocket_result = if should_prewarm {
-            match self.send_session_websocket_request(body.clone()).await {
-                Ok(result) => Ok(result),
-                Err(SdkError::RateLimited { .. }) => {
-                    match self.ensure_websocket_connection(&websocket_headers).await {
-                        Ok(_) => {}
-                        Err(err)
-                            if transport_selection.fallback_http
-                                && should_fallback_to_http_after_websocket_error(&err) =>
-                        {
-                            self.activate_http_fallback("websocket_http_fallback");
-                            return self
-                                .stream_http_request(
-                                    body,
-                                    options.include_raw_chunks,
-                                    transport_selection.requested,
-                                    &options.headers,
-                                    warnings,
-                                    tool_name_mapping,
-                                    approval_request_id_map,
-                                    store_for_stream,
-                                    logprobs_enabled,
-                                )
-                                .await;
-                        }
-                        Err(err) => return Err(err),
-                    }
-                    match self.prewarm_websocket_session(&body).await {
-                        Ok(()) => self.send_session_websocket_request(body.clone()).await,
-                        Err(err)
-                            if transport_selection.fallback_http
-                                && should_fallback_to_http_after_websocket_error(&err) =>
-                        {
-                            self.activate_http_fallback("websocket_http_fallback");
-                            return self
-                                .stream_http_request(
-                                    body,
-                                    options.include_raw_chunks,
-                                    transport_selection.requested,
-                                    &options.headers,
-                                    warnings,
-                                    tool_name_mapping,
-                                    approval_request_id_map,
-                                    store_for_stream,
-                                    logprobs_enabled,
-                                )
-                                .await;
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
-                Err(err)
-                    if transport_selection.fallback_http
-                        && should_fallback_to_http_after_websocket_error(&err) =>
-                {
-                    self.activate_http_fallback("websocket_http_fallback");
-                    return self
-                        .stream_http_request(
-                            body,
-                            options.include_raw_chunks,
-                            transport_selection.requested,
-                            &options.headers,
-                            warnings,
-                            tool_name_mapping,
-                            approval_request_id_map,
-                            store_for_stream,
-                            logprobs_enabled,
-                        )
-                        .await;
-                }
-                Err(err) => return Err(err),
-            }
-        } else {
-            self.send_session_websocket_request(body.clone()).await
         };
         let (
             session_body,
@@ -1088,18 +1225,18 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
             transport_headers,
             previous_response_id_used,
             warmup_response_id_used,
-        ) = match websocket_result {
+        ) = match self
+            .send_session_websocket_request_with_prewarm(&body, &websocket_headers)
+            .await
+        {
             Ok(result) => result,
-            Err(err)
-                if transport_selection.fallback_http
-                    && should_fallback_to_http_after_websocket_error(&err) =>
-            {
-                self.activate_http_fallback("websocket_http_fallback");
+            Err(err) => {
                 return self
-                    .stream_http_request(
+                    .stream_http_on_websocket_error(
+                        err,
+                        transport_selection,
                         body,
                         options.include_raw_chunks,
-                        transport_selection.requested,
                         &options.headers,
                         warnings,
                         tool_name_mapping,
@@ -1109,7 +1246,6 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
                     )
                     .await;
             }
-            Err(err) => return Err(err),
         };
         let response_headers = self.response_headers(
             transport_headers,
@@ -1349,31 +1485,8 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
         );
         let tool_name_mapping = build_tool_name_mapping(&options.tools);
         let (body, warnings) = build_request_body(&options, &self.model_id, &self.config)?;
-        // Use non-streaming JSON call to Responses API
-        let url = self.endpoint_url();
-        let hdrs = self.request_headers(&options.headers);
-        let headers: Vec<(String, String)> = hdrs
-            .into_iter()
-            .map(|(k, v)| (Self::canonicalize_header(&k), v))
-            .collect();
-        let (json, _res_headers) = self
-            .http
-            .post_json(&url, &headers, &body, &self.transport_cfg)
-            .await
-            .map_err(map_transport_error)?;
-
-        if let Some(error) = json.get("error").filter(|v| !v.is_null()) {
-            let message = error
-                .get("message")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| error.to_string());
-            return Err(SdkError::Upstream {
-                status: 400,
-                message,
-                source: None,
-            });
-        }
+        let json = self.post_response_json(&body, &options.headers).await?;
+        maybe_openai_response_error(&json)?;
 
         let approval_request_id_map = extract_approval_request_id_to_tool_call_id(
             &options.prompt,
@@ -1381,60 +1494,9 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModel for OpenAIResponses
         );
         let (content, has_function_calls) =
             extract_response_content(&json, &tool_name_mapping, &approval_request_id_map);
-
-        // Usage best-effort
-        let mut usage = v2t::Usage::default();
-        let usage_val = json
-            .get("usage")
-            .or_else(|| json.get("response").and_then(|r| r.get("usage")));
-        if let Some(u) = usage_val.and_then(parse_openai_usage) {
-            usage.input_tokens = Some(u.input_tokens as u64);
-            usage.output_tokens = Some(u.output_tokens as u64);
-            usage.total_tokens = Some(u.total_tokens as u64);
-            if let Some(v) = u.cache_read_tokens {
-                usage.cached_input_tokens = Some(v as u64);
-            }
-        }
-        if let Some(raw_usage) = usage_val {
-            apply_openai_usage_details(raw_usage, &mut usage);
-        }
-
-        // Finish reason mapping
-        let finish_hint = json
-            .get("incomplete_details")
-            .and_then(|v| v.get("reason"))
-            .and_then(|v| v.as_str());
-        let finish_reason = map_finish_reason(finish_hint, has_function_calls);
-
-        // Provider metadata: responseId and serviceTier
-        let mut provider_metadata: Option<
-            std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>>,
-        > = None;
-        let resp_id = json.get("id").and_then(|v| v.as_str()).or_else(|| {
-            json.get("response")
-                .and_then(|r| r.get("id"))
-                .and_then(|v| v.as_str())
-        });
-        let tier = json
-            .get("service_tier")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                json.get("response")
-                    .and_then(|r| r.get("service_tier"))
-                    .and_then(|v| v.as_str())
-            });
-        if resp_id.is_some() || tier.is_some() {
-            let mut outer = std::collections::HashMap::new();
-            let mut inner = std::collections::HashMap::new();
-            if let Some(rid) = resp_id {
-                inner.insert("responseId".into(), serde_json::json!(rid));
-            }
-            if let Some(st) = tier {
-                inner.insert("serviceTier".into(), serde_json::json!(st));
-            }
-            outer.insert("openai".into(), inner);
-            provider_metadata = Some(outer);
-        }
+        let usage = extract_openai_generate_usage(&json);
+        let finish_reason = extract_openai_finish_reason(&json, has_function_calls);
+        let provider_metadata = extract_openai_generate_provider_metadata(&json);
 
         Ok(GenerateResponse {
             content,
@@ -1557,6 +1619,82 @@ pub(super) fn parse_openai_usage(u: &serde_json::Value) -> Option<TokenUsage> {
     })
 }
 
+fn maybe_openai_response_error(json: &Value) -> Result<(), SdkError> {
+    let Some(error) = json.get("error").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+
+    let message = error
+        .get("message")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| error.to_string());
+    Err(SdkError::Upstream {
+        status: 400,
+        message,
+        source: None,
+    })
+}
+
+fn extract_openai_generate_usage(json: &Value) -> v2t::Usage {
+    let mut usage = v2t::Usage::default();
+    let usage_val = json.get("usage").or_else(|| {
+        json.get("response")
+            .and_then(|response| response.get("usage"))
+    });
+
+    if let Some(usage_tokens) = usage_val.and_then(parse_openai_usage) {
+        usage.input_tokens = Some(usage_tokens.input_tokens as u64);
+        usage.output_tokens = Some(usage_tokens.output_tokens as u64);
+        usage.total_tokens = Some(usage_tokens.total_tokens as u64);
+        if let Some(cached_input_tokens) = usage_tokens.cache_read_tokens {
+            usage.cached_input_tokens = Some(cached_input_tokens as u64);
+        }
+    }
+    if let Some(raw_usage) = usage_val {
+        apply_openai_usage_details(raw_usage, &mut usage);
+    }
+
+    usage
+}
+
+fn extract_openai_finish_reason(json: &Value, has_function_calls: bool) -> v2t::FinishReason {
+    let finish_hint = json
+        .get("incomplete_details")
+        .and_then(|value| value.get("reason"))
+        .and_then(|value| value.as_str());
+    map_finish_reason(finish_hint, has_function_calls)
+}
+
+fn extract_openai_generate_provider_metadata(json: &Value) -> Option<v2t::ProviderMetadata> {
+    let response_id = openai_response_field(json, "id");
+    let service_tier = openai_response_field(json, "service_tier");
+    if response_id.is_none() && service_tier.is_none() {
+        return None;
+    }
+
+    let mut outer = HashMap::new();
+    let mut inner = HashMap::new();
+    if let Some(response_id) = response_id {
+        inner.insert("responseId".into(), json!(response_id));
+    }
+    if let Some(service_tier) = service_tier {
+        inner.insert("serviceTier".into(), json!(service_tier));
+    }
+    outer.insert("openai".into(), inner);
+    Some(outer)
+}
+
+fn openai_response_field<'a>(json: &'a Value, field: &str) -> Option<&'a str> {
+    json.get(field)
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            json.get("response")
+                .and_then(|response| response.get(field))
+                .and_then(|value| value.as_str())
+        })
+}
+
 fn parse_openai_cached_input_tokens(u: &serde_json::Value) -> Option<u64> {
     u.get("input_tokens_details")
         .and_then(|v| v.get("cached_tokens"))
@@ -1612,530 +1750,6 @@ pub(super) fn normalize_object_schema(schema: &serde_json::Value) -> serde_json:
     }
 }
 
-/* Legacy in-file provider-tools copy removed.
-   Live owner: src/providers/openai/responses/provider_tools.rs
-#[allow(dead_code)]
-mod legacy_provider_tools_request_side {
-    use super::*;
-
-    fn invalid_tool_args(tool: &v2t::ProviderTool, message: impl Into<String>) -> SdkError {
-        SdkError::InvalidArgument {
-            message: format!(
-                "provider tool {} ({}): {}",
-                tool.name,
-                tool.id,
-                message.into()
-            ),
-        }
-    }
-
-    fn require_args_object(tool: &v2t::ProviderTool) -> Result<&Map<String, Value>, SdkError> {
-        tool.args
-            .as_object()
-            .ok_or_else(|| invalid_tool_args(tool, "args must be an object"))
-    }
-
-    fn require_field<'a>(
-        tool: &v2t::ProviderTool,
-        args: &'a Map<String, Value>,
-        key: &str,
-    ) -> Result<&'a Value, SdkError> {
-        args.get(key)
-            .ok_or_else(|| invalid_tool_args(tool, format!("args.{key} is required")))
-    }
-
-    fn expect_string(tool: &v2t::ProviderTool, value: &Value, path: &str) -> Result<(), SdkError> {
-        if value.as_str().is_some() {
-            Ok(())
-        } else {
-            Err(invalid_tool_args(tool, format!("{path} must be a string")))
-        }
-    }
-
-    fn expect_bool(tool: &v2t::ProviderTool, value: &Value, path: &str) -> Result<(), SdkError> {
-        if value.as_bool().is_some() {
-            Ok(())
-        } else {
-            Err(invalid_tool_args(tool, format!("{path} must be a boolean")))
-        }
-    }
-
-    fn expect_number(tool: &v2t::ProviderTool, value: &Value, path: &str) -> Result<(), SdkError> {
-        if value.as_f64().is_some() {
-            Ok(())
-        } else {
-            Err(invalid_tool_args(tool, format!("{path} must be a number")))
-        }
-    }
-
-    fn expect_int_range(
-        tool: &v2t::ProviderTool,
-        value: &Value,
-        path: &str,
-        min: i64,
-        max: i64,
-    ) -> Result<(), SdkError> {
-        let raw = value
-            .as_i64()
-            .or_else(|| value.as_u64().and_then(|v| i64::try_from(v).ok()))
-            .or_else(|| {
-                value.as_f64().filter(|v| v.fract() == 0.0).and_then(|v| {
-                    if v >= i64::MIN as f64 && v <= i64::MAX as f64 {
-                        Some(v as i64)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .ok_or_else(|| invalid_tool_args(tool, format!("{path} must be an integer")))?;
-        if raw < min || raw > max {
-            return Err(invalid_tool_args(
-                tool,
-                format!("{path} must be between {min} and {max}"),
-            ));
-        }
-        Ok(())
-    }
-
-    fn expect_enum(
-        tool: &v2t::ProviderTool,
-        value: &Value,
-        path: &str,
-        allowed: &[&str],
-    ) -> Result<(), SdkError> {
-        match value.as_str() {
-            Some(val) if allowed.contains(&val) => Ok(()),
-            Some(_) => Err(invalid_tool_args(
-                tool,
-                format!("{path} must be one of {}", allowed.join(", ")),
-            )),
-            None => Err(invalid_tool_args(
-                tool,
-                format!("{path} must be one of {}", allowed.join(", ")),
-            )),
-        }
-    }
-
-    fn expect_string_array(
-        tool: &v2t::ProviderTool,
-        value: &Value,
-        path: &str,
-    ) -> Result<(), SdkError> {
-        let arr = value
-            .as_array()
-            .ok_or_else(|| invalid_tool_args(tool, format!("{path} must be an array")))?;
-        if arr.iter().all(|item| item.as_str().is_some()) {
-            Ok(())
-        } else {
-            Err(invalid_tool_args(
-                tool,
-                format!("{path} must be an array of strings"),
-            ))
-        }
-    }
-
-    fn expect_object<'a>(
-        tool: &v2t::ProviderTool,
-        value: &'a Value,
-        path: &str,
-    ) -> Result<&'a Map<String, Value>, SdkError> {
-        value
-            .as_object()
-            .ok_or_else(|| invalid_tool_args(tool, format!("{path} must be an object")))
-    }
-
-    fn ensure_known_keys(
-        tool: &v2t::ProviderTool,
-        args: &Map<String, Value>,
-        allowed: &[&str],
-    ) -> Result<(), SdkError> {
-        let mut unknown = args
-            .keys()
-            .filter(|key| !allowed.contains(&key.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if unknown.is_empty() {
-            return Ok(());
-        }
-        unknown.sort();
-        Err(invalid_tool_args(
-            tool,
-            format!("args contains unsupported keys: {}", unknown.join(", ")),
-        ))
-    }
-
-    fn validate_user_location(
-        tool: &v2t::ProviderTool,
-        value: &Value,
-        path: &str,
-    ) -> Result<(), SdkError> {
-        let obj = expect_object(tool, value, path)?;
-        let loc_type = obj.get("type").ok_or_else(|| {
-            invalid_tool_args(tool, format!("{path}.type must be \"approximate\""))
-        })?;
-        expect_enum(tool, loc_type, &format!("{path}.type"), &["approximate"])?;
-        for key in ["country", "city", "region", "timezone"] {
-            if let Some(val) = obj.get(key) {
-                expect_string(tool, val, &format!("{path}.{key}"))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_file_search_filter(
-        tool: &v2t::ProviderTool,
-        value: &Value,
-        path: &str,
-    ) -> Result<(), SdkError> {
-        let obj = expect_object(tool, value, path)?;
-        let filter_type = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| invalid_tool_args(tool, format!("{path}.type is required")))?;
-        match filter_type {
-            "and" | "or" => {
-                let filters = obj.get("filters").ok_or_else(|| {
-                    invalid_tool_args(tool, format!("{path}.filters is required"))
-                })?;
-                let arr = filters.as_array().ok_or_else(|| {
-                    invalid_tool_args(tool, format!("{path}.filters must be an array"))
-                })?;
-                for (idx, entry) in arr.iter().enumerate() {
-                    validate_file_search_filter(tool, entry, &format!("{path}.filters[{idx}]"))?;
-                }
-                Ok(())
-            }
-            "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "in" | "nin" => {
-                let key = obj
-                    .get("key")
-                    .ok_or_else(|| invalid_tool_args(tool, format!("{path}.key is required")))?;
-                expect_string(tool, key, &format!("{path}.key"))?;
-                let val = obj
-                    .get("value")
-                    .ok_or_else(|| invalid_tool_args(tool, format!("{path}.value is required")))?;
-                if val.as_str().is_some() || val.as_bool().is_some() || val.as_f64().is_some() {
-                    return Ok(());
-                }
-                if let Some(arr) = val.as_array() {
-                    if arr.iter().all(|item| item.as_str().is_some()) {
-                        return Ok(());
-                    }
-                }
-                Err(invalid_tool_args(
-                    tool,
-                    format!("{path}.value must be a string, number, boolean, or array of strings"),
-                ))
-            }
-            _ => Err(invalid_tool_args(
-                tool,
-                format!("{path}.type has an invalid value"),
-            )),
-        }
-    }
-
-    pub(super) fn validate_openai_provider_tool_args(
-        tool_type: &str,
-        tool: &v2t::ProviderTool,
-    ) -> Result<(), SdkError> {
-        match tool_type {
-            "file_search" => {
-                let args = require_args_object(tool)?;
-                let ids = require_field(tool, args, "vectorStoreIds")?;
-                expect_string_array(tool, ids, "args.vectorStoreIds")?;
-                if let Some(max) = args.get("maxNumResults") {
-                    expect_number(tool, max, "args.maxNumResults")?;
-                }
-                if let Some(rank) = args.get("ranking") {
-                    let rank_obj = expect_object(tool, rank, "args.ranking")?;
-                    if let Some(ranker) = rank_obj.get("ranker") {
-                        expect_string(tool, ranker, "args.ranking.ranker")?;
-                    }
-                    if let Some(score) = rank_obj.get("scoreThreshold") {
-                        expect_number(tool, score, "args.ranking.scoreThreshold")?;
-                    }
-                }
-                if let Some(filters) = args.get("filters") {
-                    validate_file_search_filter(tool, filters, "args.filters")?;
-                }
-                Ok(())
-            }
-            "web_search_preview" => {
-                let args = require_args_object(tool)?;
-                if let Some(size) = args.get("searchContextSize") {
-                    expect_enum(
-                        tool,
-                        size,
-                        "args.searchContextSize",
-                        &["low", "medium", "high"],
-                    )?;
-                }
-                if let Some(loc) = args.get("userLocation") {
-                    validate_user_location(tool, loc, "args.userLocation")?;
-                }
-                Ok(())
-            }
-            "web_search" => {
-                let args = require_args_object(tool)?;
-                if let Some(access) = args.get("externalWebAccess") {
-                    expect_bool(tool, access, "args.externalWebAccess")?;
-                }
-                if let Some(filters) = args.get("filters") {
-                    let obj = expect_object(tool, filters, "args.filters")?;
-                    if let Some(domains) = obj.get("allowedDomains") {
-                        expect_string_array(tool, domains, "args.filters.allowedDomains")?;
-                    }
-                }
-                if let Some(size) = args.get("searchContextSize") {
-                    expect_enum(
-                        tool,
-                        size,
-                        "args.searchContextSize",
-                        &["low", "medium", "high"],
-                    )?;
-                }
-                if let Some(loc) = args.get("userLocation") {
-                    validate_user_location(tool, loc, "args.userLocation")?;
-                }
-                Ok(())
-            }
-            "code_interpreter" => {
-                let args = require_args_object(tool)?;
-                if let Some(container) = args.get("container") {
-                    if let Some(obj) = container.as_object() {
-                        if let Some(file_ids) = obj.get("fileIds") {
-                            expect_string_array(tool, file_ids, "args.container.fileIds")?;
-                        }
-                    } else if container.as_str().is_none() {
-                        return Err(invalid_tool_args(
-                            tool,
-                            "args.container must be a string or object",
-                        ));
-                    }
-                }
-                Ok(())
-            }
-            "image_generation" => {
-                let args = require_args_object(tool)?;
-                ensure_known_keys(
-                    tool,
-                    args,
-                    &[
-                        "background",
-                        "inputFidelity",
-                        "inputImageMask",
-                        "model",
-                        "moderation",
-                        "outputCompression",
-                        "outputFormat",
-                        "partialImages",
-                        "quality",
-                        "size",
-                    ],
-                )?;
-                if let Some(background) = args.get("background") {
-                    expect_enum(
-                        tool,
-                        background,
-                        "args.background",
-                        &["auto", "opaque", "transparent"],
-                    )?;
-                }
-                if let Some(fidelity) = args.get("inputFidelity") {
-                    expect_enum(tool, fidelity, "args.inputFidelity", &["low", "high"])?;
-                }
-                if let Some(mask) = args.get("inputImageMask") {
-                    let mask_obj = expect_object(tool, mask, "args.inputImageMask")?;
-                    if let Some(file_id) = mask_obj.get("fileId") {
-                        expect_string(tool, file_id, "args.inputImageMask.fileId")?;
-                    }
-                    if let Some(image_url) = mask_obj.get("imageUrl") {
-                        expect_string(tool, image_url, "args.inputImageMask.imageUrl")?;
-                    }
-                }
-                if let Some(model) = args.get("model") {
-                    expect_string(tool, model, "args.model")?;
-                }
-                if let Some(moderation) = args.get("moderation") {
-                    expect_enum(tool, moderation, "args.moderation", &["auto"])?;
-                }
-                if let Some(output_compression) = args.get("outputCompression") {
-                    expect_int_range(tool, output_compression, "args.outputCompression", 0, 100)?;
-                }
-                if let Some(output_format) = args.get("outputFormat") {
-                    expect_enum(
-                        tool,
-                        output_format,
-                        "args.outputFormat",
-                        &["png", "jpeg", "webp"],
-                    )?;
-                }
-                if let Some(partial_images) = args.get("partialImages") {
-                    expect_int_range(tool, partial_images, "args.partialImages", 0, 3)?;
-                }
-                if let Some(quality) = args.get("quality") {
-                    expect_enum(
-                        tool,
-                        quality,
-                        "args.quality",
-                        &["auto", "low", "medium", "high"],
-                    )?;
-                }
-                if let Some(size) = args.get("size") {
-                    expect_enum(
-                        tool,
-                        size,
-                        "args.size",
-                        &["1024x1024", "1024x1536", "1536x1024", "auto"],
-                    )?;
-                }
-                Ok(())
-            }
-            "mcp" => {
-                let args = require_args_object(tool)?;
-                let server_label = require_field(tool, args, "serverLabel")?;
-                expect_string(tool, server_label, "args.serverLabel")?;
-                let server_url = args.get("serverUrl");
-                let connector_id = args.get("connectorId");
-                if let Some(url) = server_url {
-                    expect_string(tool, url, "args.serverUrl")?;
-                }
-                if let Some(connector) = connector_id {
-                    expect_string(tool, connector, "args.connectorId")?;
-                }
-                if server_url.is_none() && connector_id.is_none() {
-                    return Err(invalid_tool_args(
-                        tool,
-                        "args.serverUrl or args.connectorId is required",
-                    ));
-                }
-                if let Some(allowed) = args.get("allowedTools") {
-                    if let Some(arr) = allowed.as_array() {
-                        for (idx, entry) in arr.iter().enumerate() {
-                            expect_string(tool, entry, &format!("args.allowedTools[{idx}]"))?;
-                        }
-                    } else if let Some(obj) = allowed.as_object() {
-                        if let Some(read_only) = obj.get("readOnly") {
-                            expect_bool(tool, read_only, "args.allowedTools.readOnly")?;
-                        }
-                        if let Some(tool_names) = obj.get("toolNames") {
-                            expect_string_array(tool, tool_names, "args.allowedTools.toolNames")?;
-                        }
-                    } else {
-                        return Err(invalid_tool_args(
-                            tool,
-                            "args.allowedTools must be an array or object",
-                        ));
-                    }
-                }
-                if let Some(authorization) = args.get("authorization") {
-                    expect_string(tool, authorization, "args.authorization")?;
-                }
-                if let Some(headers) = args.get("headers") {
-                    let obj = expect_object(tool, headers, "args.headers")?;
-                    for (key, val) in obj {
-                        expect_string(tool, val, &format!("args.headers.{key}"))?;
-                    }
-                }
-                if let Some(require_approval) = args.get("requireApproval") {
-                    if let Some(val) = require_approval.as_str() {
-                        if val != "always" && val != "never" {
-                            return Err(invalid_tool_args(
-                                tool,
-                                "args.requireApproval must be \"always\" or \"never\"",
-                            ));
-                        }
-                    } else if let Some(obj) = require_approval.as_object() {
-                        if let Some(never) = obj.get("never") {
-                            let never_obj =
-                                expect_object(tool, never, "args.requireApproval.never")?;
-                            if let Some(tool_names) = never_obj.get("toolNames") {
-                                expect_string_array(
-                                    tool,
-                                    tool_names,
-                                    "args.requireApproval.never.toolNames",
-                                )?;
-                            }
-                        }
-                    } else {
-                        return Err(invalid_tool_args(
-                            tool,
-                            "args.requireApproval must be a string or object",
-                        ));
-                    }
-                }
-                if let Some(server_description) = args.get("serverDescription") {
-                    expect_string(tool, server_description, "args.serverDescription")?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    #[derive(Clone, Default)]
-    pub(super) struct ToolNameMapping {
-        custom_to_provider: HashMap<String, String>,
-        provider_to_custom: HashMap<String, String>,
-        web_search_tool_name: Option<String>,
-    }
-
-    impl ToolNameMapping {
-        pub(super) fn to_provider_tool_name<'a>(&'a self, custom_tool_name: &'a str) -> &'a str {
-            self.custom_to_provider
-                .get(custom_tool_name)
-                .map(|s| s.as_str())
-                .unwrap_or(custom_tool_name)
-        }
-
-        pub(super) fn to_custom_tool_name<'a>(&'a self, provider_tool_name: &'a str) -> &'a str {
-            self.provider_to_custom
-                .get(provider_tool_name)
-                .map(|s| s.as_str())
-                .unwrap_or(provider_tool_name)
-        }
-    }
-
-    pub(super) fn openai_provider_tool_name(id: &str) -> Option<&'static str> {
-        match id {
-            "openai.file_search" => Some("file_search"),
-            "openai.local_shell" => Some("local_shell"),
-            "openai.shell" => Some("shell"),
-            "openai.apply_patch" => Some("apply_patch"),
-            "openai.web_search_preview" => Some("web_search_preview"),
-            "openai.web_search" => Some("web_search"),
-            "openai.code_interpreter" => Some("code_interpreter"),
-            "openai.image_generation" => Some("image_generation"),
-            "openai.mcp" => Some("mcp"),
-            _ => None,
-        }
-    }
-
-    pub(super) fn build_tool_name_mapping(tools: &[v2t::Tool]) -> ToolNameMapping {
-        let mut mapping = ToolNameMapping::default();
-        for tool in tools {
-            if let v2t::Tool::Provider(provider_tool) = tool {
-                if let Some(provider_name) = openai_provider_tool_name(&provider_tool.id) {
-                    mapping
-                        .custom_to_provider
-                        .insert(provider_tool.name.clone(), provider_name.to_string());
-                    mapping
-                        .provider_to_custom
-                        .insert(provider_name.to_string(), provider_tool.name.clone());
-                    if matches!(
-                        provider_tool.id.as_str(),
-                        "openai.web_search" | "openai.web_search_preview"
-                    ) && mapping.web_search_tool_name.is_none()
-                    {
-                        mapping.web_search_tool_name = Some(provider_tool.name.clone());
-                    }
-                }
-            }
-        }
-        mapping
-    }
-}
-*/
-
 fn extract_approval_request_id_to_tool_call_id(
     prompt: &[v2t::PromptMessage],
     provider_scope_name: &str,
@@ -2160,641 +1774,6 @@ fn extract_approval_request_id_to_tool_call_id(
     }
     mapping
 }
-
-/* Legacy in-file provider-tools output reconstruction copy removed.
-   Live owner: src/providers/openai/responses/provider_tools.rs
-#[allow(dead_code)]
-mod legacy_provider_tools_output_side {
-    use super::legacy_provider_tools_request_side::{
-        openai_provider_tool_name, validate_openai_provider_tool_args,
-    };
-    use super::*;
-
-    fn map_web_search_output(action: &serde_json::Value) -> Option<serde_json::Value> {
-        let obj = action.as_object()?;
-        let action_type = obj.get("type")?.as_str()?;
-        match action_type {
-            "search" => {
-                let mut out = serde_json::Map::new();
-                let mut inner = serde_json::Map::new();
-                inner.insert("type".into(), serde_json::Value::String("search".into()));
-                if let Some(query) = obj.get("query") {
-                    if !query.is_null() {
-                        inner.insert("query".into(), query.clone());
-                    }
-                }
-                out.insert("action".into(), serde_json::Value::Object(inner));
-                if let Some(sources) = obj.get("sources") {
-                    if !sources.is_null() {
-                        out.insert("sources".into(), sources.clone());
-                    }
-                }
-                Some(serde_json::Value::Object(out))
-            }
-            "open_page" => Some(json!({
-                "action": {
-                    "type": "openPage",
-                    "url": obj.get("url").cloned().unwrap_or(serde_json::Value::Null),
-                }
-            })),
-            "find_in_page" => Some(json!({
-                "action": {
-                    "type": "findInPage",
-                    "url": obj.get("url").cloned().unwrap_or(serde_json::Value::Null),
-                    "pattern": obj.get("pattern").cloned().unwrap_or(serde_json::Value::Null),
-                }
-            })),
-            _ => None,
-        }
-    }
-
-    pub(super) fn build_openai_provider_tool(
-        tool: &v2t::ProviderTool,
-    ) -> Result<Option<serde_json::Value>, SdkError> {
-        let empty = serde_json::Map::new();
-        let tool_type = match openai_provider_tool_name(&tool.id) {
-            Some(tool_type) => tool_type,
-            None => return Ok(None),
-        };
-        validate_openai_provider_tool_args(tool_type, tool)?;
-        let args = tool.args.as_object().unwrap_or(&empty);
-        let val = match tool_type {
-            "file_search" => {
-                let mut obj = serde_json::Map::new();
-                obj.insert("type".into(), json!("file_search"));
-                if let Some(ids) = args.get("vectorStoreIds") {
-                    obj.insert("vector_store_ids".into(), ids.clone());
-                }
-                if let Some(max) = args.get("maxNumResults") {
-                    obj.insert("max_num_results".into(), max.clone());
-                }
-                if let Some(rank) = args.get("ranking").and_then(|v| v.as_object()) {
-                    let mut opts = serde_json::Map::new();
-                    if let Some(ranker) = rank.get("ranker") {
-                        opts.insert("ranker".into(), ranker.clone());
-                    }
-                    if let Some(score) = rank.get("scoreThreshold") {
-                        opts.insert("score_threshold".into(), score.clone());
-                    }
-                    if !opts.is_empty() {
-                        obj.insert("ranking_options".into(), serde_json::Value::Object(opts));
-                    }
-                }
-                if let Some(filters) = args.get("filters") {
-                    obj.insert("filters".into(), filters.clone());
-                }
-                Some(serde_json::Value::Object(obj))
-            }
-            "local_shell" => Some(json!({"type":"local_shell"})),
-            "shell" => Some(json!({"type":"shell"})),
-            "apply_patch" => Some(json!({"type":"apply_patch"})),
-            "web_search_preview" => {
-                let mut obj = serde_json::Map::new();
-                obj.insert("type".into(), json!("web_search_preview"));
-                if let Some(size) = args.get("searchContextSize") {
-                    obj.insert("search_context_size".into(), size.clone());
-                }
-                if let Some(loc) = args.get("userLocation") {
-                    obj.insert("user_location".into(), loc.clone());
-                }
-                Some(serde_json::Value::Object(obj))
-            }
-            "web_search" => {
-                let mut obj = serde_json::Map::new();
-                obj.insert("type".into(), json!("web_search"));
-                if let Some(filters) = args.get("filters").and_then(|v| v.as_object()) {
-                    if let Some(allowed_domains) = filters.get("allowedDomains") {
-                        obj.insert(
-                            "filters".into(),
-                            json!({"allowed_domains": allowed_domains}),
-                        );
-                    }
-                }
-                if let Some(access) = args.get("externalWebAccess") {
-                    obj.insert("external_web_access".into(), access.clone());
-                }
-                if let Some(size) = args.get("searchContextSize") {
-                    obj.insert("search_context_size".into(), size.clone());
-                }
-                if let Some(loc) = args.get("userLocation") {
-                    obj.insert("user_location".into(), loc.clone());
-                }
-                Some(serde_json::Value::Object(obj))
-            }
-            "code_interpreter" => {
-                let mut obj = serde_json::Map::new();
-                obj.insert("type".into(), json!("code_interpreter"));
-                let container = match args.get("container") {
-                    None | Some(serde_json::Value::Null) => json!({"type":"auto"}),
-                    Some(serde_json::Value::String(val)) => json!(val),
-                    Some(serde_json::Value::Object(map)) => {
-                        let mut c = serde_json::Map::new();
-                        c.insert("type".into(), json!("auto"));
-                        if let Some(file_ids) = map.get("fileIds") {
-                            c.insert("file_ids".into(), file_ids.clone());
-                        }
-                        serde_json::Value::Object(c)
-                    }
-                    Some(other) => other.clone(),
-                };
-                obj.insert("container".into(), container);
-                Some(serde_json::Value::Object(obj))
-            }
-            "image_generation" => {
-                let mut obj = serde_json::Map::new();
-                obj.insert("type".into(), json!("image_generation"));
-                for (src, dst) in [
-                    ("background", "background"),
-                    ("inputFidelity", "input_fidelity"),
-                    ("model", "model"),
-                    ("moderation", "moderation"),
-                    ("partialImages", "partial_images"),
-                    ("quality", "quality"),
-                    ("outputCompression", "output_compression"),
-                    ("outputFormat", "output_format"),
-                    ("size", "size"),
-                ] {
-                    if let Some(val) = args.get(src) {
-                        obj.insert(dst.into(), val.clone());
-                    }
-                }
-                if let Some(mask) = args.get("inputImageMask").and_then(|v| v.as_object()) {
-                    let mut mask_obj = serde_json::Map::new();
-                    if let Some(file_id) = mask.get("fileId") {
-                        mask_obj.insert("file_id".into(), file_id.clone());
-                    }
-                    if let Some(image_url) = mask.get("imageUrl") {
-                        mask_obj.insert("image_url".into(), image_url.clone());
-                    }
-                    if !mask_obj.is_empty() {
-                        obj.insert(
-                            "input_image_mask".into(),
-                            serde_json::Value::Object(mask_obj),
-                        );
-                    }
-                }
-                Some(serde_json::Value::Object(obj))
-            }
-            "mcp" => {
-                let mut obj = serde_json::Map::new();
-                obj.insert("type".into(), json!("mcp"));
-                if let Some(val) = args.get("serverLabel") {
-                    obj.insert("server_label".into(), val.clone());
-                }
-                if let Some(val) = args.get("authorization") {
-                    obj.insert("authorization".into(), val.clone());
-                }
-                if let Some(val) = args.get("connectorId") {
-                    obj.insert("connector_id".into(), val.clone());
-                }
-                if let Some(val) = args.get("headers") {
-                    obj.insert("headers".into(), val.clone());
-                }
-                if let Some(val) = args.get("serverDescription") {
-                    obj.insert("server_description".into(), val.clone());
-                }
-                if let Some(val) = args.get("serverUrl") {
-                    obj.insert("server_url".into(), val.clone());
-                }
-                if let Some(allowed) = args.get("allowedTools") {
-                    if let Some(list) = allowed.as_array() {
-                        obj.insert(
-                            "allowed_tools".into(),
-                            serde_json::Value::Array(list.clone()),
-                        );
-                    } else if let Some(filter) = allowed.as_object() {
-                        let mut allowed_obj = serde_json::Map::new();
-                        if let Some(read_only) = filter.get("readOnly") {
-                            allowed_obj.insert("read_only".into(), read_only.clone());
-                        }
-                        if let Some(tool_names) = filter.get("toolNames") {
-                            allowed_obj.insert("tool_names".into(), tool_names.clone());
-                        }
-                        if !allowed_obj.is_empty() {
-                            obj.insert(
-                                "allowed_tools".into(),
-                                serde_json::Value::Object(allowed_obj),
-                            );
-                        }
-                    }
-                }
-                let require_approval = match args.get("requireApproval") {
-                    None | Some(serde_json::Value::Null) => None,
-                    Some(serde_json::Value::String(val)) => {
-                        Some(serde_json::Value::String(val.clone()))
-                    }
-                    Some(serde_json::Value::Object(map)) => map.get("never").map(|never| {
-                        if let Some(filter) = never.as_object() {
-                            let mut filter_obj = serde_json::Map::new();
-                            if let Some(tool_names) = filter.get("toolNames") {
-                                filter_obj.insert("tool_names".into(), tool_names.clone());
-                            }
-                            json!({"never": filter_obj})
-                        } else {
-                            json!({"never": {}})
-                        }
-                    }),
-                    Some(other) => Some(other.clone()),
-                };
-                obj.insert(
-                    "require_approval".into(),
-                    require_approval.unwrap_or_else(|| json!("never")),
-                );
-                Some(serde_json::Value::Object(obj))
-            }
-            _ => None,
-        };
-        Ok(val)
-    }
-
-    fn provider_tool_data_from_output_item(
-        item: &serde_json::Map<String, Value>,
-    ) -> Option<serde_json::Value> {
-        let item_type = item.get("type")?.as_str()?;
-        let item_id = item
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        match item_type {
-            "web_search_call" => {
-                let tool_call_id = item_id.clone()?;
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("web_search"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(true));
-                obj.insert("input".into(), json!({}));
-                if let Some(action) = item.get("action").and_then(map_web_search_output) {
-                    obj.insert("result".into(), action);
-                }
-                Some(serde_json::Value::Object(obj))
-            }
-            "file_search_call" => {
-                let tool_call_id = item_id.clone()?;
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("file_search"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(true));
-                obj.insert("input".into(), json!({}));
-                let results_val = item.get("results").and_then(|v| v.as_array()).map(|arr| {
-                    arr.iter()
-                        .filter_map(|entry| entry.as_object())
-                        .map(|entry| {
-                            let mut mapped = serde_json::Map::new();
-                            if let Some(attributes) = entry.get("attributes") {
-                                mapped.insert("attributes".into(), attributes.clone());
-                            }
-                            if let Some(file_id) = entry.get("file_id") {
-                                mapped.insert("fileId".into(), file_id.clone());
-                            }
-                            if let Some(filename) = entry.get("filename") {
-                                mapped.insert("filename".into(), filename.clone());
-                            }
-                            if let Some(score) = entry.get("score") {
-                                mapped.insert("score".into(), score.clone());
-                            }
-                            if let Some(text) = entry.get("text") {
-                                mapped.insert("text".into(), text.clone());
-                            }
-                            serde_json::Value::Object(mapped)
-                        })
-                        .collect::<Vec<_>>()
-                });
-                let result = json!({
-                    "queries": item.get("queries").cloned().unwrap_or(serde_json::Value::Null),
-                    "results": results_val.map(serde_json::Value::Array).unwrap_or(serde_json::Value::Null),
-                });
-                obj.insert("result".into(), result);
-                Some(serde_json::Value::Object(obj))
-            }
-            "code_interpreter_call" => {
-                let tool_call_id = item_id.clone()?;
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("code_interpreter"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(true));
-                let input = json!({
-                    "code": item.get("code").cloned().unwrap_or(serde_json::Value::Null),
-                    "containerId": item.get("container_id").cloned().unwrap_or(serde_json::Value::Null),
-                });
-                obj.insert("input".into(), input);
-                let result = json!({
-                    "outputs": item.get("outputs").cloned().unwrap_or(serde_json::Value::Null),
-                });
-                obj.insert("result".into(), result);
-                Some(serde_json::Value::Object(obj))
-            }
-            "image_generation_call" => {
-                let tool_call_id = item_id.clone()?;
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("image_generation"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(true));
-                obj.insert("input".into(), json!({}));
-                let result = json!({
-                    "result": item.get("result").cloned().unwrap_or(serde_json::Value::Null),
-                });
-                obj.insert("result".into(), result);
-                Some(serde_json::Value::Object(obj))
-            }
-            "computer_call" => {
-                let tool_call_id = item_id.clone()?;
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("computer_use"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(true));
-                obj.insert("input".into(), json!(""));
-                let status = item
-                    .get("status")
-                    .cloned()
-                    .unwrap_or_else(|| json!("completed"));
-                obj.insert(
-                    "result".into(),
-                    json!({
-                        "type": "computer_use_tool_result",
-                        "status": status,
-                    }),
-                );
-                Some(serde_json::Value::Object(obj))
-            }
-            "local_shell_call" => {
-                let tool_call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| item_id.clone())?;
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("local_shell"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(false));
-                let action = item.get("action").and_then(|v| v.as_object());
-                let mut action_obj = serde_json::Map::new();
-                if let Some(action) = action {
-                    if let Some(command) = action.get("command") {
-                        action_obj.insert("command".into(), command.clone());
-                    }
-                    if let Some(timeout) = action.get("timeout_ms") {
-                        action_obj.insert("timeoutMs".into(), timeout.clone());
-                    }
-                    if let Some(user) = action.get("user") {
-                        action_obj.insert("user".into(), user.clone());
-                    }
-                    if let Some(dir) = action.get("working_directory") {
-                        action_obj.insert("workingDirectory".into(), dir.clone());
-                    }
-                    if let Some(env) = action.get("env") {
-                        action_obj.insert("env".into(), env.clone());
-                    }
-                }
-                if !action_obj.is_empty() {
-                    obj.insert("input".into(), json!({ "action": action_obj }));
-                } else {
-                    obj.insert("input".into(), json!({}));
-                }
-                Some(serde_json::Value::Object(obj))
-            }
-            "shell_call" => {
-                let tool_call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| item_id.clone())?;
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("shell"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(false));
-                let action = item.get("action").and_then(|v| v.as_object());
-                let mut action_obj = serde_json::Map::new();
-                if let Some(action) = action {
-                    if let Some(commands) = action.get("commands") {
-                        action_obj.insert("commands".into(), commands.clone());
-                    }
-                    if let Some(timeout) = action.get("timeout_ms") {
-                        action_obj.insert("timeoutMs".into(), timeout.clone());
-                    }
-                    if let Some(max_len) = action.get("max_output_length") {
-                        action_obj.insert("maxOutputLength".into(), max_len.clone());
-                    }
-                }
-                if !action_obj.is_empty() {
-                    obj.insert("input".into(), json!({ "action": action_obj }));
-                } else {
-                    obj.insert("input".into(), json!({}));
-                }
-                Some(serde_json::Value::Object(obj))
-            }
-            "apply_patch_call" => {
-                let tool_call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| item_id.clone())?;
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("apply_patch"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id.clone()));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(false));
-                let input = json!({
-                    "callId": tool_call_id,
-                    "operation": item.get("operation").cloned().unwrap_or(serde_json::Value::Null),
-                });
-                obj.insert("input".into(), input);
-                Some(serde_json::Value::Object(obj))
-            }
-            "mcp_call" => {
-                let tool_call_id = item_id.clone()?;
-                let name = item.get("name").and_then(|v| v.as_str())?.to_string();
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("mcp"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(true));
-                obj.insert(
-                    "input".into(),
-                    item.get("arguments").cloned().unwrap_or_else(|| json!("")),
-                );
-                obj.insert("mcp_name".into(), json!(name.clone()));
-                if let Some(approval_request_id) =
-                    item.get("approval_request_id").and_then(|v| v.as_str())
-                {
-                    obj.insert("approval_request_id".into(), json!(approval_request_id));
-                }
-                if let Some(server_label) = item.get("server_label") {
-                    obj.insert("server_label".into(), server_label.clone());
-                }
-                let mut result = serde_json::Map::new();
-                result.insert("type".into(), json!("call"));
-                if let Some(server_label) = item.get("server_label") {
-                    result.insert("serverLabel".into(), server_label.clone());
-                }
-                result.insert("name".into(), json!(name));
-                result.insert(
-                    "arguments".into(),
-                    item.get("arguments").cloned().unwrap_or_else(|| json!("")),
-                );
-                if let Some(output) = item.get("output") {
-                    result.insert("output".into(), output.clone());
-                }
-                if let Some(error) = item.get("error") {
-                    result.insert("error".into(), error.clone());
-                }
-                obj.insert("result".into(), serde_json::Value::Object(result));
-                Some(serde_json::Value::Object(obj))
-            }
-            "mcp_approval_request" => {
-                let tool_call_id = item_id.clone()?;
-                let name = item.get("name").and_then(|v| v.as_str())?.to_string();
-                let mut obj = serde_json::Map::new();
-                obj.insert("tool_type".into(), json!("mcp"));
-                obj.insert("tool_call_id".into(), json!(tool_call_id));
-                if let Some(id) = item_id.as_ref() {
-                    obj.insert("item_id".into(), json!(id));
-                }
-                obj.insert("provider_executed".into(), json!(true));
-                obj.insert(
-                    "input".into(),
-                    item.get("arguments").cloned().unwrap_or_else(|| json!("")),
-                );
-                obj.insert("mcp_name".into(), json!(name));
-                let approval_request_id = item
-                    .get("approval_request_id")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string())
-                    .or_else(|| item_id.clone());
-                if let Some(approval_request_id) = approval_request_id {
-                    obj.insert("approval_request_id".into(), json!(approval_request_id));
-                }
-                obj.insert("approval_request".into(), json!(true));
-                if let Some(server_label) = item.get("server_label") {
-                    obj.insert("server_label".into(), server_label.clone());
-                }
-                Some(serde_json::Value::Object(obj))
-            }
-            _ => None,
-        }
-    }
-
-    struct ProviderToolParts {
-        tool_call_id: String,
-        tool_name: String,
-        tool_type: String,
-        input: String,
-        provider_executed: bool,
-        dynamic: bool,
-        result: Option<serde_json::Value>,
-        is_error: bool,
-        provider_metadata: Option<v2t::ProviderMetadata>,
-        approval_request_id: Option<String>,
-        is_approval_request: bool,
-    }
-
-    fn provider_tool_parts_from_data(
-        data: &serde_json::Value,
-        tool_name_mapping: &ToolNameMapping,
-    ) -> Option<ProviderToolParts> {
-        let obj = data.as_object()?;
-        let tool_type = obj.get("tool_type").and_then(|v| v.as_str()).unwrap_or("");
-        let tool_call_id = obj
-            .get("tool_call_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if tool_call_id.is_empty() {
-            return None;
-        }
-        let input_val = obj.get("input").cloned().unwrap_or(serde_json::Value::Null);
-        let input = match input_val {
-            serde_json::Value::String(s) => s,
-            other => other.to_string(),
-        };
-        let dynamic = tool_type == "mcp";
-        let tool_name = if tool_type == "mcp" {
-            obj.get("mcp_name")
-                .and_then(|v| v.as_str())
-                .map(|name| format!("mcp.{name}"))
-                .unwrap_or_else(|| "mcp".into())
-        } else if tool_type == "web_search" {
-            tool_name_mapping
-                .web_search_tool_name
-                .clone()
-                .unwrap_or_else(|| {
-                    tool_name_mapping
-                        .to_custom_tool_name("web_search")
-                        .to_string()
-                })
-        } else {
-            tool_name_mapping.to_custom_tool_name(tool_type).to_string()
-        };
-        let provider_executed = obj
-            .get("provider_executed")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let result = obj.get("result").cloned().filter(|v| !v.is_null());
-        let is_error = obj
-            .get("is_error")
-            .and_then(|v| v.as_bool())
-            .unwrap_or_else(|| {
-                result
-                    .as_ref()
-                    .and_then(|val| val.get("error"))
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false)
-            });
-        let provider_metadata = obj.get("item_id").and_then(|v| v.as_str()).map(|id| {
-            let mut inner = HashMap::new();
-            inner.insert("itemId".into(), serde_json::json!(id));
-            let mut outer = HashMap::new();
-            outer.insert("openai".into(), inner);
-            outer
-        });
-        let approval_request_id = obj
-            .get("approval_request_id")
-            .and_then(|v| v.as_str())
-            .map(|v| v.to_string());
-        let is_approval_request = obj
-            .get("approval_request")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        Some(ProviderToolParts {
-            tool_call_id,
-            tool_name,
-            tool_type: tool_type.to_string(),
-            input,
-            provider_executed,
-            dynamic,
-            result,
-            is_error,
-            provider_metadata,
-            approval_request_id,
-            is_approval_request,
-        })
-    }
-}
-*/
 
 pub(super) fn escape_json_delta(delta: &str) -> String {
     if delta
@@ -2822,6 +1801,678 @@ struct OpenAIToolCallState {
     id: String,
 }
 
+impl OpenAIResponsesChunk {
+    fn output_index(json: &Value) -> Option<usize> {
+        json.get("output_index")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+    }
+
+    fn push_data(events: &mut Vec<Event>, key: impl Into<String>, value: Value) {
+        events.push(Event::Data {
+            key: key.into(),
+            value,
+        });
+    }
+
+    fn flush_pending_tool_call_deltas(
+        &mut self,
+        output_index: usize,
+        call_id: &str,
+        events: &mut Vec<Event>,
+    ) {
+        if let Some(pending) = self.pending_deltas.remove(&output_index) {
+            for delta in pending {
+                events.push(Event::ToolCallDelta {
+                    id: call_id.to_string(),
+                    args_json: delta,
+                });
+            }
+        }
+    }
+
+    fn finish_tool_call(&mut self, output_index: usize, events: &mut Vec<Event>) {
+        if let Some(state) = self.tool_calls.remove(&output_index) {
+            self.flush_pending_tool_call_deltas(output_index, &state.id, events);
+            events.push(Event::ToolCallEnd { id: state.id });
+        }
+    }
+
+    fn close_open_tool_calls(&mut self, events: &mut Vec<Event>) {
+        if self.tool_calls.is_empty() {
+            return;
+        }
+        for (_output_index, state) in self.tool_calls.drain() {
+            events.push(Event::ToolCallEnd { id: state.id });
+        }
+        self.pending_deltas.clear();
+    }
+
+    fn handle_response_created(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(response) = json.get("response") else {
+            return;
+        };
+        let id = response.get("id").cloned().unwrap_or(Value::Null);
+        let model = response.get("model").cloned().unwrap_or(Value::Null);
+        let created_at = response
+            .get("created_at")
+            .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|n| n as i64)))
+            .map(|value| value * 1000);
+        Self::push_data(
+            events,
+            "openai.response_metadata",
+            json!({
+                "id": id,
+                "model": model,
+                "created_at": created_at,
+            }),
+        );
+    }
+
+    fn handle_output_text_event(&self, event_type: &str, json: &Value, events: &mut Vec<Event>) {
+        match event_type {
+            "response.output_text.delta" => self.handle_output_text_delta(json, events),
+            "response.output_text.annotation.added" => {
+                self.handle_output_text_annotation(json, events);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_output_text_delta(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(item_id) = json.get("item_id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let delta = json
+            .get("delta")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if delta.is_empty() {
+            return;
+        }
+        let logprobs = json.get("logprobs").cloned().unwrap_or(Value::Null);
+        Self::push_data(
+            events,
+            "openai.text_delta",
+            json!({
+                "item_id": item_id,
+                "delta": delta,
+                "logprobs": logprobs,
+            }),
+        );
+    }
+
+    fn handle_output_text_annotation(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(item_id) = json.get("item_id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let annotation = json.get("annotation").cloned().unwrap_or(Value::Null);
+        Self::push_data(
+            events,
+            "openai.text_annotation",
+            json!({
+                "item_id": item_id,
+                "annotation": annotation,
+            }),
+        );
+    }
+
+    fn handle_output_item_event(
+        &mut self,
+        event_type: &str,
+        json: &Value,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(item) = json.get("item").and_then(|value| value.as_object()) else {
+            return;
+        };
+        match event_type {
+            "response.output_item.added" => self.handle_output_item_added(json, item, events),
+            "response.output_item.done" => self.handle_output_item_done(json, item, events),
+            _ => {}
+        }
+    }
+
+    fn handle_output_item_added(
+        &mut self,
+        json: &Value,
+        item: &Map<String, Value>,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(item_type) = item.get("type").and_then(|value| value.as_str()) else {
+            return;
+        };
+        match item_type {
+            "function_call" => self.handle_function_call_added(json, item, events),
+            "apply_patch_call" => self.handle_apply_patch_call_added(json, item, events),
+            "message" => Self::handle_message_added(item, events),
+            "reasoning" => Self::handle_reasoning_added(item, events),
+            "web_search_call" => {
+                Self::handle_simple_tool_item_added(item, "openai.web_search_call.added", events)
+            }
+            "file_search_call" => {
+                Self::handle_simple_tool_item_added(item, "openai.file_search_call.added", events)
+            }
+            "image_generation_call" => Self::handle_simple_tool_item_added(
+                item,
+                "openai.image_generation_call.added",
+                events,
+            ),
+            "code_interpreter_call" => self.handle_code_interpreter_call_added(json, item, events),
+            "computer_call" => {
+                Self::handle_simple_tool_item_added(item, "openai.computer_call.added", events)
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_function_call_added(
+        &mut self,
+        json: &Value,
+        item: &Map<String, Value>,
+        events: &mut Vec<Event>,
+    ) {
+        let name = item
+            .get("name")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+        let call_id = item
+            .get("call_id")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+        let output_index = Self::output_index(json);
+
+        if let (Some(call_id), Some(item_id)) = (
+            call_id.as_ref(),
+            item.get("id").and_then(|value| value.as_str()),
+        ) {
+            Self::push_data(
+                events,
+                format!("openai.tool_item_id.{call_id}"),
+                json!({ "item_id": item_id }),
+            );
+        }
+
+        if let (Some(output_index), Some(call_id), Some(tool_name)) = (output_index, call_id, name)
+        {
+            self.tool_calls.insert(
+                output_index,
+                OpenAIToolCallState {
+                    id: call_id.clone(),
+                },
+            );
+            events.push(Event::ToolCallStart {
+                id: call_id.clone(),
+                name: tool_name,
+            });
+            self.flush_pending_tool_call_deltas(output_index, &call_id, events);
+        }
+    }
+
+    fn handle_apply_patch_call_added(
+        &self,
+        json: &Value,
+        item: &Map<String, Value>,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(output_index) = Self::output_index(json) else {
+            return;
+        };
+        let Some(call_id) = item.get("call_id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let operation = item.get("operation").cloned().unwrap_or(Value::Null);
+        Self::push_data(
+            events,
+            "openai.apply_patch_call.added",
+            json!({
+                "output_index": output_index,
+                "call_id": call_id,
+                "operation": operation,
+            }),
+        );
+    }
+
+    fn handle_message_added(item: &Map<String, Value>, events: &mut Vec<Event>) {
+        let Some(item_id) = item.get("id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        Self::push_data(
+            events,
+            "openai.message_added",
+            json!({ "item_id": item_id }),
+        );
+    }
+
+    fn handle_reasoning_added(item: &Map<String, Value>, events: &mut Vec<Event>) {
+        let Some(item_id) = item.get("id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let encrypted_content = item
+            .get("encrypted_content")
+            .cloned()
+            .unwrap_or(Value::Null);
+        Self::push_data(
+            events,
+            "openai.reasoning_added",
+            json!({
+                "item_id": item_id,
+                "encrypted_content": encrypted_content,
+            }),
+        );
+    }
+
+    fn handle_simple_tool_item_added(
+        item: &Map<String, Value>,
+        event_key: &str,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(tool_call_id) = item.get("id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        Self::push_data(events, event_key, json!({ "tool_call_id": tool_call_id }));
+    }
+
+    fn handle_code_interpreter_call_added(
+        &self,
+        json: &Value,
+        item: &Map<String, Value>,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(output_index) = Self::output_index(json) else {
+            return;
+        };
+        let Some(tool_call_id) = item.get("id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let container_id = item
+            .get("container_id")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+        Self::push_data(
+            events,
+            "openai.code_interpreter_call.added",
+            json!({
+                "output_index": output_index,
+                "tool_call_id": tool_call_id,
+                "container_id": container_id,
+            }),
+        );
+    }
+
+    fn handle_output_item_done(
+        &mut self,
+        json: &Value,
+        item: &Map<String, Value>,
+        events: &mut Vec<Event>,
+    ) {
+        match item.get("type").and_then(|value| value.as_str()) {
+            Some("apply_patch_call") => self.handle_apply_patch_call_done(json, item, events),
+            Some("message") => Self::handle_message_done(item, events),
+            Some("reasoning") => Self::handle_reasoning_done(item, events),
+            Some("function_call") => {
+                Self::push_data(events, "openai.function_call_done", json!({}));
+            }
+            _ => {}
+        }
+
+        if let Some(tool_data) = provider_tool_data_from_output_item(item) {
+            Self::push_data(events, "openai.provider_tool", tool_data);
+        }
+
+        if let Some(output_index) = Self::output_index(json) {
+            self.finish_tool_call(output_index, events);
+        }
+    }
+
+    fn handle_apply_patch_call_done(
+        &self,
+        json: &Value,
+        item: &Map<String, Value>,
+        events: &mut Vec<Event>,
+    ) {
+        let Some(output_index) = Self::output_index(json) else {
+            return;
+        };
+        let call_id = item.get("call_id").and_then(|value| value.as_str());
+        let operation = item.get("operation").cloned().unwrap_or(Value::Null);
+        Self::push_data(
+            events,
+            "openai.apply_patch_call.done",
+            json!({
+                "output_index": output_index,
+                "call_id": call_id,
+                "operation": operation,
+            }),
+        );
+    }
+
+    fn handle_message_done(item: &Map<String, Value>, events: &mut Vec<Event>) {
+        let Some(item_id) = item.get("id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        Self::push_data(events, "openai.message_done", json!({ "item_id": item_id }));
+    }
+
+    fn handle_reasoning_done(item: &Map<String, Value>, events: &mut Vec<Event>) {
+        let Some(item_id) = item.get("id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let encrypted_content = item
+            .get("encrypted_content")
+            .cloned()
+            .unwrap_or(Value::Null);
+        Self::push_data(
+            events,
+            "openai.reasoning_done",
+            json!({
+                "item_id": item_id,
+                "encrypted_content": encrypted_content,
+            }),
+        );
+    }
+
+    fn handle_function_call_arguments_event(
+        &mut self,
+        event_type: &str,
+        json: &Value,
+        events: &mut Vec<Event>,
+    ) {
+        if event_type != "response.function_call_arguments.delta" {
+            return;
+        }
+        let Some(output_index) = Self::output_index(json) else {
+            return;
+        };
+        let delta = json
+            .get("delta")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(state) = self.tool_calls.get(&output_index) {
+            events.push(Event::ToolCallDelta {
+                id: state.id.clone(),
+                args_json: delta,
+            });
+        } else {
+            self.pending_deltas
+                .entry(output_index)
+                .or_default()
+                .push(delta);
+        }
+    }
+
+    fn handle_code_interpreter_event(
+        &self,
+        event_type: &str,
+        json: &Value,
+        events: &mut Vec<Event>,
+    ) {
+        match event_type {
+            "response.code_interpreter_call_code.delta" => {
+                self.handle_code_interpreter_code_delta(json, events);
+            }
+            "response.code_interpreter_call_code.done" => {
+                self.handle_code_interpreter_code_done(json, events);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_code_interpreter_code_delta(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(output_index) = Self::output_index(json) else {
+            return;
+        };
+        let delta = json
+            .get("delta")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        if delta.is_empty() {
+            return;
+        }
+        Self::push_data(
+            events,
+            "openai.code_interpreter_call.code_delta",
+            json!({
+                "output_index": output_index,
+                "delta": delta,
+            }),
+        );
+    }
+
+    fn handle_code_interpreter_code_done(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(output_index) = Self::output_index(json) else {
+            return;
+        };
+        let code = json
+            .get("code")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        Self::push_data(
+            events,
+            "openai.code_interpreter_call.code_done",
+            json!({
+                "output_index": output_index,
+                "code": code,
+            }),
+        );
+    }
+
+    fn handle_apply_patch_event(&self, event_type: &str, json: &Value, events: &mut Vec<Event>) {
+        match event_type {
+            "response.apply_patch_call_operation_diff.delta" => {
+                self.handle_apply_patch_diff_delta(json, events);
+            }
+            "response.apply_patch_call_operation_diff.done" => {
+                self.handle_apply_patch_diff_done(json, events);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_apply_patch_diff_delta(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(output_index) = Self::output_index(json) else {
+            return;
+        };
+        let delta = json
+            .get("delta")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        if delta.is_empty() {
+            return;
+        }
+        Self::push_data(
+            events,
+            "openai.apply_patch_call.diff.delta",
+            json!({
+                "output_index": output_index,
+                "delta": delta,
+            }),
+        );
+    }
+
+    fn handle_apply_patch_diff_done(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(output_index) = Self::output_index(json) else {
+            return;
+        };
+        let diff = json
+            .get("diff")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        Self::push_data(
+            events,
+            "openai.apply_patch_call.diff.done",
+            json!({
+                "output_index": output_index,
+                "diff": diff,
+            }),
+        );
+    }
+
+    fn handle_reasoning_summary_event(
+        &self,
+        event_type: &str,
+        json: &Value,
+        events: &mut Vec<Event>,
+    ) {
+        match event_type {
+            "response.reasoning_summary_part.added" => {
+                self.handle_reasoning_summary_added(json, events);
+            }
+            "response.reasoning_summary_text.delta" => {
+                self.handle_reasoning_summary_delta(json, events);
+            }
+            "response.reasoning_summary_part.done" => {
+                self.handle_reasoning_summary_done(json, events);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_reasoning_summary_added(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(item_id) = json.get("item_id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let Some(summary_index) = json.get("summary_index").and_then(|value| value.as_u64()) else {
+            return;
+        };
+        Self::push_data(
+            events,
+            "openai.reasoning_summary_added",
+            json!({
+                "item_id": item_id,
+                "summary_index": summary_index,
+            }),
+        );
+    }
+
+    fn handle_reasoning_summary_delta(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(item_id) = json.get("item_id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let Some(summary_index) = json.get("summary_index").and_then(|value| value.as_u64()) else {
+            return;
+        };
+        let delta = json
+            .get("delta")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if delta.is_empty() {
+            return;
+        }
+        Self::push_data(
+            events,
+            "openai.reasoning_summary_delta",
+            json!({
+                "item_id": item_id,
+                "summary_index": summary_index,
+                "delta": delta,
+            }),
+        );
+    }
+
+    fn handle_reasoning_summary_done(&self, json: &Value, events: &mut Vec<Event>) {
+        let Some(item_id) = json.get("item_id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let Some(summary_index) = json.get("summary_index").and_then(|value| value.as_u64()) else {
+            return;
+        };
+        Self::push_data(
+            events,
+            "openai.reasoning_summary_done",
+            json!({
+                "item_id": item_id,
+                "summary_index": summary_index,
+            }),
+        );
+    }
+
+    fn handle_image_generation_partial(&self, json: &Value, events: &mut Vec<Event>) {
+        let (Some(tool_call_id), Some(partial_image_b64)) = (
+            json.get("item_id").and_then(|value| value.as_str()),
+            json.get("partial_image_b64")
+                .and_then(|value| value.as_str()),
+        ) else {
+            return;
+        };
+        Self::push_data(
+            events,
+            "openai.image_generation_call.partial",
+            json!({
+                "tool_call_id": tool_call_id,
+                "partial_image_b64": partial_image_b64,
+            }),
+        );
+    }
+
+    fn handle_terminal_event(&mut self, event_type: &str, json: &Value, events: &mut Vec<Event>) {
+        match event_type {
+            "response.completed" | "response.incomplete" => {
+                self.handle_response_terminal(json, events);
+            }
+            "response.failed" => self.handle_response_failed(json, events),
+            "error" => Self::push_data(events, "openai.error", json.clone()),
+            _ => {}
+        }
+    }
+
+    fn handle_response_terminal(&mut self, json: &Value, events: &mut Vec<Event>) {
+        if let Some(response) = json.get("response") {
+            self.handle_response_terminal_metadata(response, events);
+        }
+        self.close_open_tool_calls(events);
+        events.push(Event::Done);
+    }
+
+    fn handle_response_terminal_metadata(&self, response: &Value, events: &mut Vec<Event>) {
+        if let Some(usage_value) = response.get("usage") {
+            if let Some(usage) = parse_openai_usage(usage_value) {
+                events.push(Event::Usage { usage });
+            }
+            Self::push_data(events, "usage", usage_value.clone());
+        }
+        let incomplete_reason = response
+            .get("incomplete_details")
+            .and_then(|value| value.get("reason"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        Self::push_data(
+            events,
+            "openai.finish",
+            json!({ "incomplete_reason": incomplete_reason }),
+        );
+        let response_id = response.get("id").cloned().unwrap_or(Value::Null);
+        let service_tier = response.get("service_tier").cloned().unwrap_or(Value::Null);
+        Self::push_data(
+            events,
+            "openai.response",
+            json!({
+                "id": response_id,
+                "service_tier": service_tier,
+            }),
+        );
+    }
+
+    fn handle_response_failed(&mut self, json: &Value, events: &mut Vec<Event>) {
+        let failed_payload = json
+            .get("response")
+            .map(|response| {
+                json!({
+                    "id": response.get("id").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .unwrap_or_else(|| json!({}));
+        Self::push_data(events, "openai.failed", failed_payload);
+        self.close_open_tool_calls(events);
+        events.push(Event::Done);
+    }
+}
+
 impl ProviderChunk for OpenAIResponsesChunk {
     fn try_from_sse(&mut self, event: &SseEvent) -> Result<Option<Vec<Event>>, SdkError> {
         let trimmed = std::str::from_utf8(&event.data).unwrap_or("").trim();
@@ -2845,511 +2496,29 @@ impl ProviderChunk for OpenAIResponsesChunk {
             }
         };
         let mut events = Vec::new();
-        match t {
-            "response.created" => {
-                if let Some(resp) = json.get("response") {
-                    let id = resp.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                    let model = resp
-                        .get("model")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    let created_at = resp
-                        .get("created_at")
-                        .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)))
-                        .map(|v| v * 1000);
-                    events.push(Event::Data {
-                        key: "openai.response_metadata".into(),
-                        value: serde_json::json!({
-                            "id": id,
-                            "model": model,
-                            "created_at": created_at,
-                        }),
-                    });
+        if t.starts_with("response.output_text.") {
+            self.handle_output_text_event(t, &json, &mut events);
+        } else if t.starts_with("response.output_item.") {
+            self.handle_output_item_event(t, &json, &mut events);
+        } else if t.starts_with("response.function_call_arguments.") {
+            self.handle_function_call_arguments_event(t, &json, &mut events);
+        } else if t.starts_with("response.code_interpreter_call_code.") {
+            self.handle_code_interpreter_event(t, &json, &mut events);
+        } else if t.starts_with("response.apply_patch_call_operation_diff.") {
+            self.handle_apply_patch_event(t, &json, &mut events);
+        } else if t.starts_with("response.reasoning_summary_") {
+            self.handle_reasoning_summary_event(t, &json, &mut events);
+        } else {
+            match t {
+                "response.created" => self.handle_response_created(&json, &mut events),
+                "response.image_generation_call.partial_image" => {
+                    self.handle_image_generation_partial(&json, &mut events);
                 }
+                "response.completed" | "response.incomplete" | "response.failed" | "error" => {
+                    self.handle_terminal_event(t, &json, &mut events);
+                }
+                _ => {}
             }
-            "response.output_text.delta" => {
-                let delta = json.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                let item_id = json.get("item_id").and_then(|v| v.as_str());
-                if let Some(item_id) = item_id {
-                    if !delta.is_empty() {
-                        let logprobs = json
-                            .get("logprobs")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        events.push(Event::Data {
-                            key: "openai.text_delta".into(),
-                            value: serde_json::json!({
-                                "item_id": item_id,
-                                "delta": delta,
-                                "logprobs": logprobs,
-                            }),
-                        });
-                    }
-                }
-            }
-            "response.output_text.annotation.added" => {
-                let item_id = json.get("item_id").and_then(|v| v.as_str());
-                let annotation = json
-                    .get("annotation")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                if let Some(item_id) = item_id {
-                    events.push(Event::Data {
-                        key: "openai.text_annotation".into(),
-                        value: serde_json::json!({
-                            "item_id": item_id,
-                            "annotation": annotation,
-                        }),
-                    });
-                }
-            }
-            "response.output_item.added" => {
-                if let Some(item) = json.get("item").and_then(|v| v.as_object()) {
-                    if let Some(typ) = item.get("type").and_then(|v| v.as_str()) {
-                        match typ {
-                            "function_call" => {
-                                let name = item
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
-                                let call_id = item
-                                    .get("call_id")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
-                                let index = json
-                                    .get("output_index")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|n| n as usize);
-                                if let (Some(cid), Some(id)) =
-                                    (call_id.as_ref(), item.get("id").and_then(|v| v.as_str()))
-                                {
-                                    events.push(Event::Data {
-                                        key: format!("openai.tool_item_id.{}", cid),
-                                        value: serde_json::json!({"item_id": id}),
-                                    });
-                                }
-                                if let (Some(idx), Some(cid), Some(tool_name)) =
-                                    (index, call_id.clone(), name.clone())
-                                {
-                                    self.tool_calls
-                                        .insert(idx, OpenAIToolCallState { id: cid.clone() });
-                                    events.push(Event::ToolCallStart {
-                                        id: cid.clone(),
-                                        name: tool_name,
-                                    });
-                                    if let Some(pending) = self.pending_deltas.remove(&idx) {
-                                        for delta in pending {
-                                            events.push(Event::ToolCallDelta {
-                                                id: cid.clone(),
-                                                args_json: delta,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            "apply_patch_call" => {
-                                let index = json
-                                    .get("output_index")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|n| n as usize);
-                                let call_id = item.get("call_id").and_then(|v| v.as_str());
-                                let operation = item
-                                    .get("operation")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
-                                if let (Some(idx), Some(call_id)) = (index, call_id) {
-                                    events.push(Event::Data {
-                                        key: "openai.apply_patch_call.added".into(),
-                                        value: serde_json::json!({
-                                            "output_index": idx,
-                                            "call_id": call_id,
-                                            "operation": operation,
-                                        }),
-                                    });
-                                }
-                            }
-                            "message" => {
-                                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                    events.push(Event::Data {
-                                        key: "openai.message_added".into(),
-                                        value: serde_json::json!({"item_id": id}),
-                                    });
-                                }
-                            }
-                            "reasoning" => {
-                                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                    let enc = item
-                                        .get("encrypted_content")
-                                        .cloned()
-                                        .unwrap_or(serde_json::Value::Null);
-                                    events.push(Event::Data {
-                                        key: "openai.reasoning_added".into(),
-                                        value: serde_json::json!({
-                                            "item_id": id,
-                                            "encrypted_content": enc,
-                                        }),
-                                    });
-                                }
-                            }
-                            "web_search_call" => {
-                                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                    events.push(Event::Data {
-                                        key: "openai.web_search_call.added".into(),
-                                        value: serde_json::json!({"tool_call_id": id}),
-                                    });
-                                }
-                            }
-                            "file_search_call" => {
-                                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                    events.push(Event::Data {
-                                        key: "openai.file_search_call.added".into(),
-                                        value: serde_json::json!({"tool_call_id": id}),
-                                    });
-                                }
-                            }
-                            "image_generation_call" => {
-                                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                    events.push(Event::Data {
-                                        key: "openai.image_generation_call.added".into(),
-                                        value: serde_json::json!({"tool_call_id": id}),
-                                    });
-                                }
-                            }
-                            "code_interpreter_call" => {
-                                let output_index = json
-                                    .get("output_index")
-                                    .and_then(|v| v.as_u64())
-                                    .map(|n| n as usize);
-                                if let (Some(id), Some(idx)) =
-                                    (item.get("id").and_then(|v| v.as_str()), output_index)
-                                {
-                                    let container_id = item
-                                        .get("container_id")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string());
-                                    events.push(Event::Data {
-                                        key: "openai.code_interpreter_call.added".into(),
-                                        value: serde_json::json!({
-                                            "output_index": idx,
-                                            "tool_call_id": id,
-                                            "container_id": container_id,
-                                        }),
-                                    });
-                                }
-                            }
-                            "computer_call" => {
-                                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                    events.push(Event::Data {
-                                        key: "openai.computer_call.added".into(),
-                                        value: serde_json::json!({"tool_call_id": id}),
-                                    });
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            "response.output_item.done" => {
-                let index = json
-                    .get("output_index")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
-                if let Some(item) = json.get("item").and_then(|v| v.as_object()) {
-                    if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                        if item_type == "apply_patch_call" {
-                            if let Some(idx) = index {
-                                let call_id = item.get("call_id").and_then(|v| v.as_str());
-                                let operation = item
-                                    .get("operation")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
-                                events.push(Event::Data {
-                                    key: "openai.apply_patch_call.done".into(),
-                                    value: serde_json::json!({
-                                        "output_index": idx,
-                                        "call_id": call_id,
-                                        "operation": operation,
-                                    }),
-                                });
-                            }
-                        }
-                        if item_type == "message" {
-                            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                events.push(Event::Data {
-                                    key: "openai.message_done".into(),
-                                    value: serde_json::json!({"item_id": id}),
-                                });
-                            }
-                        }
-                        if item_type == "reasoning" {
-                            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                                let enc = item
-                                    .get("encrypted_content")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
-                                events.push(Event::Data {
-                                    key: "openai.reasoning_done".into(),
-                                    value: serde_json::json!({
-                                        "item_id": id,
-                                        "encrypted_content": enc,
-                                    }),
-                                });
-                            }
-                        }
-                        if item_type == "function_call" {
-                            events.push(Event::Data {
-                                key: "openai.function_call_done".into(),
-                                value: serde_json::json!({}),
-                            });
-                        }
-                    }
-                    if let Some(tool_data) = provider_tool_data_from_output_item(item) {
-                        events.push(Event::Data {
-                            key: "openai.provider_tool".into(),
-                            value: tool_data,
-                        });
-                    }
-                }
-                if let Some(idx) = index {
-                    if let Some(state) = self.tool_calls.remove(&idx) {
-                        if let Some(pending) = self.pending_deltas.remove(&idx) {
-                            for delta in pending {
-                                events.push(Event::ToolCallDelta {
-                                    id: state.id.clone(),
-                                    args_json: delta,
-                                });
-                            }
-                        }
-                        events.push(Event::ToolCallEnd { id: state.id });
-                    }
-                }
-            }
-            "response.function_call_arguments.delta" => {
-                let index = json
-                    .get("output_index")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
-                let delta = json
-                    .get("delta")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(idx) = index {
-                    if let Some(state) = self.tool_calls.get(&idx) {
-                        events.push(Event::ToolCallDelta {
-                            id: state.id.clone(),
-                            args_json: delta,
-                        });
-                    } else {
-                        self.pending_deltas.entry(idx).or_default().push(delta);
-                    }
-                }
-            }
-            "response.code_interpreter_call_code.delta" => {
-                if let Some(idx) = json.get("output_index").and_then(|v| v.as_u64()) {
-                    let delta = json
-                        .get("delta")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !delta.is_empty() {
-                        events.push(Event::Data {
-                            key: "openai.code_interpreter_call.code_delta".into(),
-                            value: serde_json::json!({
-                                "output_index": idx as usize,
-                                "delta": delta,
-                            }),
-                        });
-                    }
-                }
-            }
-            "response.code_interpreter_call_code.done" => {
-                if let Some(idx) = json.get("output_index").and_then(|v| v.as_u64()) {
-                    let code = json
-                        .get("code")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    events.push(Event::Data {
-                        key: "openai.code_interpreter_call.code_done".into(),
-                        value: serde_json::json!({
-                            "output_index": idx as usize,
-                            "code": code,
-                        }),
-                    });
-                }
-            }
-            "response.image_generation_call.partial_image" => {
-                if let (Some(id), Some(b64)) = (
-                    json.get("item_id").and_then(|v| v.as_str()),
-                    json.get("partial_image_b64").and_then(|v| v.as_str()),
-                ) {
-                    events.push(Event::Data {
-                        key: "openai.image_generation_call.partial".into(),
-                        value: serde_json::json!({
-                            "tool_call_id": id,
-                            "partial_image_b64": b64,
-                        }),
-                    });
-                }
-            }
-            "response.apply_patch_call_operation_diff.delta" => {
-                let index = json
-                    .get("output_index")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
-                let delta = json
-                    .get("delta")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(idx) = index {
-                    if !delta.is_empty() {
-                        events.push(Event::Data {
-                            key: "openai.apply_patch_call.diff.delta".into(),
-                            value: serde_json::json!({
-                                "output_index": idx,
-                                "delta": delta,
-                            }),
-                        });
-                    }
-                }
-            }
-            "response.apply_patch_call_operation_diff.done" => {
-                let index = json
-                    .get("output_index")
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
-                let diff = json
-                    .get("diff")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(idx) = index {
-                    events.push(Event::Data {
-                        key: "openai.apply_patch_call.diff.done".into(),
-                        value: serde_json::json!({
-                            "output_index": idx,
-                            "diff": diff,
-                        }),
-                    });
-                }
-            }
-            "response.reasoning_summary_part.added" => {
-                if let (Some(id), Some(idx)) = (
-                    json.get("item_id").and_then(|v| v.as_str()),
-                    json.get("summary_index").and_then(|v| v.as_u64()),
-                ) {
-                    events.push(Event::Data {
-                        key: "openai.reasoning_summary_added".into(),
-                        value: serde_json::json!({
-                            "item_id": id,
-                            "summary_index": idx,
-                        }),
-                    });
-                }
-            }
-            "response.reasoning_summary_text.delta" => {
-                if let (Some(id), Some(idx)) = (
-                    json.get("item_id").and_then(|v| v.as_str()),
-                    json.get("summary_index").and_then(|v| v.as_u64()),
-                ) {
-                    let delta = json.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                    if !delta.is_empty() {
-                        events.push(Event::Data {
-                            key: "openai.reasoning_summary_delta".into(),
-                            value: serde_json::json!({
-                                "item_id": id,
-                                "summary_index": idx,
-                                "delta": delta,
-                            }),
-                        });
-                    }
-                }
-            }
-            "response.reasoning_summary_part.done" => {
-                if let (Some(id), Some(idx)) = (
-                    json.get("item_id").and_then(|v| v.as_str()),
-                    json.get("summary_index").and_then(|v| v.as_u64()),
-                ) {
-                    events.push(Event::Data {
-                        key: "openai.reasoning_summary_done".into(),
-                        value: serde_json::json!({
-                            "item_id": id,
-                            "summary_index": idx,
-                        }),
-                    });
-                }
-            }
-            "response.completed" | "response.incomplete" => {
-                if let Some(resp) = json.get("response") {
-                    if let Some(usage_val) = resp.get("usage") {
-                        if let Some(usage) = parse_openai_usage(usage_val) {
-                            events.push(Event::Usage { usage });
-                        }
-                        events.push(Event::Data {
-                            key: "usage".into(),
-                            value: usage_val.clone(),
-                        });
-                    }
-                    let fin = resp
-                        .get("incomplete_details")
-                        .and_then(|v| v.get("reason"))
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    events.push(Event::Data {
-                        key: "openai.finish".into(),
-                        value: serde_json::json!({"incomplete_reason": fin}),
-                    });
-                    let rid = resp.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                    let st = resp
-                        .get("service_tier")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    events.push(Event::Data {
-                        key: "openai.response".into(),
-                        value: serde_json::json!({"id": rid, "service_tier": st}),
-                    });
-                }
-                if !self.tool_calls.is_empty() {
-                    for (_idx, state) in self.tool_calls.drain() {
-                        events.push(Event::ToolCallEnd { id: state.id });
-                    }
-                    self.pending_deltas.clear();
-                }
-                events.push(Event::Done);
-            }
-            "response.failed" => {
-                // TS parity: failed chunks are not treated as "response finished" chunks.
-                // They should not set incomplete_reason/service_tier driven finish metadata.
-                let failed_payload = json
-                    .get("response")
-                    .map(|resp| {
-                        serde_json::json!({
-                            "id": resp.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                        })
-                    })
-                    .unwrap_or_else(|| serde_json::json!({}));
-                events.push(Event::Data {
-                    key: "openai.failed".into(),
-                    value: failed_payload,
-                });
-                if !self.tool_calls.is_empty() {
-                    for (_idx, state) in self.tool_calls.drain() {
-                        events.push(Event::ToolCallEnd { id: state.id });
-                    }
-                    self.pending_deltas.clear();
-                }
-                events.push(Event::Done);
-            }
-            "error" => {
-                events.push(Event::Data {
-                    key: "openai.error".into(),
-                    value: json.clone(),
-                });
-            }
-            _ => {}
         }
         if events.is_empty() {
             Ok(None)
@@ -3358,57 +2527,6 @@ impl ProviderChunk for OpenAIResponsesChunk {
         }
     }
 }
-
-/* Legacy in-file stream-hook state removed.
-   Live owner: src/providers/openai/responses/stream_hooks.rs
-#[derive(Debug, Clone)]
-struct OpenAIApplyPatchState {
-    tool_call_id: String,
-    operation_path: Option<String>,
-    has_diff: bool,
-    end_emitted: bool,
-}
-
-#[derive(Debug, Clone)]
-struct OpenAICodeInterpreterState {
-    tool_call_id: String,
-    container_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReasoningSummaryStatus {
-    Active,
-    CanConclude,
-    Concluded,
-}
-
-#[derive(Debug, Clone, Default)]
-struct OpenAIReasoningState {
-    encrypted_content: Option<serde_json::Value>,
-    summary_parts: HashMap<u32, ReasoningSummaryStatus>,
-}
-
-#[derive(Default)]
-struct OpenAIStreamExtras {
-    finish_hint: Option<String>,
-    response_id: Option<String>,
-    service_tier: Option<String>,
-    saw_response_failed: bool,
-    store: bool,
-    logprobs_enabled: bool,
-    has_function_calls: bool,
-    logprobs: Vec<serde_json::Value>,
-    message_annotations: HashMap<String, Vec<serde_json::Value>>,
-    active_reasoning: HashMap<String, OpenAIReasoningState>,
-    open_tool_inputs: HashSet<String>,
-    tool_item_ids: HashMap<String, String>, // call_id -> item_id
-    approval_request_id_map: HashMap<String, String>,
-    apply_patch_calls: HashMap<usize, OpenAIApplyPatchState>,
-    code_interpreter_calls: HashMap<usize, OpenAICodeInterpreterState>,
-    emitted_tool_calls: HashSet<String>,
-    tool_name_mapping: ToolNameMapping,
-}
-*/
 
 pub(super) fn openai_item_metadata(
     item_id: &str,
@@ -3423,845 +2541,6 @@ pub(super) fn openai_item_metadata(
     outer.insert("openai".into(), inner);
     outer
 }
-
-/* Legacy in-file stream-hook assembly removed.
-   Live owner: src/providers/openai/responses/stream_hooks.rs
-fn build_stream_mapper_config(
-    warnings: Vec<v2t::CallWarning>,
-    tool_name_mapping: ToolNameMapping,
-    approval_request_id_map: HashMap<String, String>,
-    store: bool,
-    logprobs_enabled: bool,
-) -> EventMapperConfig<OpenAIStreamExtras> {
-    let mut hooks: EventMapperHooks<OpenAIStreamExtras> = EventMapperHooks::default();
-
-    hooks.tool_end_metadata = Some(Box::new(
-        |state: &mut EventMapperState<OpenAIStreamExtras>, id| {
-            state
-                .extra
-                .tool_item_ids
-                .get(id)
-                .map(|iid| openai_item_metadata(iid, []))
-        },
-    ));
-
-    hooks.data = Some(Box::new(
-        |state: &mut EventMapperState<OpenAIStreamExtras>, key, value| {
-            if key == "usage" {
-                if let Some(usage) = parse_openai_usage(value) {
-                    state.usage.input_tokens = Some(usage.input_tokens as u64);
-                    state.usage.output_tokens = Some(usage.output_tokens as u64);
-                    state.usage.total_tokens = Some(usage.total_tokens as u64);
-                    state.usage.cached_input_tokens = usage.cache_read_tokens.map(|v| v as u64);
-                }
-                apply_openai_usage_details(value, &mut state.usage);
-                return None;
-            } else if key == "openai.response_metadata" {
-                let id = value
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let model_id = value
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let timestamp_ms = value
-                    .get("created_at")
-                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|n| n as i64)));
-                if let Some(rid) = id.as_ref() {
-                    if state.extra.response_id.is_none() {
-                        state.extra.response_id = Some(rid.clone());
-                    }
-                }
-                let meta = v2t::ResponseMetadata {
-                    id,
-                    timestamp_ms,
-                    model_id,
-                };
-                return Some(vec![v2t::StreamPart::ResponseMetadata { meta }]);
-            } else if key == "openai.message_added" {
-                let item_id = value.get("item_id").and_then(|v| v.as_str())?;
-                state
-                    .extra
-                    .message_annotations
-                    .insert(item_id.to_string(), Vec::new());
-                if state.text_open.as_deref() != Some(item_id) {
-                    return Some(
-                        state.open_text(
-                            item_id.to_string(),
-                            Some(openai_item_metadata(item_id, [])),
-                        ),
-                    );
-                }
-            } else if key == "openai.text_delta" {
-                let item_id = value.get("item_id").and_then(|v| v.as_str())?;
-                let delta = value.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                if delta.is_empty() {
-                    return None;
-                }
-                let start_metadata = if state.text_open.as_deref() != Some(item_id) {
-                    state
-                        .extra
-                        .message_annotations
-                        .entry(item_id.to_string())
-                        .or_default();
-                    Some(openai_item_metadata(item_id, []))
-                } else {
-                    None
-                };
-                if state.extra.logprobs_enabled {
-                    if let Some(logprobs) = value.get("logprobs").filter(|v| !v.is_null()) {
-                        state.extra.logprobs.push(logprobs.clone());
-                    }
-                }
-                return Some(state.push_text_delta(
-                    Some(item_id.to_string()),
-                    item_id,
-                    delta.to_string(),
-                    start_metadata,
-                    None,
-                ));
-            } else if key == "openai.text_annotation" {
-                let item_id = value.get("item_id").and_then(|v| v.as_str())?;
-                let annotation = value.get("annotation")?.clone();
-                state
-                    .extra
-                    .message_annotations
-                    .entry(item_id.to_string())
-                    .or_default()
-                    .push(annotation.clone());
-                let annotation_obj = annotation.as_object()?;
-                let annotation_type = annotation_obj.get("type")?.as_str()?;
-                let make_provider_metadata = |vals: Vec<(&str, serde_json::Value)>| {
-                    let mut inner = HashMap::new();
-                    for (key, val) in vals {
-                        inner.insert(key.into(), val);
-                    }
-                    let mut outer = HashMap::new();
-                    outer.insert("openai".into(), inner);
-                    outer
-                };
-                match annotation_type {
-                    "url_citation" => {
-                        let url = annotation_obj.get("url")?.as_str()?;
-                        let title = annotation_obj
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        return Some(vec![v2t::StreamPart::SourceUrl {
-                            id: Uuid::new_v4().to_string(),
-                            url: url.to_string(),
-                            title,
-                            provider_metadata: None,
-                        }]);
-                    }
-                    "file_citation" => {
-                        let file_id = annotation_obj.get("file_id")?.as_str()?;
-                        let title = annotation_obj
-                            .get("quote")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .or_else(|| {
-                                annotation_obj
-                                    .get("filename")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            })
-                            .or_else(|| Some(file_id.to_string()));
-                        let mut metadata_vals = vec![("fileId", json!(file_id))];
-                        if let Some(index) = annotation_obj.get("index").filter(|v| !v.is_null()) {
-                            metadata_vals.push(("index", index.clone()));
-                        }
-                        return Some(vec![v2t::StreamPart::SourceUrl {
-                            id: Uuid::new_v4().to_string(),
-                            url: file_id.to_string(),
-                            title,
-                            provider_metadata: Some(make_provider_metadata(metadata_vals)),
-                        }]);
-                    }
-                    "container_file_citation" => {
-                        let file_id = annotation_obj.get("file_id")?.as_str()?;
-                        let container_id = annotation_obj.get("container_id")?.as_str()?;
-                        let title = annotation_obj
-                            .get("filename")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .or_else(|| Some(file_id.to_string()));
-                        let mut metadata_vals = vec![
-                            ("fileId", json!(file_id)),
-                            ("containerId", json!(container_id)),
-                        ];
-                        if let Some(index) = annotation_obj.get("index").filter(|v| !v.is_null()) {
-                            metadata_vals.push(("index", index.clone()));
-                        }
-                        return Some(vec![v2t::StreamPart::SourceUrl {
-                            id: Uuid::new_v4().to_string(),
-                            url: file_id.to_string(),
-                            title,
-                            provider_metadata: Some(make_provider_metadata(metadata_vals)),
-                        }]);
-                    }
-                    "file_path" => {
-                        let file_id = annotation_obj.get("file_id")?.as_str()?;
-                        let mut metadata_vals = vec![("fileId", json!(file_id))];
-                        if let Some(index) = annotation_obj.get("index").filter(|v| !v.is_null()) {
-                            metadata_vals.push(("index", index.clone()));
-                        }
-                        return Some(vec![v2t::StreamPart::SourceUrl {
-                            id: Uuid::new_v4().to_string(),
-                            url: file_id.to_string(),
-                            title: Some(file_id.to_string()),
-                            provider_metadata: Some(make_provider_metadata(metadata_vals)),
-                        }]);
-                    }
-                    _ => {}
-                }
-            } else if key == "openai.message_done" {
-                let item_id = value.get("item_id").and_then(|v| v.as_str())?;
-                let annotations = state
-                    .extra
-                    .message_annotations
-                    .remove(item_id)
-                    .unwrap_or_default();
-                let md = if annotations.is_empty() {
-                    openai_item_metadata(item_id, [])
-                } else {
-                    openai_item_metadata(
-                        item_id,
-                        [("annotations".into(), serde_json::Value::Array(annotations))],
-                    )
-                };
-                if state.text_open.as_deref() == Some(item_id) {
-                    return state.close_text(Some(md)).map(|part| vec![part]);
-                }
-                return Some(vec![state.text_end_part(item_id.to_string(), Some(md))]);
-            } else if key == "openai.error" {
-                state.extra.finish_hint = Some("error".into());
-                return Some(vec![v2t::StreamPart::Error {
-                    error: value.clone(),
-                }]);
-            } else if key == "openai.reasoning_added" {
-                let item_id = value.get("item_id").and_then(|v| v.as_str())?;
-                let enc = value
-                    .get("encrypted_content")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let mut state_entry = OpenAIReasoningState {
-                    encrypted_content: Some(enc.clone()),
-                    summary_parts: HashMap::new(),
-                };
-                state_entry
-                    .summary_parts
-                    .insert(0, ReasoningSummaryStatus::Active);
-                state
-                    .extra
-                    .active_reasoning
-                    .insert(item_id.to_string(), state_entry);
-                return Some(state.open_reasoning(
-                    format!("{item_id}:0"),
-                    Some(openai_item_metadata(
-                        item_id,
-                        [("reasoningEncryptedContent".into(), enc)],
-                    )),
-                ));
-            } else if key == "openai.reasoning_summary_added" {
-                let item_id = value.get("item_id").and_then(|v| v.as_str())?;
-                let summary_index = value.get("summary_index").and_then(|v| v.as_u64())?;
-                if summary_index == 0 {
-                    return None;
-                }
-                let (concluded_ids, enc) = {
-                    let reasoning_state = state.extra.active_reasoning.get_mut(item_id)?;
-                    let mut concluded_ids = Vec::new();
-                    for (idx, status) in reasoning_state.summary_parts.iter_mut() {
-                        if matches!(status, ReasoningSummaryStatus::CanConclude) {
-                            concluded_ids.push(*idx);
-                            *status = ReasoningSummaryStatus::Concluded;
-                        }
-                    }
-                    reasoning_state
-                        .summary_parts
-                        .insert(summary_index as u32, ReasoningSummaryStatus::Active);
-                    let enc = reasoning_state
-                        .encrypted_content
-                        .clone()
-                        .unwrap_or(serde_json::Value::Null);
-                    (concluded_ids, enc)
-                };
-                let mut out = Vec::new();
-                for idx in concluded_ids {
-                    let reasoning_id = format!("{item_id}:{idx}");
-                    if state.reasoning_open.as_deref() == Some(reasoning_id.as_str()) {
-                        if let Some(part) =
-                            state.close_reasoning(Some(openai_item_metadata(item_id, [])))
-                        {
-                            out.push(part);
-                        }
-                    } else {
-                        out.push(state.reasoning_end_part(
-                            reasoning_id,
-                            Some(openai_item_metadata(item_id, [])),
-                        ));
-                    }
-                }
-                out.extend(state.open_reasoning(
-                    format!("{item_id}:{summary_index}"),
-                    Some(openai_item_metadata(
-                        item_id,
-                        [("reasoningEncryptedContent".into(), enc)],
-                    )),
-                ));
-                return Some(out);
-            } else if key == "openai.reasoning_summary_delta" {
-                let item_id = value.get("item_id").and_then(|v| v.as_str())?;
-                let summary_index = value.get("summary_index").and_then(|v| v.as_u64())?;
-                let delta = value.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                if delta.is_empty() {
-                    return None;
-                }
-                return Some(vec![state.push_reasoning_delta(
-                    &format!("{item_id}:{summary_index}"),
-                    delta.to_string(),
-                    Some(openai_item_metadata(item_id, [])),
-                )]);
-            } else if key == "openai.reasoning_summary_done" {
-                let item_id = value.get("item_id").and_then(|v| v.as_str())?;
-                let summary_index = value.get("summary_index").and_then(|v| v.as_u64())?;
-                let should_close =
-                    if let Some(reasoning_state) = state.extra.active_reasoning.get_mut(item_id) {
-                        if state.extra.store {
-                            reasoning_state
-                                .summary_parts
-                                .insert(summary_index as u32, ReasoningSummaryStatus::Concluded);
-                            Some(format!("{item_id}:{summary_index}"))
-                        } else {
-                            reasoning_state
-                                .summary_parts
-                                .insert(summary_index as u32, ReasoningSummaryStatus::CanConclude);
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                if let Some(reasoning_id) = should_close {
-                    if state.reasoning_open.as_deref() == Some(reasoning_id.as_str()) {
-                        return state
-                            .close_reasoning(Some(openai_item_metadata(item_id, [])))
-                            .map(|part| vec![part]);
-                    }
-                    return Some(vec![state.reasoning_end_part(
-                        reasoning_id,
-                        Some(openai_item_metadata(item_id, [])),
-                    )]);
-                }
-            } else if key == "openai.reasoning_done" {
-                let item_id = value.get("item_id").and_then(|v| v.as_str())?;
-                let enc = value
-                    .get("encrypted_content")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                if let Some(reasoning_state) = state.extra.active_reasoning.remove(item_id) {
-                    let md =
-                        openai_item_metadata(item_id, [("reasoningEncryptedContent".into(), enc)]);
-                    let mut out = Vec::new();
-                    for (idx, status) in reasoning_state.summary_parts {
-                        if matches!(
-                            status,
-                            ReasoningSummaryStatus::Active | ReasoningSummaryStatus::CanConclude
-                        ) {
-                            let reasoning_id = format!("{item_id}:{idx}");
-                            if state.reasoning_open.as_deref() == Some(reasoning_id.as_str()) {
-                                if let Some(part) = state.close_reasoning(Some(md.clone())) {
-                                    out.push(part);
-                                }
-                            } else {
-                                out.push(state.reasoning_end_part(reasoning_id, Some(md.clone())));
-                            }
-                        }
-                    }
-                    if !out.is_empty() {
-                        return Some(out);
-                    }
-                }
-            } else if key == "openai.web_search_call.added" {
-                let tool_call_id = value.get("tool_call_id").and_then(|v| v.as_str())?;
-                let tool_name = state
-                    .extra
-                    .tool_name_mapping
-                    .web_search_tool_name
-                    .clone()
-                    .unwrap_or_else(|| {
-                        state
-                            .extra
-                            .tool_name_mapping
-                            .to_custom_tool_name("web_search")
-                            .to_string()
-                    });
-                state.has_tool_calls = true;
-                state
-                    .extra
-                    .emitted_tool_calls
-                    .insert(tool_call_id.to_string());
-                let tool_call_id = tool_call_id.to_string();
-                let mut out =
-                    vec![state.start_tool_call(tool_call_id.clone(), tool_name, true, None)];
-                state.tool_args.insert(tool_call_id.clone(), "{}".into());
-                out.extend(state.finish_tool_call(tool_call_id, true, None, None, false, None));
-                return Some(out);
-            } else if key == "openai.file_search_call.added" {
-                let tool_call_id = value.get("tool_call_id").and_then(|v| v.as_str())?;
-                let tool_name = state
-                    .extra
-                    .tool_name_mapping
-                    .to_custom_tool_name("file_search")
-                    .to_string();
-                state.has_tool_calls = true;
-                state
-                    .extra
-                    .emitted_tool_calls
-                    .insert(tool_call_id.to_string());
-                return Some(vec![state.tool_call_part(
-                    tool_call_id.to_string(),
-                    tool_name,
-                    "{}".into(),
-                    true,
-                    None,
-                    false,
-                    None,
-                )]);
-            } else if key == "openai.image_generation_call.added" {
-                let tool_call_id = value.get("tool_call_id").and_then(|v| v.as_str())?;
-                let tool_name = state
-                    .extra
-                    .tool_name_mapping
-                    .to_custom_tool_name("image_generation")
-                    .to_string();
-                state.has_tool_calls = true;
-                state
-                    .extra
-                    .emitted_tool_calls
-                    .insert(tool_call_id.to_string());
-                return Some(vec![state.tool_call_part(
-                    tool_call_id.to_string(),
-                    tool_name,
-                    "{}".into(),
-                    true,
-                    None,
-                    false,
-                    None,
-                )]);
-            } else if key == "openai.image_generation_call.partial" {
-                let tool_call_id = value.get("tool_call_id").and_then(|v| v.as_str())?;
-                let partial = value.get("partial_image_b64").and_then(|v| v.as_str())?;
-                let tool_name = state
-                    .extra
-                    .tool_name_mapping
-                    .to_custom_tool_name("image_generation")
-                    .to_string();
-                return Some(vec![v2t::StreamPart::ToolResult {
-                    tool_call_id: tool_call_id.to_string(),
-                    tool_name,
-                    result: json!({ "result": partial }),
-                    is_error: false,
-                    preliminary: true,
-                    provider_metadata: None,
-                }]);
-            } else if key == "openai.code_interpreter_call.added" {
-                let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
-                let tool_call_id = value.get("tool_call_id").and_then(|v| v.as_str())?;
-                let container_id = value
-                    .get("container_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                state.extra.code_interpreter_calls.insert(
-                    output_index,
-                    OpenAICodeInterpreterState {
-                        tool_call_id: tool_call_id.to_string(),
-                        container_id: container_id.clone(),
-                    },
-                );
-                state.has_tool_calls = true;
-                let tool_name = state
-                    .extra
-                    .tool_name_mapping
-                    .to_custom_tool_name("code_interpreter")
-                    .to_string();
-                let cid = container_id.unwrap_or_default();
-                return Some(vec![
-                    state.start_tool_call(tool_call_id.to_string(), tool_name, true, None),
-                    state.push_tool_call_delta(
-                        tool_call_id.to_string(),
-                        format!(
-                            "{{\"containerId\":\"{}\",\"code\":\"",
-                            escape_json_delta(&cid)
-                        ),
-                        true,
-                        None,
-                    ),
-                ]);
-            } else if key == "openai.code_interpreter_call.code_delta" {
-                let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
-                let delta = value.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                if delta.is_empty() {
-                    return None;
-                }
-                if let Some(call_state) = state.extra.code_interpreter_calls.get(&output_index) {
-                    return Some(vec![state.push_tool_call_delta(
-                        call_state.tool_call_id.clone(),
-                        escape_json_delta(delta),
-                        true,
-                        None,
-                    )]);
-                }
-            } else if key == "openai.code_interpreter_call.code_done" {
-                let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
-                if let Some(call_state) = state.extra.code_interpreter_calls.remove(&output_index) {
-                    let mut out = vec![state.push_tool_call_delta(
-                        call_state.tool_call_id.clone(),
-                        "\"}".into(),
-                        true,
-                        None,
-                    )];
-                    out.extend(state.finish_tool_call(
-                        call_state.tool_call_id.clone(),
-                        true,
-                        None,
-                        None,
-                        false,
-                        None,
-                    ));
-                    state
-                        .extra
-                        .emitted_tool_calls
-                        .insert(call_state.tool_call_id);
-                    return Some(out);
-                }
-            } else if key == "openai.computer_call.added" {
-                let tool_call_id = value.get("tool_call_id").and_then(|v| v.as_str())?;
-                state
-                    .extra
-                    .open_tool_inputs
-                    .insert(tool_call_id.to_string());
-                state.has_tool_calls = true;
-                return Some(vec![state.start_tool_call(
-                    tool_call_id.to_string(),
-                    state
-                        .extra
-                        .tool_name_mapping
-                        .to_custom_tool_name("computer_use")
-                        .to_string(),
-                    true,
-                    None,
-                )]);
-            } else if key == "openai.apply_patch_call.added" {
-                let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
-                let call_id = value.get("call_id").and_then(|v| v.as_str())?;
-                let operation = value
-                    .get("operation")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let operation_type = operation.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                if operation_type.is_empty() {
-                    return None;
-                }
-                let operation_path = operation
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_string());
-                let tool_name = state
-                    .extra
-                    .tool_name_mapping
-                    .to_custom_tool_name("apply_patch")
-                    .to_string();
-                let mut call_state = OpenAIApplyPatchState {
-                    tool_call_id: call_id.to_string(),
-                    operation_path,
-                    has_diff: false,
-                    end_emitted: false,
-                };
-                let mut out =
-                    vec![state.start_tool_call(call_id.to_string(), tool_name, false, None)];
-                if operation_type == "delete_file" {
-                    let input = json!({
-                        "callId": call_id,
-                        "operation": operation,
-                    })
-                    .to_string();
-                    out.push(state.push_tool_call_delta(call_id.to_string(), input, false, None));
-                    out.push(state.tool_input_end_part(call_id.to_string(), false, None));
-                    call_state.has_diff = true;
-                    call_state.end_emitted = true;
-                } else {
-                    let path = call_state.operation_path.as_deref().unwrap_or("");
-                    let delta = format!(
-                        "{{\"callId\":\"{}\",\"operation\":{{\"type\":\"{}\",\"path\":\"{}\",\"diff\":\"",
-                        escape_json_delta(call_id),
-                        escape_json_delta(operation_type),
-                        escape_json_delta(path)
-                    );
-                    out.push(state.push_tool_call_delta(call_id.to_string(), delta, false, None));
-                }
-                state.has_tool_calls = true;
-                state
-                    .extra
-                    .apply_patch_calls
-                    .insert(output_index, call_state);
-                return Some(out);
-            } else if key == "openai.apply_patch_call.diff.delta" {
-                let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
-                let delta = value.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                if let Some(call_state) = state.extra.apply_patch_calls.get_mut(&output_index) {
-                    if call_state.end_emitted {
-                        return None;
-                    }
-                    if !delta.is_empty() {
-                        call_state.has_diff = true;
-                        let tool_call_id = call_state.tool_call_id.clone();
-                        return Some(vec![state.push_tool_call_delta(
-                            tool_call_id,
-                            escape_json_delta(delta),
-                            false,
-                            None,
-                        )]);
-                    }
-                }
-            } else if key == "openai.apply_patch_call.diff.done" {
-                let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
-                let diff = value.get("diff").and_then(|v| v.as_str()).unwrap_or("");
-                if let Some((tool_call_id, should_emit_diff)) = state
-                    .extra
-                    .apply_patch_calls
-                    .get_mut(&output_index)
-                    .and_then(|call_state| {
-                        if call_state.end_emitted {
-                            return None;
-                        }
-                        let should_emit_diff = !call_state.has_diff;
-                        if should_emit_diff {
-                            call_state.has_diff = true;
-                        }
-                        call_state.end_emitted = true;
-                        Some((call_state.tool_call_id.clone(), should_emit_diff))
-                    })
-                {
-                    let mut out = Vec::new();
-                    if should_emit_diff {
-                        out.push(state.push_tool_call_delta(
-                            tool_call_id.clone(),
-                            escape_json_delta(diff),
-                            false,
-                            None,
-                        ));
-                    }
-                    out.push(state.push_tool_call_delta(
-                        tool_call_id.clone(),
-                        "\"}}".into(),
-                        false,
-                        None,
-                    ));
-                    out.push(state.tool_input_end_part(tool_call_id, false, None));
-                    return Some(out);
-                }
-            } else if key == "openai.apply_patch_call.done" {
-                let output_index = value.get("output_index").and_then(|v| v.as_u64())? as usize;
-                if let Some(mut call_state) = state.extra.apply_patch_calls.remove(&output_index) {
-                    if call_state.end_emitted {
-                        return None;
-                    }
-                    let mut out = Vec::new();
-                    if !call_state.has_diff {
-                        let diff = value
-                            .get("operation")
-                            .and_then(|v| v.get("diff"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        call_state.has_diff = true;
-                        out.push(state.push_tool_call_delta(
-                            call_state.tool_call_id.clone(),
-                            escape_json_delta(diff),
-                            false,
-                            None,
-                        ));
-                    }
-                    out.push(state.push_tool_call_delta(
-                        call_state.tool_call_id.clone(),
-                        "\"}}".into(),
-                        false,
-                        None,
-                    ));
-                    out.push(state.tool_input_end_part(
-                        call_state.tool_call_id.clone(),
-                        false,
-                        None,
-                    ));
-                    call_state.end_emitted = true;
-                    return Some(out);
-                }
-            } else if key == "openai.provider_tool" {
-                if let Some(mut parts) =
-                    provider_tool_parts_from_data(value, &state.extra.tool_name_mapping)
-                {
-                    state.has_tool_calls = true;
-                    let tool_type = parts.tool_type.clone();
-                    if parts.is_approval_request {
-                        let approval_id = parts
-                            .approval_request_id
-                            .clone()
-                            .unwrap_or_else(|| parts.tool_call_id.clone());
-                        let tool_call_id = Uuid::new_v4().to_string();
-                        state
-                            .extra
-                            .approval_request_id_map
-                            .insert(approval_id.clone(), tool_call_id.clone());
-                        return Some(vec![
-                            state.tool_call_part(
-                                tool_call_id.clone(),
-                                parts.tool_name,
-                                parts.input,
-                                parts.provider_executed,
-                                None,
-                                parts.dynamic,
-                                None,
-                            ),
-                            v2t::StreamPart::ToolApprovalRequest {
-                                approval_id,
-                                tool_call_id,
-                                provider_metadata: None,
-                            },
-                        ]);
-                    }
-                    if let Some(approval_id) = parts.approval_request_id.as_ref() {
-                        if let Some(mapped) = state.extra.approval_request_id_map.get(approval_id) {
-                            parts.tool_call_id = mapped.clone();
-                        }
-                    }
-                    let tool_call_id = parts.tool_call_id.clone();
-                    let tool_call_metadata = match tool_type.as_str() {
-                        "apply_patch" | "local_shell" | "shell" => parts.provider_metadata.clone(),
-                        _ => None,
-                    };
-                    let tool_result_metadata = if tool_type == "mcp" {
-                        parts.provider_metadata.clone()
-                    } else {
-                        None
-                    };
-                    let mut out = Vec::new();
-                    if tool_type == "computer_use" {
-                        if state.extra.open_tool_inputs.remove(&tool_call_id) {
-                            out.push(state.tool_input_end_part(tool_call_id.clone(), true, None));
-                        }
-                    }
-                    let skip_tool_call =
-                        matches!(
-                            tool_type.as_str(),
-                            "web_search" | "file_search" | "image_generation" | "code_interpreter"
-                        ) && state.extra.emitted_tool_calls.contains(&tool_call_id);
-                    if !skip_tool_call {
-                        out.push(state.tool_call_part(
-                            tool_call_id.clone(),
-                            parts.tool_name.clone(),
-                            parts.input,
-                            parts.provider_executed,
-                            tool_call_metadata,
-                            parts.dynamic,
-                            None,
-                        ));
-                    }
-                    if let Some(result) = parts.result.take() {
-                        out.push(v2t::StreamPart::ToolResult {
-                            tool_call_id: tool_call_id.clone(),
-                            tool_name: parts.tool_name,
-                            result,
-                            is_error: parts.is_error,
-                            preliminary: false,
-                            provider_metadata: tool_result_metadata,
-                        });
-                    }
-                    if !out.is_empty() {
-                        return Some(out);
-                    }
-                }
-            } else if key.starts_with("openai.tool_item_id.") {
-                if let Some(iid) = value.get("item_id").and_then(|v| v.as_str()) {
-                    let call_id = key.trim_start_matches("openai.tool_item_id.").to_string();
-                    state.extra.tool_item_ids.insert(call_id, iid.to_string());
-                }
-            } else if key == "openai.function_call_done" {
-                state.extra.has_function_calls = true;
-            } else if key == "openai.finish" {
-                if let Some(r) = value.get("incomplete_reason").and_then(|v| v.as_str()) {
-                    state.extra.finish_hint = Some(r.to_string());
-                }
-            } else if key == "openai.failed" {
-                state.extra.saw_response_failed = true;
-                if state.extra.response_id.is_none() {
-                    if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
-                        state.extra.response_id = Some(id.to_string());
-                    }
-                }
-            } else if key == "openai.response" {
-                if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
-                    state.extra.response_id = Some(id.to_string());
-                }
-                if let Some(st) = value.get("service_tier").and_then(|v| v.as_str()) {
-                    state.extra.service_tier = Some(st.to_string());
-                }
-            }
-            None
-        },
-    ));
-
-    hooks.finish = Some(Box::new(|state: &EventMapperState<OpenAIStreamExtras>| {
-        let reason = if state.extra.saw_response_failed {
-            // TS mapper keeps default "other" for response.failed terminal trajectories.
-            v2t::FinishReason::Other
-        } else {
-            map_finish_reason(
-                state.extra.finish_hint.as_deref(),
-                state.extra.has_function_calls,
-            )
-        };
-        let mut inner = HashMap::new();
-        if let Some(rid) = &state.extra.response_id {
-            inner.insert("responseId".into(), serde_json::json!(rid));
-        }
-        if !state.extra.saw_response_failed {
-            if let Some(st) = &state.extra.service_tier {
-                inner.insert("serviceTier".into(), serde_json::json!(st));
-            }
-        }
-        if !state.extra.logprobs.is_empty() {
-            inner.insert(
-                "logprobs".into(),
-                serde_json::Value::Array(state.extra.logprobs.clone()),
-            );
-        }
-        let metadata = if inner.is_empty() {
-            None
-        } else {
-            let mut outer = HashMap::new();
-            outer.insert("openai".into(), inner);
-            Some(outer)
-        };
-        (reason, metadata)
-    }));
-
-    EventMapperConfig {
-        warnings,
-        treat_tool_names_as_text: HashSet::new(),
-        default_text_id: "text-1",
-        finish_reason_fallback: v2t::FinishReason::Stop,
-        initial_extra: OpenAIStreamExtras {
-            tool_name_mapping,
-            approval_request_id_map,
-            store,
-            logprobs_enabled,
-            ..Default::default()
-        },
-        hooks,
-    }
-}
-*/
 
 pub(super) fn map_finish_reason(hint: Option<&str>, has_function_calls: bool) -> v2t::FinishReason {
     match hint {
@@ -4284,17 +2563,25 @@ pub(super) fn map_finish_reason(hint: Option<&str>, has_function_calls: bool) ->
     }
 }
 
+struct ResponseContentAccumulator {
+    content: Vec<v2t::Content>,
+    has_function_calls: bool,
+    approval_request_id_map: HashMap<String, String>,
+}
+
 fn extract_response_content(
     json: &serde_json::Value,
     tool_name_mapping: &ToolNameMapping,
     approval_request_id_map: &HashMap<String, String>,
 ) -> (Vec<v2t::Content>, bool) {
-    let mut content: Vec<v2t::Content> = Vec::new();
-    let mut has_function_calls = false;
-    let mut approval_request_id_map = approval_request_id_map.clone();
+    let mut state = ResponseContentAccumulator {
+        content: Vec::new(),
+        has_function_calls: false,
+        approval_request_id_map: approval_request_id_map.clone(),
+    };
     let output = match json.get("output").and_then(|v| v.as_array()) {
         Some(arr) => arr,
-        None => return (content, false),
+        None => return (state.content, false),
     };
 
     for item in output {
@@ -4302,123 +2589,181 @@ fn extract_response_content(
             Some(obj) => obj,
             None => continue,
         };
-        let item_type = item_obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match item_type {
-            "message" => {
-                if let Some(parts) = item_obj.get("content").and_then(|v| v.as_array()) {
-                    let mut text_acc = String::new();
-                    for part in parts {
-                        if part.get("type").and_then(|v| v.as_str()) == Some("output_text") {
-                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                text_acc.push_str(text);
-                            }
-                        }
-                    }
-                    if !text_acc.is_empty() {
-                        content.push(v2t::Content::Text {
-                            text: text_acc,
-                            provider_metadata: None,
-                        });
-                    }
-                }
-            }
-            "function_call" => {
-                if let (Some(call_id), Some(name)) = (
-                    item_obj.get("call_id").and_then(|v| v.as_str()),
-                    item_obj.get("name").and_then(|v| v.as_str()),
-                ) {
-                    let args = item_obj
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let provider_metadata = item_obj
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .map(|id| openai_item_metadata(id, []));
-                    content.push(v2t::Content::ToolCall(v2t::ToolCallPart {
-                        tool_call_id: call_id.to_string(),
-                        tool_name: name.to_string(),
-                        input: args,
-                        provider_executed: false,
-                        provider_metadata,
-                        dynamic: false,
-                        provider_options: None,
-                    }));
-                    has_function_calls = true;
-                }
-            }
-            _ => {
-                if let Some(tool_data) = provider_tool_data_from_output_item(item_obj) {
-                    if let Some(mut parts) =
-                        provider_tool_parts_from_data(&tool_data, tool_name_mapping)
-                    {
-                        let tool_type = parts.tool_type.clone();
-                        if parts.is_approval_request {
-                            let approval_id = parts
-                                .approval_request_id
-                                .clone()
-                                .unwrap_or_else(|| parts.tool_call_id.clone());
-                            let tool_call_id = Uuid::new_v4().to_string();
-                            approval_request_id_map
-                                .insert(approval_id.clone(), tool_call_id.clone());
-                            content.push(v2t::Content::ToolCall(v2t::ToolCallPart {
-                                tool_call_id: tool_call_id.clone(),
-                                tool_name: parts.tool_name,
-                                input: parts.input,
-                                provider_executed: parts.provider_executed,
-                                provider_metadata: None,
-                                dynamic: parts.dynamic,
-                                provider_options: None,
-                            }));
-                            content.push(v2t::Content::ToolApprovalRequest {
-                                approval_id,
-                                tool_call_id,
-                                provider_metadata: None,
-                            });
-                            continue;
-                        }
-                        if let Some(approval_id) = parts.approval_request_id.as_ref() {
-                            if let Some(mapped) = approval_request_id_map.get(approval_id) {
-                                parts.tool_call_id = mapped.clone();
-                            }
-                        }
-                        let tool_call_metadata = match tool_type.as_str() {
-                            "apply_patch" | "local_shell" | "shell" => {
-                                parts.provider_metadata.clone()
-                            }
-                            _ => None,
-                        };
-                        let tool_result_metadata = if tool_type == "mcp" {
-                            parts.provider_metadata.clone()
-                        } else {
-                            None
-                        };
-                        content.push(v2t::Content::ToolCall(v2t::ToolCallPart {
-                            tool_call_id: parts.tool_call_id.clone(),
-                            tool_name: parts.tool_name.clone(),
-                            input: parts.input,
-                            provider_executed: parts.provider_executed,
-                            provider_metadata: tool_call_metadata,
-                            dynamic: parts.dynamic,
-                            provider_options: None,
-                        }));
-                        if let Some(result) = parts.result {
-                            content.push(v2t::Content::ToolResult {
-                                tool_call_id: parts.tool_call_id,
-                                tool_name: parts.tool_name,
-                                result,
-                                is_error: parts.is_error,
-                                provider_metadata: tool_result_metadata,
-                            });
-                        }
-                    }
-                }
-            }
+        extract_response_output_item(item_obj, tool_name_mapping, &mut state);
+    }
+
+    (state.content, state.has_function_calls)
+}
+
+fn extract_response_output_item(
+    item: &Map<String, Value>,
+    tool_name_mapping: &ToolNameMapping,
+    state: &mut ResponseContentAccumulator,
+) {
+    match item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+    {
+        "message" => push_response_message_content(item, &mut state.content),
+        "function_call" => push_response_function_call(item, state),
+        _ => push_response_provider_tool_content(item, tool_name_mapping, state),
+    }
+}
+
+fn push_response_message_content(item: &Map<String, Value>, content: &mut Vec<v2t::Content>) {
+    let Some(parts) = item.get("content").and_then(|value| value.as_array()) else {
+        return;
+    };
+
+    let mut text_acc = String::new();
+    for part in parts {
+        if part.get("type").and_then(|value| value.as_str()) != Some("output_text") {
+            continue;
+        }
+        if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+            text_acc.push_str(text);
         }
     }
 
-    (content, has_function_calls)
+    if !text_acc.is_empty() {
+        content.push(v2t::Content::Text {
+            text: text_acc,
+            provider_metadata: None,
+        });
+    }
+}
+
+fn push_response_function_call(item: &Map<String, Value>, state: &mut ResponseContentAccumulator) {
+    let (Some(call_id), Some(name)) = (
+        item.get("call_id").and_then(|value| value.as_str()),
+        item.get("name").and_then(|value| value.as_str()),
+    ) else {
+        return;
+    };
+
+    let args = item
+        .get("arguments")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let provider_metadata = item
+        .get("id")
+        .and_then(|value| value.as_str())
+        .map(|id| openai_item_metadata(id, []));
+    state
+        .content
+        .push(v2t::Content::ToolCall(v2t::ToolCallPart {
+            tool_call_id: call_id.to_string(),
+            tool_name: name.to_string(),
+            input: args,
+            provider_executed: false,
+            provider_metadata,
+            dynamic: false,
+            provider_options: None,
+        }));
+    state.has_function_calls = true;
+}
+
+fn push_response_provider_tool_content(
+    item: &Map<String, Value>,
+    tool_name_mapping: &ToolNameMapping,
+    state: &mut ResponseContentAccumulator,
+) {
+    let Some(tool_data) = provider_tool_data_from_output_item(item) else {
+        return;
+    };
+    let Some(mut parts) = provider_tool_parts_from_data(&tool_data, tool_name_mapping) else {
+        return;
+    };
+
+    if push_response_tool_approval_request(&parts, state) {
+        return;
+    }
+
+    remap_response_tool_call_id(&mut parts, &state.approval_request_id_map);
+    let (tool_call_metadata, tool_result_metadata) = response_provider_tool_metadata(&parts);
+    state
+        .content
+        .push(v2t::Content::ToolCall(v2t::ToolCallPart {
+            tool_call_id: parts.tool_call_id.clone(),
+            tool_name: parts.tool_name.clone(),
+            input: parts.input,
+            provider_executed: parts.provider_executed,
+            provider_metadata: tool_call_metadata,
+            dynamic: parts.dynamic,
+            provider_options: None,
+        }));
+    if let Some(result) = parts.result {
+        state.content.push(v2t::Content::ToolResult {
+            tool_call_id: parts.tool_call_id,
+            tool_name: parts.tool_name,
+            result,
+            is_error: parts.is_error,
+            provider_metadata: tool_result_metadata,
+        });
+    }
+}
+
+fn push_response_tool_approval_request(
+    parts: &ProviderToolParts,
+    state: &mut ResponseContentAccumulator,
+) -> bool {
+    if !parts.is_approval_request {
+        return false;
+    }
+
+    let approval_id = parts
+        .approval_request_id
+        .clone()
+        .unwrap_or_else(|| parts.tool_call_id.clone());
+    let tool_call_id = Uuid::new_v4().to_string();
+    state
+        .approval_request_id_map
+        .insert(approval_id.clone(), tool_call_id.clone());
+    state
+        .content
+        .push(v2t::Content::ToolCall(v2t::ToolCallPart {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: parts.tool_name.clone(),
+            input: parts.input.clone(),
+            provider_executed: parts.provider_executed,
+            provider_metadata: None,
+            dynamic: parts.dynamic,
+            provider_options: None,
+        }));
+    state.content.push(v2t::Content::ToolApprovalRequest {
+        approval_id,
+        tool_call_id,
+        provider_metadata: None,
+    });
+    true
+}
+
+fn remap_response_tool_call_id(
+    parts: &mut ProviderToolParts,
+    approval_request_id_map: &HashMap<String, String>,
+) {
+    if let Some(approval_id) = parts.approval_request_id.as_ref() {
+        if let Some(mapped) = approval_request_id_map.get(approval_id) {
+            parts.tool_call_id = mapped.clone();
+        }
+    }
+}
+
+fn response_provider_tool_metadata(
+    parts: &ProviderToolParts,
+) -> (Option<v2t::ProviderMetadata>, Option<v2t::ProviderMetadata>) {
+    let tool_call_metadata = match parts.tool_type.as_str() {
+        "apply_patch" | "local_shell" | "shell" => parts.provider_metadata.clone(),
+        _ => None,
+    };
+    let tool_result_metadata = if parts.tool_type == "mcp" {
+        parts.provider_metadata.clone()
+    } else {
+        None
+    };
+    (tool_call_metadata, tool_result_metadata)
 }
 
 fn resolve_transport_selection(

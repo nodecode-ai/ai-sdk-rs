@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::ai_sdk_types::v2::{headers_is_empty, provider_options_is_empty, ProviderOptions};
+use crate::ai_sdk_types::v2::ProviderOptions;
 
 /// Single embedding vector.
 pub type Embedding = Vec<f32>;
@@ -11,11 +11,11 @@ pub type Embedding = Vec<f32>;
 pub struct EmbedOptions {
     #[serde(default)]
     pub values: Vec<String>,
-    #[serde(default, skip_serializing_if = "headers_is_empty")]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
     #[serde(
         default,
-        skip_serializing_if = "provider_options_is_empty",
+        skip_serializing_if = "HashMap::is_empty",
         rename = "providerOptions"
     )]
     pub provider_options: ProviderOptions,

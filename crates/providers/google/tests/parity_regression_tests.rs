@@ -8,6 +8,9 @@ use serde_json::json;
 
 use crate::ai_sdk_core::error::{SdkError, TransportError};
 use crate::ai_sdk_types::v2 as v2t;
+use crate::provider_google::shared::generate_response::{
+    parse_google_gen_ai_generate_response, parse_google_vertex_generate_response,
+};
 use crate::provider_google::shared::options::{
     parse_google_provider_options_for_scopes, GoogleProviderOptions,
 };
@@ -207,6 +210,18 @@ fn metadata_scope(meta: &Option<v2t::ProviderMetadata>) -> Option<String> {
     meta.as_ref().and_then(|m| m.keys().next().cloned())
 }
 
+async fn collect_parts<S, E>(mut stream: S, label: &str) -> Vec<v2t::StreamPart>
+where
+    S: Stream<Item = Result<v2t::StreamPart, E>> + Unpin,
+    E: std::fmt::Debug,
+{
+    let mut parts = Vec::new();
+    while let Some(part) = stream.next().await {
+        parts.push(part.unwrap_or_else(|err| panic!("{label} stream part: {err:?}")));
+    }
+    parts
+}
+
 #[tokio::test]
 async fn shared_stream_core_preserves_provider_scope_namespace() {
     let payload = json!({
@@ -236,15 +251,8 @@ async fn shared_stream_core_preserves_provider_scope_namespace() {
     let mut vertex_stream =
         build_google_stream_part_stream(stream_input(payload), vec![], false, "google-vertex");
 
-    let mut google_parts = Vec::new();
-    let mut vertex_parts = Vec::new();
-
-    while let Some(part) = google_stream.next().await {
-        google_parts.push(part.expect("google stream part"));
-    }
-    while let Some(part) = vertex_stream.next().await {
-        vertex_parts.push(part.expect("vertex stream part"));
-    }
+    let google_parts = collect_parts(&mut google_stream, "google").await;
+    let vertex_parts = collect_parts(&mut vertex_stream, "google-vertex").await;
 
     let google_text_scope = google_parts.iter().find_map(|part| match part {
         v2t::StreamPart::TextStart {
@@ -321,61 +329,251 @@ async fn shared_stream_core_normalizes_reasoning_tool_raw_and_finish() {
 
     let mut google_stream =
         build_google_stream_part_stream(stream_inputs(vec![payload]), vec![], true, "google");
-    let mut parts = Vec::new();
-    while let Some(part) = google_stream.next().await {
-        parts.push(part.expect("google stream part"));
-    }
+    let parts = collect_parts(&mut google_stream, "google").await;
 
-    assert!(matches!(&parts[0], v2t::StreamPart::StreamStart { warnings } if warnings.is_empty()));
-    assert!(matches!(&parts[1], v2t::StreamPart::Raw { .. }));
-    assert!(matches!(
-        &parts[2],
-        v2t::StreamPart::ReasoningStart { provider_metadata, .. }
-            if metadata_scope(provider_metadata).as_deref() == Some("google")
-    ));
-    assert!(matches!(
-        &parts[3],
-        v2t::StreamPart::ReasoningDelta { delta, .. } if delta == "hidden reasoning"
-    ));
-    assert!(matches!(&parts[4], v2t::StreamPart::ReasoningEnd { .. }));
-    assert!(matches!(&parts[5], v2t::StreamPart::TextStart { .. }));
-    assert!(matches!(
-        &parts[6],
-        v2t::StreamPart::TextDelta { delta, .. } if delta == "visible answer"
-    ));
-    assert!(matches!(
-        &parts[7],
-        v2t::StreamPart::ToolInputStart { tool_name, provider_executed, .. }
-            if tool_name == "weather" && !provider_executed
-    ));
-    assert!(matches!(
-        &parts[8],
-        v2t::StreamPart::ToolInputDelta { delta, provider_executed, .. }
-            if delta == "{\"city\":\"SF\"}" && !provider_executed
-    ));
-    assert!(matches!(
-        &parts[9],
-        v2t::StreamPart::ToolInputEnd { provider_executed, .. } if !provider_executed
-    ));
-    assert!(matches!(
-        &parts[10],
-        v2t::StreamPart::ToolCall(call)
-            if call.tool_name == "weather"
-                && call.input == "{\"city\":\"SF\"}"
-                && !call.provider_executed
-    ));
-    assert!(matches!(&parts[11], v2t::StreamPart::TextEnd { .. }));
-    assert!(matches!(
-        &parts[12],
-        v2t::StreamPart::Finish {
-            usage,
-            finish_reason,
-            provider_metadata,
-        } if usage.input_tokens == Some(2)
-            && usage.output_tokens == Some(3)
-            && usage.total_tokens == Some(5)
-            && usage.reasoning_tokens == Some(1)
-            && matches!(finish_reason, v2t::FinishReason::ToolCalls)
-            && metadata_scope(provider_metadata).as_deref() == Some("google")
-    ));
+    let [v2t::StreamPart::StreamStart { warnings }, v2t::StreamPart::Raw { .. }, v2t::StreamPart::ReasoningStart {
+        provider_metadata: reasoning_metadata,
+        ..
+    }, v2t::StreamPart::ReasoningDelta {
+        delta: reasoning_delta,
+        ..
+    }, v2t::StreamPart::ReasoningEnd { .. }, v2t::StreamPart::TextStart { .. }, v2t::StreamPart::TextDelta {
+        delta: visible_answer,
+        ..
+    }, v2t::StreamPart::ToolInputStart {
+        tool_name,
+        provider_executed: tool_started_by_provider,
+        ..
+    }, v2t::StreamPart::ToolInputDelta {
+        delta: tool_delta,
+        provider_executed: tool_delta_from_provider,
+        ..
+    }, v2t::StreamPart::ToolInputEnd {
+        provider_executed: tool_ended_by_provider,
+        ..
+    }, v2t::StreamPart::ToolCall(call), v2t::StreamPart::TextEnd { .. }, v2t::StreamPart::Finish {
+        usage,
+        finish_reason,
+        provider_metadata: finish_metadata,
+    }] = parts.as_slice()
+    else {
+        panic!("unexpected stream sequence: {parts:?}");
+    };
+
+    assert!(warnings.is_empty());
+    assert_eq!(
+        metadata_scope(reasoning_metadata).as_deref(),
+        Some("google")
+    );
+    assert_eq!(reasoning_delta, "hidden reasoning");
+    assert_eq!(visible_answer, "visible answer");
+    assert_eq!(tool_name, "weather");
+    assert!(!tool_started_by_provider);
+    assert_eq!(tool_delta, "{\"city\":\"SF\"}");
+    assert!(!tool_delta_from_provider);
+    assert!(!tool_ended_by_provider);
+    assert_eq!(call.tool_name, "weather");
+    assert_eq!(call.input, "{\"city\":\"SF\"}");
+    assert!(!call.provider_executed);
+    assert_eq!(usage.input_tokens, Some(2));
+    assert_eq!(usage.output_tokens, Some(3));
+    assert_eq!(usage.total_tokens, Some(5));
+    assert_eq!(usage.reasoning_tokens, Some(1));
+    assert!(matches!(finish_reason, v2t::FinishReason::ToolCalls));
+    assert_eq!(metadata_scope(finish_metadata).as_deref(), Some("google"));
+}
+
+#[test]
+fn shared_generate_response_parser_preserves_google_gen_ai_fields() {
+    let parsed = parse_google_gen_ai_generate_response(&json!({
+        "candidates": [{
+            "content": {
+                "parts": [
+                    {
+                        "executableCode": {
+                            "language": "PYTHON",
+                            "code": "print('hi')"
+                        }
+                    },
+                    {
+                        "codeExecutionResult": {
+                            "outcome": "OUTCOME_OK",
+                            "output": "hi"
+                        }
+                    },
+                    {
+                        "text": "internal thought",
+                        "thought": true,
+                        "thoughtSignature": "sig-reasoning"
+                    },
+                    {
+                        "text": "visible answer",
+                        "thoughtSignature": "sig-text"
+                    },
+                    {
+                        "functionCall": {
+                            "name": "weather",
+                            "args": {"city": "SF"}
+                        },
+                        "thoughtSignature": "sig-tool"
+                    },
+                    {
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": "abc123"
+                        }
+                    }
+                ]
+            },
+            "groundingMetadata": {
+                "groundingChunks": [{
+                    "web": {"uri": "https://example.com", "title": "Example"}
+                }]
+            },
+            "urlContextMetadata": {"status": "ok"},
+            "safetyRatings": [{"category": "SAFE"}],
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 3,
+            "candidatesTokenCount": 5,
+            "totalTokenCount": 8,
+            "thoughtsTokenCount": 2,
+            "cachedContentTokenCount": 1
+        }
+    }));
+
+    let [v2t::Content::ToolCall(code_call), v2t::Content::ToolResult {
+        tool_call_id: code_result_id,
+        tool_name: code_result_name,
+        result: code_result,
+        ..
+    }, v2t::Content::Reasoning {
+        text: reasoning_text,
+        provider_metadata: reasoning_metadata,
+    }, v2t::Content::Text {
+        text: visible_text,
+        provider_metadata: text_metadata,
+    }, v2t::Content::ToolCall(function_call), v2t::Content::File { media_type, data }, v2t::Content::SourceUrl { url, title, .. }] =
+        parsed.content.as_slice()
+    else {
+        panic!("unexpected google gen-ai content: {:?}", parsed.content);
+    };
+
+    assert_eq!(code_call.tool_name, "code_execution");
+    assert!(code_call.provider_executed);
+    assert_eq!(code_result_id, &code_call.tool_call_id);
+    assert_eq!(code_result_name, "code_execution");
+    assert_eq!(code_result["output"], json!("hi"));
+    assert_eq!(reasoning_text, "internal thought");
+    assert_eq!(
+        metadata_scope(reasoning_metadata).as_deref(),
+        Some("google")
+    );
+    assert_eq!(visible_text, "visible answer");
+    assert_eq!(metadata_scope(text_metadata).as_deref(), Some("google"));
+    assert_eq!(function_call.tool_name, "weather");
+    assert_eq!(function_call.input, "{\"city\":\"SF\"}");
+    assert_eq!(
+        function_call
+            .provider_options
+            .as_ref()
+            .and_then(|options| options.keys().next())
+            .map(String::as_str),
+        Some("google")
+    );
+    assert_eq!(media_type, "image/png");
+    assert_eq!(data, "abc123");
+    assert_eq!(url, "https://example.com");
+    assert_eq!(title.as_deref(), Some("Example"));
+    assert!(matches!(parsed.finish_reason, v2t::FinishReason::ToolCalls));
+    assert_eq!(parsed.usage.input_tokens, Some(3));
+    assert_eq!(parsed.usage.output_tokens, Some(5));
+    assert_eq!(parsed.usage.total_tokens, Some(8));
+    assert_eq!(parsed.usage.reasoning_tokens, Some(2));
+    assert_eq!(parsed.usage.cached_input_tokens, Some(1));
+    let provider_metadata = parsed.provider_metadata.expect("google provider metadata");
+    assert!(provider_metadata.contains_key("google"));
+    assert_eq!(
+        provider_metadata["google"]["usageMetadata"]["thoughtsTokenCount"],
+        json!(2)
+    );
+}
+
+#[test]
+fn shared_generate_response_parser_preserves_google_vertex_fields() {
+    let parsed = parse_google_vertex_generate_response(&json!({
+        "candidates": [{
+            "content": {
+                "parts": [
+                    {
+                        "text": "vertex thought",
+                        "thought": true,
+                        "thoughtSignature": "sig-vertex"
+                    },
+                    {
+                        "functionCall": {
+                            "name": "weather",
+                            "args": null
+                        },
+                        "thoughtSignature": "sig-tool"
+                    },
+                    {
+                        "functionResponse": {
+                            "name": "weather",
+                            "response": {
+                                "content": {"tempC": 20}
+                            }
+                        }
+                    },
+                    {
+                        "inlineData": {
+                            "mimeType": "application/pdf",
+                            "data": "xyz"
+                        }
+                    }
+                ]
+            }
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 4,
+            "candidatesTokenCount": 6,
+            "totalTokenCount": 10,
+            "thoughtsTokenCount": 99,
+            "cachedContentTokenCount": 77
+        }
+    }));
+
+    let [v2t::Content::Reasoning {
+        text: reasoning_text,
+        provider_metadata: reasoning_metadata,
+    }, v2t::Content::ToolCall(tool_call), v2t::Content::ToolResult {
+        tool_call_id: tool_result_id,
+        tool_name: tool_result_name,
+        result: tool_result,
+        ..
+    }, v2t::Content::File { media_type, data }] = parsed.content.as_slice()
+    else {
+        panic!("unexpected google vertex content: {:?}", parsed.content);
+    };
+
+    assert_eq!(reasoning_text, "vertex thought");
+    assert_eq!(
+        metadata_scope(reasoning_metadata).as_deref(),
+        Some("google-vertex")
+    );
+    assert_eq!(tool_call.tool_name, "weather");
+    assert_eq!(tool_call.input, "{}");
+    assert_eq!(tool_result_id, &tool_call.tool_call_id);
+    assert_eq!(tool_result_name, "weather");
+    assert_eq!(tool_result["tempC"], json!(20));
+    assert_eq!(media_type, "application/pdf");
+    assert_eq!(data, "xyz");
+    assert!(matches!(parsed.finish_reason, v2t::FinishReason::Stop));
+    assert_eq!(parsed.usage.input_tokens, Some(4));
+    assert_eq!(parsed.usage.output_tokens, Some(6));
+    assert_eq!(parsed.usage.total_tokens, Some(10));
+    assert_eq!(parsed.usage.reasoning_tokens, None);
+    assert_eq!(parsed.usage.cached_input_tokens, None);
+    assert!(parsed.provider_metadata.is_none());
 }

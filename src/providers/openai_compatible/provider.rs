@@ -28,68 +28,6 @@ use crate::provider_openai_compatible::image::image_model::{
 
 const _TRACE_PREFIX: &str = "[OPENAI-COMP-CMPL]";
 
-fn default_headers_from_creds(
-    api_key: Option<String>,
-    bearer: Option<String>,
-) -> Vec<(String, String)> {
-    let mut h = vec![
-        ("content-type".to_string(), "application/json".to_string()),
-        ("accept".to_string(), "application/json".to_string()),
-    ];
-    if let Some(b) = bearer {
-        h.push((
-            "authorization".into(),
-            if b.to_lowercase().starts_with("bearer ") {
-                b
-            } else {
-                format!("Bearer {}", b)
-            },
-        ));
-    } else if let Some(k) = api_key {
-        h.push(("authorization".into(), format!("Bearer {}", k)));
-    }
-    h
-}
-
-fn user_agent_suffix() -> String {
-    let pkg_version = env!("CARGO_PKG_VERSION");
-    format!("ai-sdk/openai-compatible/{pkg_version}")
-}
-
-fn apply_user_agent_suffix(headers: &mut BTreeMap<String, String>) {
-    let suffix = user_agent_suffix();
-    let existing = headers.remove("user-agent").unwrap_or_default();
-    let value = if existing.trim().is_empty() {
-        suffix
-    } else {
-        format!("{existing} {suffix}")
-    };
-    headers.insert("user-agent".into(), value);
-}
-
-fn build_headers_from_pairs(
-    header_pairs: &[(String, String)],
-    api_key: Option<String>,
-    bearer: Option<String>,
-) -> Vec<(String, String)> {
-    let mut headers: BTreeMap<String, String> = BTreeMap::new();
-    for (k, v) in default_headers_from_creds(api_key, bearer) {
-        headers.insert(k.to_ascii_lowercase(), v);
-    }
-    for (k, v) in header_pairs.iter() {
-        let kl = k.to_ascii_lowercase();
-        if kl == "content-type" || kl == "accept" || kl == "authorization" || kl == "x-api-key" {
-            continue;
-        }
-        if sdkopt::is_internal_sdk_header(&kl) {
-            continue;
-        }
-        headers.insert(kl, v.clone());
-    }
-    apply_user_agent_suffix(&mut headers);
-    headers.into_iter().collect()
-}
-
 struct BaseConfig {
     base_url: String,
     headers: Vec<(String, String)>,
@@ -97,39 +35,6 @@ struct BaseConfig {
     transport_cfg: TransportConfig,
     query_params: Vec<(String, String)>,
     default_options: Option<v2t::ProviderOptions>,
-}
-
-fn build_base_config_from_parts(
-    provider_scope_name: &str,
-    base_url: String,
-    header_pairs: Vec<(String, String)>,
-    api_key: Option<String>,
-    bearer: Option<String>,
-    transport_cfg: TransportConfig,
-    query_params: Vec<(String, String)>,
-    default_options: Option<v2t::ProviderOptions>,
-) -> Result<BaseConfig, SdkError> {
-    let base_url = base_url.trim().to_string();
-    if base_url.is_empty() {
-        return Err(SdkError::InvalidArgument {
-            message: format!(
-                "openai-compatible provider '{}' requires base_url",
-                provider_scope_name
-            ),
-        });
-    }
-    let headers = build_headers_from_pairs(&header_pairs, api_key, bearer);
-    let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
-        .map_err(SdkError::Transport)?;
-
-    Ok(BaseConfig {
-        base_url,
-        headers,
-        http,
-        transport_cfg,
-        query_params,
-        default_options,
-    })
 }
 
 #[derive(Clone, Debug)]
@@ -231,16 +136,65 @@ impl OpenAICompatibleBuilderBase {
     fn build(self) -> Result<(String, String, BaseConfig), SdkError> {
         let provider_scope_name = self.provider_scope_name;
         let model_id = self.model_id;
-        let base = build_base_config_from_parts(
-            &provider_scope_name,
-            self.base_url.unwrap_or_default(),
-            self.headers,
-            self.api_key,
-            self.bearer,
-            self.transport_cfg,
-            self.query_params,
-            self.default_options,
-        )?;
+        let base_url = self.base_url.unwrap_or_default();
+        let base_url = base_url.trim().to_string();
+        if base_url.is_empty() {
+            return Err(SdkError::InvalidArgument {
+                message: format!(
+                    "openai-compatible provider '{}' requires base_url",
+                    provider_scope_name
+                ),
+            });
+        }
+
+        let mut headers: BTreeMap<String, String> = BTreeMap::from([
+            ("accept".to_string(), "application/json".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ]);
+
+        if let Some(bearer) = self.bearer {
+            let authorization = if bearer.to_lowercase().starts_with("bearer ") {
+                bearer
+            } else {
+                format!("Bearer {bearer}")
+            };
+            headers.insert("authorization".into(), authorization);
+        } else if let Some(api_key) = self.api_key {
+            headers.insert("authorization".into(), format!("Bearer {api_key}"));
+        }
+
+        for (key, value) in self.headers {
+            let key = key.to_ascii_lowercase();
+            if matches!(
+                key.as_str(),
+                "accept" | "authorization" | "content-type" | "x-api-key"
+            ) || sdkopt::is_internal_sdk_header(&key)
+            {
+                continue;
+            }
+            headers.insert(key, value);
+        }
+
+        let user_agent_suffix = format!("ai-sdk/openai-compatible/{}", env!("CARGO_PKG_VERSION"));
+        let user_agent = headers.remove("user-agent").unwrap_or_default();
+        let user_agent = if user_agent.trim().is_empty() {
+            user_agent_suffix
+        } else {
+            format!("{user_agent} {user_agent_suffix}")
+        };
+        headers.insert("user-agent".into(), user_agent);
+
+        let transport_cfg = self.transport_cfg;
+        let http = crate::reqwest_transport::ReqwestTransport::try_new(&transport_cfg)
+            .map_err(SdkError::Transport)?;
+        let base = BaseConfig {
+            base_url,
+            headers: headers.into_iter().collect(),
+            http,
+            transport_cfg,
+            query_params: self.query_params,
+            default_options: self.default_options,
+        };
         Ok((model_id, provider_scope_name, base))
     }
 }

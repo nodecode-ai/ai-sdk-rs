@@ -34,6 +34,54 @@ pub struct OpenAICompatibleChatLanguageModel<
     cfg: OpenAICompatibleChatConfig<T>,
 }
 
+fn insert_json_value(
+    body_map: &mut serde_json::Map<String, JsonValue>,
+    key: &str,
+    value: Option<JsonValue>,
+) {
+    if let Some(value) = value {
+        body_map.insert(key.into(), value);
+    }
+}
+
+fn build_response_format(
+    supports_structured_outputs: bool,
+    response_format: &Option<v2t::ResponseFormat>,
+    warnings: &mut Vec<v2t::CallWarning>,
+) -> Option<JsonValue> {
+    match response_format {
+        Some(v2t::ResponseFormat::Json {
+            schema,
+            name,
+            description,
+        }) => {
+            if supports_structured_outputs {
+                Some(match schema {
+                    Some(schema) => json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "schema": schema,
+                            "name": name.clone().unwrap_or_else(|| "response".into()),
+                            "description": description,
+                        }
+                    }),
+                    None => json!({"type":"json_object"}),
+                })
+            } else {
+                warnings.push(v2t::CallWarning::UnsupportedSetting {
+                    setting: "responseFormat".into(),
+                    details: Some(
+                        "JSON response format schema is only supported with structuredOutputs"
+                            .into(),
+                    ),
+                });
+                Some(json!({"type":"json_object"}))
+            }
+        }
+        _ => None,
+    }
+}
+
 impl<T: HttpTransport> OpenAICompatibleChatLanguageModel<T> {
     pub fn new(model_id: impl Into<String>, cfg: OpenAICompatibleChatConfig<T>) -> Self {
         Self {
@@ -71,34 +119,11 @@ impl<T: HttpTransport> OpenAICompatibleChatLanguageModel<T> {
             });
         }
 
-        // Response format JSON handling (structured outputs)
-        let response_format = match &options.response_format {
-            Some(v2t::ResponseFormat::Json {
-                schema,
-                name,
-                description,
-            }) => {
-                if self.cfg.supports_structured_outputs {
-                    if let Some(s) = schema {
-                        Some(
-                            json!({"type":"json_schema","json_schema": {"schema": s, "name": name.clone().unwrap_or_else(|| "response".into()), "description": description } }),
-                        )
-                    } else {
-                        Some(json!({"type":"json_object"}))
-                    }
-                } else {
-                    warnings.push(v2t::CallWarning::UnsupportedSetting {
-                        setting: "responseFormat".into(),
-                        details: Some(
-                            "JSON response format schema is only supported with structuredOutputs"
-                                .into(),
-                        ),
-                    });
-                    Some(json!({"type":"json_object"}))
-                }
-            }
-            _ => None,
-        };
+        let response_format = build_response_format(
+            self.cfg.supports_structured_outputs,
+            &options.response_format,
+            &mut warnings,
+        );
 
         // Provider options and extras
         let scope_names = ["openai-compatible", self.cfg.provider_scope_name.as_str()];
@@ -119,7 +144,7 @@ impl<T: HttpTransport> OpenAICompatibleChatLanguageModel<T> {
 
         // Prepare tools & tool_choice
         let prep = prepare_tools(&options.tools, &options.tool_choice);
-        warnings.extend(prep.warnings.into_iter());
+        warnings.extend(prep.warnings);
 
         let OpenAICompatibleChatProviderOptions {
             user,
@@ -136,45 +161,55 @@ impl<T: HttpTransport> OpenAICompatibleChatLanguageModel<T> {
                 &options.prompt
             )),
         );
-        if let Some(u) = user {
-            body_map.insert("user".into(), json!(u));
-        }
-        if let Some(mt) = options.max_output_tokens {
-            body_map.insert("max_tokens".into(), json!(mt));
-        }
-        if let Some(t) = options.temperature {
-            body_map.insert("temperature".into(), json!(t));
-        }
-        if let Some(tp) = options.top_p {
-            body_map.insert("top_p".into(), json!(tp));
-        }
-        if let Some(fp) = options.frequency_penalty {
-            body_map.insert("frequency_penalty".into(), json!(fp));
-        }
-        if let Some(pp) = options.presence_penalty {
-            body_map.insert("presence_penalty".into(), json!(pp));
-        }
-        if let Some(stop) = options.stop_sequences.as_ref() {
-            body_map.insert("stop".into(), json!(stop));
-        }
-        if let Some(seed) = options.seed {
-            body_map.insert("seed".into(), json!(seed));
-        }
-        if let Some(tools) = prep.tools {
-            body_map.insert("tools".into(), json!(tools));
-        }
-        if let Some(choice) = prep.tool_choice {
-            body_map.insert("tool_choice".into(), choice);
-        }
-        if let Some(rf) = response_format {
-            body_map.insert("response_format".into(), rf);
-        }
-        if let Some(re) = reasoning_effort {
-            body_map.insert("reasoning_effort".into(), JsonValue::String(re));
-        }
-        if let Some(verbosity) = text_verbosity {
-            body_map.insert("verbosity".into(), JsonValue::String(verbosity));
-        }
+        insert_json_value(&mut body_map, "user", user.map(JsonValue::String));
+        insert_json_value(
+            &mut body_map,
+            "max_tokens",
+            options.max_output_tokens.map(|value| json!(value)),
+        );
+        insert_json_value(
+            &mut body_map,
+            "temperature",
+            options.temperature.map(|value| json!(value)),
+        );
+        insert_json_value(
+            &mut body_map,
+            "top_p",
+            options.top_p.map(|value| json!(value)),
+        );
+        insert_json_value(
+            &mut body_map,
+            "frequency_penalty",
+            options.frequency_penalty.map(|value| json!(value)),
+        );
+        insert_json_value(
+            &mut body_map,
+            "presence_penalty",
+            options.presence_penalty.map(|value| json!(value)),
+        );
+        insert_json_value(
+            &mut body_map,
+            "stop",
+            options.stop_sequences.as_ref().map(|value| json!(value)),
+        );
+        insert_json_value(
+            &mut body_map,
+            "seed",
+            options.seed.map(|value| json!(value)),
+        );
+        insert_json_value(&mut body_map, "tools", prep.tools.map(|value| json!(value)));
+        insert_json_value(&mut body_map, "tool_choice", prep.tool_choice);
+        insert_json_value(&mut body_map, "response_format", response_format);
+        insert_json_value(
+            &mut body_map,
+            "reasoning_effort",
+            reasoning_effort.map(JsonValue::String),
+        );
+        insert_json_value(
+            &mut body_map,
+            "verbosity",
+            text_verbosity.map(JsonValue::String),
+        );
         if let Some(extras) = prov_extras {
             for (k, v) in extras {
                 tracing::info!("[PROVOPTS]: chat extra {}", k);

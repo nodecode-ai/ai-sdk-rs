@@ -375,56 +375,36 @@ where
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk?;
             for event in decoder.push(&chunk) {
-                if event.data.is_empty() {
-                    continue;
-                }
-                if event.data.as_ref() == b"[DONE]" {
-                    continue;
-                }
-
-                let raw_value = match serde_json::from_slice::<JsonValue>(&event.data) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        if include_raw {
-                            yield v2t::StreamPart::Raw {
-                                raw_value: JsonValue::String(String::from_utf8_lossy(&event.data).to_string()),
-                            };
-                        }
-                        continue;
-                    }
-                };
-
-                for part in state.process_chunk(raw_value.clone(), include_raw) {
+                for part in decode_gateway_event_data(&mut state, &event.data, include_raw) {
                     yield part;
                 }
             }
         }
 
         for event in decoder.finish() {
-            if event.data.is_empty() {
-                continue;
-            }
-            if event.data.as_ref() == b"[DONE]" {
-                continue;
-            }
-            match serde_json::from_slice::<JsonValue>(&event.data) {
-                Ok(raw_value) => {
-                    for part in state.process_chunk(raw_value, include_raw) {
-                        yield part;
-                    }
-                }
-                Err(_) => {
-                    if include_raw {
-                        yield v2t::StreamPart::Raw {
-                            raw_value: JsonValue::String(
-                                String::from_utf8_lossy(&event.data).to_string(),
-                            ),
-                        };
-                    }
-                }
+            for part in decode_gateway_event_data(&mut state, &event.data, include_raw) {
+                yield part;
             }
         }
     })
+}
+
+fn decode_gateway_event_data(
+    state: &mut GatewayStreamState,
+    data: &[u8],
+    include_raw: bool,
+) -> Vec<v2t::StreamPart> {
+    if data.is_empty() || data == b"[DONE]" {
+        return Vec::new();
+    }
+
+    match serde_json::from_slice::<JsonValue>(data) {
+        Ok(raw_value) => state.process_chunk(raw_value, include_raw),
+        Err(_) if include_raw => vec![v2t::StreamPart::Raw {
+            raw_value: JsonValue::String(String::from_utf8_lossy(data).to_string()),
+        }],
+        Err(_) => Vec::new(),
+    }
 }
 
 struct GatewayStreamState {
@@ -454,24 +434,23 @@ impl Default for GatewayStreamState {
 }
 
 impl GatewayStreamState {
-    fn process_chunk(&mut self, value: JsonValue, include_raw: bool) -> Vec<v2t::StreamPart> {
-        let mut parts = Vec::new();
-        let chunk_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    fn stream_start_parts(&mut self, value: &JsonValue) -> Vec<v2t::StreamPart> {
+        self.stream_started = true;
+        let warnings = parse_call_warnings(value.get("warnings").unwrap_or(&JsonValue::Null));
+        vec![v2t::StreamPart::StreamStart { warnings }]
+    }
 
-        if chunk_type == "stream-start" {
-            self.stream_started = true;
-            let warnings = parse_call_warnings(value.get("warnings").unwrap_or(&JsonValue::Null));
-            parts.push(v2t::StreamPart::StreamStart { warnings });
-            return parts;
-        }
-
+    fn ensure_stream_started(&mut self, parts: &mut Vec<v2t::StreamPart>) {
         if !self.stream_started {
             self.stream_started = true;
             parts.push(v2t::StreamPart::StreamStart {
                 warnings: Vec::new(),
             });
         }
+    }
 
+    fn process_text_chunk(&mut self, chunk_type: &str, value: &JsonValue) -> Vec<v2t::StreamPart> {
+        let mut parts = Vec::new();
         match chunk_type {
             "text-start" => {
                 let id = self.ensure_text_id(value.get("id").and_then(|v| v.as_str()));
@@ -515,6 +494,18 @@ impl GatewayStreamState {
                 }
                 self.current_text_id = None;
             }
+            _ => {}
+        }
+        parts
+    }
+
+    fn process_reasoning_chunk(
+        &mut self,
+        chunk_type: &str,
+        value: &JsonValue,
+    ) -> Vec<v2t::StreamPart> {
+        let mut parts = Vec::new();
+        match chunk_type {
             "reasoning-start" => {
                 let id = self.ensure_reasoning_id(value.get("id").and_then(|v| v.as_str()));
                 if self.normalizer.reasoning_open.as_ref() != Some(&id) {
@@ -535,9 +526,8 @@ impl GatewayStreamState {
                 let id = self.ensure_reasoning_id(value.get("id").and_then(|v| v.as_str()));
                 let metadata = provider_metadata_from_value(value.get("providerMetadata"));
                 if self.normalizer.reasoning_open.as_ref() != Some(&id) {
-                    parts.extend(self.normalizer.open_reasoning(id.clone(), metadata.clone()));
+                    parts.extend(self.normalizer.open_reasoning(id, metadata.clone()));
                 }
-                let _ = id;
                 parts.push(
                     self.normalizer
                         .push_reasoning_delta("reasoning-1", delta, metadata),
@@ -553,6 +543,14 @@ impl GatewayStreamState {
                 }
                 self.current_reasoning_id = None;
             }
+            _ => {}
+        }
+        parts
+    }
+
+    fn process_tool_chunk(&mut self, chunk_type: &str, value: &JsonValue) -> Vec<v2t::StreamPart> {
+        let mut parts = Vec::new();
+        match chunk_type {
             "tool-input-start" => {
                 if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
                     let tool_name = value
@@ -665,88 +663,126 @@ impl GatewayStreamState {
                     });
                 }
             }
-            "file" => {
-                if let (Some(media_type), Some(data_str)) = (
-                    value.get("mediaType").and_then(|v| v.as_str()),
-                    value.get("data").and_then(|v| v.as_str()),
+            _ => {}
+        }
+        parts
+    }
+
+    fn process_file_chunk(&self, value: &JsonValue, include_raw: bool) -> Vec<v2t::StreamPart> {
+        if let (Some(media_type), Some(data_str)) = (
+            value.get("mediaType").and_then(|v| v.as_str()),
+            value.get("data").and_then(|v| v.as_str()),
+        ) {
+            return vec![v2t::StreamPart::File {
+                media_type: media_type.to_string(),
+                data: data_str.to_string(),
+            }];
+        }
+        if include_raw {
+            vec![v2t::StreamPart::Raw {
+                raw_value: value.clone(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn process_source_chunk(&self, value: &JsonValue, include_raw: bool) -> Vec<v2t::StreamPart> {
+        let Some(source_type) = value.get("sourceType").and_then(|v| v.as_str()) else {
+            return Vec::new();
+        };
+
+        match source_type {
+            "url" => {
+                if let (Some(id), Some(url)) = (
+                    value.get("id").and_then(|v| v.as_str()),
+                    value.get("url").and_then(|v| v.as_str()),
                 ) {
-                    parts.push(v2t::StreamPart::File {
-                        media_type: media_type.to_string(),
-                        data: data_str.to_string(),
-                    });
-                } else if include_raw {
-                    parts.push(v2t::StreamPart::Raw { raw_value: value });
+                    let title = value
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let metadata = provider_metadata_from_value(value.get("providerMetadata"));
+                    return vec![v2t::StreamPart::SourceUrl {
+                        id: id.to_string(),
+                        url: url.to_string(),
+                        title,
+                        provider_metadata: metadata,
+                    }];
                 }
+                Vec::new()
             }
-            "source" => {
-                if let Some(source_type) = value.get("sourceType").and_then(|v| v.as_str()) {
-                    match source_type {
-                        "url" => {
-                            if let (Some(id), Some(url)) = (
-                                value.get("id").and_then(|v| v.as_str()),
-                                value.get("url").and_then(|v| v.as_str()),
-                            ) {
-                                let title = value
-                                    .get("title")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
-                                let metadata =
-                                    provider_metadata_from_value(value.get("providerMetadata"));
-                                parts.push(v2t::StreamPart::SourceUrl {
-                                    id: id.to_string(),
-                                    url: url.to_string(),
-                                    title,
-                                    provider_metadata: metadata,
-                                });
-                            }
-                        }
-                        _ => {
-                            if include_raw {
-                                parts.push(v2t::StreamPart::Raw { raw_value: value });
-                            }
-                        }
-                    }
-                }
+            _ if include_raw => vec![v2t::StreamPart::Raw {
+                raw_value: value.clone(),
+            }],
+            _ => Vec::new(),
+        }
+    }
+
+    fn process_finish_chunk(&mut self, value: &JsonValue) -> Vec<v2t::StreamPart> {
+        if self.finished_emitted {
+            return Vec::new();
+        }
+        let usage = parse_usage(value.get("usage"));
+        let finish_reason = parse_finish_reason(
+            value
+                .get("finishReason")
+                .or_else(|| value.get("finish_reason")),
+        );
+        let metadata = provider_metadata_from_value(value.get("providerMetadata"));
+        self.normalizer.usage = usage;
+        self.finished_emitted = true;
+        vec![self.normalizer.finish_part(finish_reason, metadata)]
+    }
+
+    fn process_raw_chunk(&self, value: &JsonValue, include_raw: bool) -> Vec<v2t::StreamPart> {
+        if !include_raw {
+            return Vec::new();
+        }
+        value
+            .get("rawValue")
+            .cloned()
+            .map(|raw_value| vec![v2t::StreamPart::Raw { raw_value }])
+            .unwrap_or_default()
+    }
+
+    fn process_chunk(&mut self, value: JsonValue, include_raw: bool) -> Vec<v2t::StreamPart> {
+        let chunk_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if chunk_type == "stream-start" {
+            return self.stream_start_parts(&value);
+        }
+
+        let mut parts = Vec::new();
+        self.ensure_stream_started(&mut parts);
+        let chunk_parts = match chunk_type {
+            "text-start" | "text-delta" | "text-end" => self.process_text_chunk(chunk_type, &value),
+            "reasoning-start" | "reasoning-delta" | "reasoning-end" => {
+                self.process_reasoning_chunk(chunk_type, &value)
             }
+            "tool-input-start" | "tool-input-delta" | "tool-input-end" | "tool-call"
+            | "tool-result" => self.process_tool_chunk(chunk_type, &value),
+            "file" => self.process_file_chunk(&value, include_raw),
+            "source" => self.process_source_chunk(&value, include_raw),
             "response-metadata" => {
                 let meta = parse_response_metadata(&value);
-                parts.push(v2t::StreamPart::ResponseMetadata { meta });
+                vec![v2t::StreamPart::ResponseMetadata { meta }]
             }
-            "finish" => {
-                if self.finished_emitted {
-                    return parts;
-                }
-                let usage = parse_usage(value.get("usage"));
-                let finish_reason = parse_finish_reason(
-                    value
-                        .get("finishReason")
-                        .or_else(|| value.get("finish_reason")),
-                );
-                let metadata = provider_metadata_from_value(value.get("providerMetadata"));
-                self.normalizer.usage = usage;
-                parts.push(self.normalizer.finish_part(finish_reason, metadata));
-                self.finished_emitted = true;
-            }
+            "finish" => self.process_finish_chunk(&value),
             "error" => {
                 let payload = value
                     .get("error")
                     .cloned()
                     .unwrap_or(JsonValue::String("Gateway error".into()));
-                parts.push(v2t::StreamPart::Error { error: payload });
+                vec![v2t::StreamPart::Error { error: payload }]
             }
-            "raw" => {
-                if include_raw {
-                    if let Some(raw_value) = value.get("rawValue").cloned() {
-                        parts.push(v2t::StreamPart::Raw { raw_value });
-                    }
-                }
-            }
-            _ => {
-                if include_raw {
-                    parts.push(v2t::StreamPart::Raw { raw_value: value });
-                }
-            }
-        }
+            "raw" => self.process_raw_chunk(&value, include_raw),
+            _ if include_raw => vec![v2t::StreamPart::Raw {
+                raw_value: value.clone(),
+            }],
+            _ => Vec::new(),
+        };
+        parts.extend(chunk_parts);
         parts
     }
 
@@ -934,78 +970,73 @@ mod tests {
         Ok(Bytes::from(format!("data: {value}\n\n")))
     }
 
-    #[tokio::test]
-    async fn decode_gateway_stream_normalizes_text_reasoning_tool_raw_and_finish() {
-        let parts: Vec<v2t::StreamPart> = decode_gateway_stream(
-            stream::iter(vec![
-                sse_chunk(json!({
-                    "type": "stream-start",
-                    "warnings": [{"type": "other", "message": "gateway warning"}]
-                })),
-                sse_chunk(json!({
-                    "type": "response-metadata",
-                    "id": "resp-gateway-1",
-                    "modelId": "gateway-model",
-                    "timestamp": "2026-01-02T03:04:05Z"
-                })),
-                sse_chunk(json!({
-                    "type": "reasoning-delta",
-                    "delta": "thinking",
-                    "providerMetadata": {"gateway": {"phase": "reasoning"}}
-                })),
-                sse_chunk(json!({
-                    "type": "text-delta",
-                    "delta": "hello",
-                    "providerMetadata": {"gateway": {"phase": "text"}}
-                })),
-                sse_chunk(json!({
-                    "type": "tool-input-start",
-                    "id": "call-1",
-                    "toolName": "weather",
-                    "providerExecuted": false
-                })),
-                sse_chunk(json!({
-                    "type": "tool-input-delta",
-                    "id": "call-1",
-                    "delta": "{\"city\":\"SF\"}",
-                    "providerExecuted": false
-                })),
-                sse_chunk(json!({
-                    "type": "tool-input-end",
-                    "id": "call-1",
-                    "providerExecuted": false
-                })),
-                sse_chunk(json!({
-                    "type": "tool-call",
-                    "toolCallId": "call-1",
-                    "toolName": "weather",
-                    "input": {"city": "SF"},
-                    "providerExecuted": false
-                })),
-                sse_chunk(json!({
-                    "type": "raw",
-                    "rawValue": {"upstream": "frame-9"}
-                })),
-                sse_chunk(json!({
-                    "type": "finish",
-                    "finishReason": "tool-calls",
-                    "usage": {
-                        "prompt_tokens": 2,
-                        "completion_tokens": 3,
-                        "total_tokens": 5
-                    },
-                    "providerMetadata": {"gateway": {"finishSource": "gateway"}}
-                })),
-                Ok(Bytes::from_static(b"data: [DONE]\n\n")),
-            ]),
-            true,
-        )
-        .try_collect()
-        .await
-        .expect("gateway stream parts");
+    fn gateway_stream_fixture() -> Vec<Result<Bytes, SdkError>> {
+        vec![
+            sse_chunk(json!({
+                "type": "stream-start",
+                "warnings": [{"type": "other", "message": "gateway warning"}]
+            })),
+            sse_chunk(json!({
+                "type": "response-metadata",
+                "id": "resp-gateway-1",
+                "modelId": "gateway-model",
+                "timestamp": "2026-01-02T03:04:05Z"
+            })),
+            sse_chunk(json!({
+                "type": "reasoning-delta",
+                "delta": "thinking",
+                "providerMetadata": {"gateway": {"phase": "reasoning"}}
+            })),
+            sse_chunk(json!({
+                "type": "text-delta",
+                "delta": "hello",
+                "providerMetadata": {"gateway": {"phase": "text"}}
+            })),
+            sse_chunk(json!({
+                "type": "tool-input-start",
+                "id": "call-1",
+                "toolName": "weather",
+                "providerExecuted": false
+            })),
+            sse_chunk(json!({
+                "type": "tool-input-delta",
+                "id": "call-1",
+                "delta": "{\"city\":\"SF\"}",
+                "providerExecuted": false
+            })),
+            sse_chunk(json!({
+                "type": "tool-input-end",
+                "id": "call-1",
+                "providerExecuted": false
+            })),
+            sse_chunk(json!({
+                "type": "tool-call",
+                "toolCallId": "call-1",
+                "toolName": "weather",
+                "input": {"city": "SF"},
+                "providerExecuted": false
+            })),
+            sse_chunk(json!({
+                "type": "raw",
+                "rawValue": {"upstream": "frame-9"}
+            })),
+            sse_chunk(json!({
+                "type": "finish",
+                "finishReason": "tool-calls",
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 3,
+                    "total_tokens": 5
+                },
+                "providerMetadata": {"gateway": {"finishSource": "gateway"}}
+            })),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ]
+    }
 
+    fn assert_gateway_stream_start(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[0],
+            part,
             v2t::StreamPart::StreamStart { warnings }
                 if warnings.len() == 1
                     && matches!(
@@ -1013,14 +1044,20 @@ mod tests {
                         v2t::CallWarning::Other { ref message } if message == "gateway warning"
                     )
         ));
+    }
+
+    fn assert_gateway_response_metadata(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[1],
+            part,
             v2t::StreamPart::ResponseMetadata { meta }
                 if meta.id.as_deref() == Some("resp-gateway-1")
                     && meta.model_id.as_deref() == Some("gateway-model")
         ));
+    }
+
+    fn assert_gateway_reasoning_start(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[2],
+            part,
             v2t::StreamPart::ReasoningStart { id, provider_metadata }
                 if id == "reasoning-1"
                     && provider_metadata
@@ -1029,13 +1066,19 @@ mod tests {
                         .and_then(|inner| inner.get("phase"))
                         == Some(&json!("reasoning"))
         ));
+    }
+
+    fn assert_gateway_reasoning_delta(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[3],
+            part,
             v2t::StreamPart::ReasoningDelta { id, delta, .. }
                 if id == "reasoning-1" && delta == "thinking"
         ));
+    }
+
+    fn assert_gateway_text_start(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[4],
+            part,
             v2t::StreamPart::TextStart { id, provider_metadata }
                 if id == "text-1"
                     && provider_metadata
@@ -1044,41 +1087,62 @@ mod tests {
                         .and_then(|inner| inner.get("phase"))
                         == Some(&json!("text"))
         ));
+    }
+
+    fn assert_gateway_text_delta(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[5],
+            part,
             v2t::StreamPart::TextDelta { id, delta, .. }
                 if id == "text-1" && delta == "hello"
         ));
+    }
+
+    fn assert_gateway_tool_input_start(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[6],
+            part,
             v2t::StreamPart::ToolInputStart { id, tool_name, provider_executed, .. }
                 if id == "call-1" && tool_name == "weather" && !provider_executed
         ));
+    }
+
+    fn assert_gateway_tool_input_delta(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[7],
+            part,
             v2t::StreamPart::ToolInputDelta { id, delta, provider_executed, .. }
                 if id == "call-1" && delta == "{\"city\":\"SF\"}" && !provider_executed
         ));
+    }
+
+    fn assert_gateway_tool_input_end(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[8],
+            part,
             v2t::StreamPart::ToolInputEnd { id, provider_executed, .. }
                 if id == "call-1" && !provider_executed
         ));
+    }
+
+    fn assert_gateway_tool_call(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[9],
+            part,
             v2t::StreamPart::ToolCall(call)
                 if call.tool_call_id == "call-1"
                     && call.tool_name == "weather"
                     && call.input == "{\"city\":\"SF\"}"
                     && !call.provider_executed
         ));
+    }
+
+    fn assert_gateway_raw(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[10],
+            part,
             v2t::StreamPart::Raw { raw_value }
                 if raw_value == &json!({"upstream": "frame-9"})
         ));
+    }
+
+    fn assert_gateway_finish(part: &v2t::StreamPart) {
         assert!(matches!(
-            &parts[11],
+            part,
             v2t::StreamPart::Finish {
                 usage,
                 finish_reason,
@@ -1093,5 +1157,31 @@ mod tests {
                     .and_then(|inner| inner.get("finishSource"))
                     == Some(&json!("gateway"))
         ));
+    }
+
+    fn assert_gateway_stream_parts(parts: &[v2t::StreamPart]) {
+        assert_gateway_stream_start(&parts[0]);
+        assert_gateway_response_metadata(&parts[1]);
+        assert_gateway_reasoning_start(&parts[2]);
+        assert_gateway_reasoning_delta(&parts[3]);
+        assert_gateway_text_start(&parts[4]);
+        assert_gateway_text_delta(&parts[5]);
+        assert_gateway_tool_input_start(&parts[6]);
+        assert_gateway_tool_input_delta(&parts[7]);
+        assert_gateway_tool_input_end(&parts[8]);
+        assert_gateway_tool_call(&parts[9]);
+        assert_gateway_raw(&parts[10]);
+        assert_gateway_finish(&parts[11]);
+    }
+
+    #[tokio::test]
+    async fn decode_gateway_stream_normalizes_text_reasoning_tool_raw_and_finish() {
+        let parts: Vec<v2t::StreamPart> =
+            decode_gateway_stream(stream::iter(gateway_stream_fixture()), true)
+                .try_collect()
+                .await
+                .expect("gateway stream parts");
+
+        assert_gateway_stream_parts(&parts);
     }
 }

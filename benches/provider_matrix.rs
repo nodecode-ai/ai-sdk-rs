@@ -30,7 +30,8 @@ fn bench_provider_generate_matrix(c: &mut Criterion) {
         b.to_async(&runtime).iter(support::run_google_generate);
     });
     group.bench_function(BenchmarkId::from_parameter("google-vertex"), |b| {
-        b.to_async(&runtime).iter(support::run_google_vertex_generate);
+        b.to_async(&runtime)
+            .iter(support::run_google_vertex_generate);
     });
 
     group.finish();

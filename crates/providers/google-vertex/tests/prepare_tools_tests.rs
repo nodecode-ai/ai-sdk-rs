@@ -1,7 +1,7 @@
 use crate::core::error::TransportError;
-use crate::types::v2 as v2t;
 use crate::providers::google::shared::error::map_transport_error_to_sdk_error;
 use crate::providers::google::shared::prepare_tools::prepare_tools;
+use crate::types::v2 as v2t;
 use serde_json::json;
 
 fn provider_tool(id: &str, args: serde_json::Value) -> v2t::Tool {

@@ -164,49 +164,77 @@ fn validate_user_location(
     Ok(())
 }
 
+fn require_filter_type<'a>(
+    tool: &v2t::ProviderTool,
+    obj: &'a Map<String, Value>,
+    path: &str,
+) -> Result<&'a str, SdkError> {
+    obj.get("type")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| invalid_tool_args(tool, format!("{path}.type is required")))
+}
+
+fn validate_nested_file_search_filters(
+    tool: &v2t::ProviderTool,
+    obj: &Map<String, Value>,
+    path: &str,
+) -> Result<(), SdkError> {
+    let filters = obj
+        .get("filters")
+        .ok_or_else(|| invalid_tool_args(tool, format!("{path}.filters is required")))?;
+    let arr = filters
+        .as_array()
+        .ok_or_else(|| invalid_tool_args(tool, format!("{path}.filters must be an array")))?;
+    for (idx, entry) in arr.iter().enumerate() {
+        validate_file_search_filter(tool, entry, &format!("{path}.filters[{idx}]"))?;
+    }
+    Ok(())
+}
+
+fn validate_file_search_filter_value(
+    tool: &v2t::ProviderTool,
+    value: &Value,
+    path: &str,
+) -> Result<(), SdkError> {
+    if value.as_str().is_some() || value.as_bool().is_some() || value.as_f64().is_some() {
+        return Ok(());
+    }
+    if let Some(arr) = value.as_array() {
+        if arr.iter().all(|item| item.as_str().is_some()) {
+            return Ok(());
+        }
+    }
+    Err(invalid_tool_args(
+        tool,
+        format!("{path} must be a string, number, boolean, or array of strings"),
+    ))
+}
+
+fn validate_comparison_file_search_filter(
+    tool: &v2t::ProviderTool,
+    obj: &Map<String, Value>,
+    path: &str,
+) -> Result<(), SdkError> {
+    let key = obj
+        .get("key")
+        .ok_or_else(|| invalid_tool_args(tool, format!("{path}.key is required")))?;
+    expect_string(tool, key, &format!("{path}.key"))?;
+    let value = obj
+        .get("value")
+        .ok_or_else(|| invalid_tool_args(tool, format!("{path}.value is required")))?;
+    validate_file_search_filter_value(tool, value, &format!("{path}.value"))
+}
+
 fn validate_file_search_filter(
     tool: &v2t::ProviderTool,
     value: &Value,
     path: &str,
 ) -> Result<(), SdkError> {
     let obj = expect_object(tool, value, path)?;
-    let filter_type = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| invalid_tool_args(tool, format!("{path}.type is required")))?;
-    match filter_type {
-        "and" | "or" => {
-            let filters = obj
-                .get("filters")
-                .ok_or_else(|| invalid_tool_args(tool, format!("{path}.filters is required")))?;
-            let arr = filters.as_array().ok_or_else(|| {
-                invalid_tool_args(tool, format!("{path}.filters must be an array"))
-            })?;
-            for (idx, entry) in arr.iter().enumerate() {
-                validate_file_search_filter(tool, entry, &format!("{path}.filters[{idx}]"))?;
-            }
-            Ok(())
-        }
+    match require_filter_type(tool, obj, path)? {
+        "and" | "or" => validate_nested_file_search_filters(tool, obj, path),
         "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "in" | "nin" => {
-            let key = obj
-                .get("key")
-                .ok_or_else(|| invalid_tool_args(tool, format!("{path}.key is required")))?;
-            expect_string(tool, key, &format!("{path}.key"))?;
-            let val = obj
-                .get("value")
-                .ok_or_else(|| invalid_tool_args(tool, format!("{path}.value is required")))?;
-            if val.as_str().is_some() || val.as_bool().is_some() || val.as_f64().is_some() {
-                return Ok(());
-            }
-            if let Some(arr) = val.as_array() {
-                if arr.iter().all(|item| item.as_str().is_some()) {
-                    return Ok(());
-                }
-            }
-            Err(invalid_tool_args(
-                tool,
-                format!("{path}.value must be a string, number, boolean, or array of strings"),
-            ))
+            validate_comparison_file_search_filter(tool, obj, path)
         }
         _ => Err(invalid_tool_args(
             tool,
@@ -215,240 +243,275 @@ fn validate_file_search_filter(
     }
 }
 
+fn validate_file_search_tool_args(
+    tool: &v2t::ProviderTool,
+    args: &Map<String, Value>,
+) -> Result<(), SdkError> {
+    let ids = require_field(tool, args, "vectorStoreIds")?;
+    expect_string_array(tool, ids, "args.vectorStoreIds")?;
+    if let Some(max) = args.get("maxNumResults") {
+        expect_number(tool, max, "args.maxNumResults")?;
+    }
+    if let Some(rank) = args.get("ranking") {
+        let rank_obj = expect_object(tool, rank, "args.ranking")?;
+        if let Some(ranker) = rank_obj.get("ranker") {
+            expect_string(tool, ranker, "args.ranking.ranker")?;
+        }
+        if let Some(score) = rank_obj.get("scoreThreshold") {
+            expect_number(tool, score, "args.ranking.scoreThreshold")?;
+        }
+    }
+    if let Some(filters) = args.get("filters") {
+        validate_file_search_filter(tool, filters, "args.filters")?;
+    }
+    Ok(())
+}
+
+fn validate_web_search_preview_tool_args(
+    tool: &v2t::ProviderTool,
+    args: &Map<String, Value>,
+) -> Result<(), SdkError> {
+    if let Some(size) = args.get("searchContextSize") {
+        expect_enum(
+            tool,
+            size,
+            "args.searchContextSize",
+            &["low", "medium", "high"],
+        )?;
+    }
+    if let Some(loc) = args.get("userLocation") {
+        validate_user_location(tool, loc, "args.userLocation")?;
+    }
+    Ok(())
+}
+
+fn validate_web_search_tool_args(
+    tool: &v2t::ProviderTool,
+    args: &Map<String, Value>,
+) -> Result<(), SdkError> {
+    if let Some(access) = args.get("externalWebAccess") {
+        expect_bool(tool, access, "args.externalWebAccess")?;
+    }
+    if let Some(filters) = args.get("filters") {
+        let obj = expect_object(tool, filters, "args.filters")?;
+        if let Some(domains) = obj.get("allowedDomains") {
+            expect_string_array(tool, domains, "args.filters.allowedDomains")?;
+        }
+    }
+    if let Some(size) = args.get("searchContextSize") {
+        expect_enum(
+            tool,
+            size,
+            "args.searchContextSize",
+            &["low", "medium", "high"],
+        )?;
+    }
+    if let Some(loc) = args.get("userLocation") {
+        validate_user_location(tool, loc, "args.userLocation")?;
+    }
+    Ok(())
+}
+
+fn validate_code_interpreter_tool_args(
+    tool: &v2t::ProviderTool,
+    args: &Map<String, Value>,
+) -> Result<(), SdkError> {
+    if let Some(container) = args.get("container") {
+        if let Some(obj) = container.as_object() {
+            if let Some(file_ids) = obj.get("fileIds") {
+                expect_string_array(tool, file_ids, "args.container.fileIds")?;
+            }
+        } else if container.as_str().is_none() {
+            return Err(invalid_tool_args(
+                tool,
+                "args.container must be a string or object",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_image_generation_tool_args(
+    tool: &v2t::ProviderTool,
+    args: &Map<String, Value>,
+) -> Result<(), SdkError> {
+    ensure_known_keys(
+        tool,
+        args,
+        &[
+            "background",
+            "inputFidelity",
+            "inputImageMask",
+            "model",
+            "moderation",
+            "outputCompression",
+            "outputFormat",
+            "partialImages",
+            "quality",
+            "size",
+        ],
+    )?;
+    if let Some(background) = args.get("background") {
+        expect_enum(
+            tool,
+            background,
+            "args.background",
+            &["auto", "opaque", "transparent"],
+        )?;
+    }
+    if let Some(fidelity) = args.get("inputFidelity") {
+        expect_enum(tool, fidelity, "args.inputFidelity", &["low", "high"])?;
+    }
+    if let Some(mask) = args.get("inputImageMask") {
+        let mask_obj = expect_object(tool, mask, "args.inputImageMask")?;
+        if let Some(file_id) = mask_obj.get("fileId") {
+            expect_string(tool, file_id, "args.inputImageMask.fileId")?;
+        }
+        if let Some(image_url) = mask_obj.get("imageUrl") {
+            expect_string(tool, image_url, "args.inputImageMask.imageUrl")?;
+        }
+    }
+    if let Some(model) = args.get("model") {
+        expect_string(tool, model, "args.model")?;
+    }
+    if let Some(moderation) = args.get("moderation") {
+        expect_enum(tool, moderation, "args.moderation", &["auto"])?;
+    }
+    if let Some(output_compression) = args.get("outputCompression") {
+        expect_int_range(tool, output_compression, "args.outputCompression", 0, 100)?;
+    }
+    if let Some(output_format) = args.get("outputFormat") {
+        expect_enum(
+            tool,
+            output_format,
+            "args.outputFormat",
+            &["png", "jpeg", "webp"],
+        )?;
+    }
+    if let Some(partial_images) = args.get("partialImages") {
+        expect_int_range(tool, partial_images, "args.partialImages", 0, 3)?;
+    }
+    if let Some(quality) = args.get("quality") {
+        expect_enum(
+            tool,
+            quality,
+            "args.quality",
+            &["auto", "low", "medium", "high"],
+        )?;
+    }
+    if let Some(size) = args.get("size") {
+        expect_enum(
+            tool,
+            size,
+            "args.size",
+            &["1024x1024", "1024x1536", "1536x1024", "auto"],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_mcp_allowed_tools(tool: &v2t::ProviderTool, allowed: &Value) -> Result<(), SdkError> {
+    if let Some(arr) = allowed.as_array() {
+        for (idx, entry) in arr.iter().enumerate() {
+            expect_string(tool, entry, &format!("args.allowedTools[{idx}]"))?;
+        }
+        return Ok(());
+    }
+
+    let obj = allowed
+        .as_object()
+        .ok_or_else(|| invalid_tool_args(tool, "args.allowedTools must be an array or object"))?;
+    if let Some(read_only) = obj.get("readOnly") {
+        expect_bool(tool, read_only, "args.allowedTools.readOnly")?;
+    }
+    if let Some(tool_names) = obj.get("toolNames") {
+        expect_string_array(tool, tool_names, "args.allowedTools.toolNames")?;
+    }
+    Ok(())
+}
+
+fn validate_mcp_require_approval(
+    tool: &v2t::ProviderTool,
+    require_approval: &Value,
+) -> Result<(), SdkError> {
+    if let Some(value) = require_approval.as_str() {
+        if matches!(value, "always" | "never") {
+            return Ok(());
+        }
+        return Err(invalid_tool_args(
+            tool,
+            "args.requireApproval must be \"always\" or \"never\"",
+        ));
+    }
+
+    let obj = require_approval.as_object().ok_or_else(|| {
+        invalid_tool_args(tool, "args.requireApproval must be a string or object")
+    })?;
+    if let Some(never) = obj.get("never") {
+        let never_obj = expect_object(tool, never, "args.requireApproval.never")?;
+        if let Some(tool_names) = never_obj.get("toolNames") {
+            expect_string_array(tool, tool_names, "args.requireApproval.never.toolNames")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_tool_args(
+    tool: &v2t::ProviderTool,
+    args: &Map<String, Value>,
+) -> Result<(), SdkError> {
+    let server_label = require_field(tool, args, "serverLabel")?;
+    expect_string(tool, server_label, "args.serverLabel")?;
+
+    let server_url = args.get("serverUrl");
+    let connector_id = args.get("connectorId");
+    if let Some(url) = server_url {
+        expect_string(tool, url, "args.serverUrl")?;
+    }
+    if let Some(connector) = connector_id {
+        expect_string(tool, connector, "args.connectorId")?;
+    }
+    if server_url.is_none() && connector_id.is_none() {
+        return Err(invalid_tool_args(
+            tool,
+            "args.serverUrl or args.connectorId is required",
+        ));
+    }
+
+    if let Some(allowed) = args.get("allowedTools") {
+        validate_mcp_allowed_tools(tool, allowed)?;
+    }
+    if let Some(authorization) = args.get("authorization") {
+        expect_string(tool, authorization, "args.authorization")?;
+    }
+    if let Some(headers) = args.get("headers") {
+        let obj = expect_object(tool, headers, "args.headers")?;
+        for (key, val) in obj {
+            expect_string(tool, val, &format!("args.headers.{key}"))?;
+        }
+    }
+    if let Some(require_approval) = args.get("requireApproval") {
+        validate_mcp_require_approval(tool, require_approval)?;
+    }
+    if let Some(server_description) = args.get("serverDescription") {
+        expect_string(tool, server_description, "args.serverDescription")?;
+    }
+    Ok(())
+}
+
 fn validate_openai_provider_tool_args(
     tool_type: &str,
     tool: &v2t::ProviderTool,
 ) -> Result<(), SdkError> {
     match tool_type {
-        "file_search" => {
-            let args = require_args_object(tool)?;
-            let ids = require_field(tool, args, "vectorStoreIds")?;
-            expect_string_array(tool, ids, "args.vectorStoreIds")?;
-            if let Some(max) = args.get("maxNumResults") {
-                expect_number(tool, max, "args.maxNumResults")?;
-            }
-            if let Some(rank) = args.get("ranking") {
-                let rank_obj = expect_object(tool, rank, "args.ranking")?;
-                if let Some(ranker) = rank_obj.get("ranker") {
-                    expect_string(tool, ranker, "args.ranking.ranker")?;
-                }
-                if let Some(score) = rank_obj.get("scoreThreshold") {
-                    expect_number(tool, score, "args.ranking.scoreThreshold")?;
-                }
-            }
-            if let Some(filters) = args.get("filters") {
-                validate_file_search_filter(tool, filters, "args.filters")?;
-            }
-            Ok(())
-        }
+        "file_search" => validate_file_search_tool_args(tool, require_args_object(tool)?),
         "web_search_preview" => {
-            let args = require_args_object(tool)?;
-            if let Some(size) = args.get("searchContextSize") {
-                expect_enum(
-                    tool,
-                    size,
-                    "args.searchContextSize",
-                    &["low", "medium", "high"],
-                )?;
-            }
-            if let Some(loc) = args.get("userLocation") {
-                validate_user_location(tool, loc, "args.userLocation")?;
-            }
-            Ok(())
+            validate_web_search_preview_tool_args(tool, require_args_object(tool)?)
         }
-        "web_search" => {
-            let args = require_args_object(tool)?;
-            if let Some(access) = args.get("externalWebAccess") {
-                expect_bool(tool, access, "args.externalWebAccess")?;
-            }
-            if let Some(filters) = args.get("filters") {
-                let obj = expect_object(tool, filters, "args.filters")?;
-                if let Some(domains) = obj.get("allowedDomains") {
-                    expect_string_array(tool, domains, "args.filters.allowedDomains")?;
-                }
-            }
-            if let Some(size) = args.get("searchContextSize") {
-                expect_enum(
-                    tool,
-                    size,
-                    "args.searchContextSize",
-                    &["low", "medium", "high"],
-                )?;
-            }
-            if let Some(loc) = args.get("userLocation") {
-                validate_user_location(tool, loc, "args.userLocation")?;
-            }
-            Ok(())
-        }
-        "code_interpreter" => {
-            let args = require_args_object(tool)?;
-            if let Some(container) = args.get("container") {
-                if let Some(obj) = container.as_object() {
-                    if let Some(file_ids) = obj.get("fileIds") {
-                        expect_string_array(tool, file_ids, "args.container.fileIds")?;
-                    }
-                } else if container.as_str().is_none() {
-                    return Err(invalid_tool_args(
-                        tool,
-                        "args.container must be a string or object",
-                    ));
-                }
-            }
-            Ok(())
-        }
-        "image_generation" => {
-            let args = require_args_object(tool)?;
-            ensure_known_keys(
-                tool,
-                args,
-                &[
-                    "background",
-                    "inputFidelity",
-                    "inputImageMask",
-                    "model",
-                    "moderation",
-                    "outputCompression",
-                    "outputFormat",
-                    "partialImages",
-                    "quality",
-                    "size",
-                ],
-            )?;
-            if let Some(background) = args.get("background") {
-                expect_enum(
-                    tool,
-                    background,
-                    "args.background",
-                    &["auto", "opaque", "transparent"],
-                )?;
-            }
-            if let Some(fidelity) = args.get("inputFidelity") {
-                expect_enum(tool, fidelity, "args.inputFidelity", &["low", "high"])?;
-            }
-            if let Some(mask) = args.get("inputImageMask") {
-                let mask_obj = expect_object(tool, mask, "args.inputImageMask")?;
-                if let Some(file_id) = mask_obj.get("fileId") {
-                    expect_string(tool, file_id, "args.inputImageMask.fileId")?;
-                }
-                if let Some(image_url) = mask_obj.get("imageUrl") {
-                    expect_string(tool, image_url, "args.inputImageMask.imageUrl")?;
-                }
-            }
-            if let Some(model) = args.get("model") {
-                expect_string(tool, model, "args.model")?;
-            }
-            if let Some(moderation) = args.get("moderation") {
-                expect_enum(tool, moderation, "args.moderation", &["auto"])?;
-            }
-            if let Some(output_compression) = args.get("outputCompression") {
-                expect_int_range(tool, output_compression, "args.outputCompression", 0, 100)?;
-            }
-            if let Some(output_format) = args.get("outputFormat") {
-                expect_enum(
-                    tool,
-                    output_format,
-                    "args.outputFormat",
-                    &["png", "jpeg", "webp"],
-                )?;
-            }
-            if let Some(partial_images) = args.get("partialImages") {
-                expect_int_range(tool, partial_images, "args.partialImages", 0, 3)?;
-            }
-            if let Some(quality) = args.get("quality") {
-                expect_enum(
-                    tool,
-                    quality,
-                    "args.quality",
-                    &["auto", "low", "medium", "high"],
-                )?;
-            }
-            if let Some(size) = args.get("size") {
-                expect_enum(
-                    tool,
-                    size,
-                    "args.size",
-                    &["1024x1024", "1024x1536", "1536x1024", "auto"],
-                )?;
-            }
-            Ok(())
-        }
-        "mcp" => {
-            let args = require_args_object(tool)?;
-            let server_label = require_field(tool, args, "serverLabel")?;
-            expect_string(tool, server_label, "args.serverLabel")?;
-            let server_url = args.get("serverUrl");
-            let connector_id = args.get("connectorId");
-            if let Some(url) = server_url {
-                expect_string(tool, url, "args.serverUrl")?;
-            }
-            if let Some(connector) = connector_id {
-                expect_string(tool, connector, "args.connectorId")?;
-            }
-            if server_url.is_none() && connector_id.is_none() {
-                return Err(invalid_tool_args(
-                    tool,
-                    "args.serverUrl or args.connectorId is required",
-                ));
-            }
-            if let Some(allowed) = args.get("allowedTools") {
-                if let Some(arr) = allowed.as_array() {
-                    for (idx, entry) in arr.iter().enumerate() {
-                        expect_string(tool, entry, &format!("args.allowedTools[{idx}]"))?;
-                    }
-                } else if let Some(obj) = allowed.as_object() {
-                    if let Some(read_only) = obj.get("readOnly") {
-                        expect_bool(tool, read_only, "args.allowedTools.readOnly")?;
-                    }
-                    if let Some(tool_names) = obj.get("toolNames") {
-                        expect_string_array(tool, tool_names, "args.allowedTools.toolNames")?;
-                    }
-                } else {
-                    return Err(invalid_tool_args(
-                        tool,
-                        "args.allowedTools must be an array or object",
-                    ));
-                }
-            }
-            if let Some(authorization) = args.get("authorization") {
-                expect_string(tool, authorization, "args.authorization")?;
-            }
-            if let Some(headers) = args.get("headers") {
-                let obj = expect_object(tool, headers, "args.headers")?;
-                for (key, val) in obj {
-                    expect_string(tool, val, &format!("args.headers.{key}"))?;
-                }
-            }
-            if let Some(require_approval) = args.get("requireApproval") {
-                if let Some(val) = require_approval.as_str() {
-                    if val != "always" && val != "never" {
-                        return Err(invalid_tool_args(
-                            tool,
-                            "args.requireApproval must be \"always\" or \"never\"",
-                        ));
-                    }
-                } else if let Some(obj) = require_approval.as_object() {
-                    if let Some(never) = obj.get("never") {
-                        let never_obj = expect_object(tool, never, "args.requireApproval.never")?;
-                        if let Some(tool_names) = never_obj.get("toolNames") {
-                            expect_string_array(
-                                tool,
-                                tool_names,
-                                "args.requireApproval.never.toolNames",
-                            )?;
-                        }
-                    }
-                } else {
-                    return Err(invalid_tool_args(
-                        tool,
-                        "args.requireApproval must be a string or object",
-                    ));
-                }
-            }
-            if let Some(server_description) = args.get("serverDescription") {
-                expect_string(tool, server_description, "args.serverDescription")?;
-            }
-            Ok(())
-        }
+        "web_search" => validate_web_search_tool_args(tool, require_args_object(tool)?),
+        "code_interpreter" => validate_code_interpreter_tool_args(tool, require_args_object(tool)?),
+        "image_generation" => validate_image_generation_tool_args(tool, require_args_object(tool)?),
+        "mcp" => validate_mcp_tool_args(tool, require_args_object(tool)?),
         _ => Ok(()),
     }
 }
@@ -553,6 +616,190 @@ fn map_web_search_output(action: &serde_json::Value) -> Option<serde_json::Value
     }
 }
 
+fn build_file_search_provider_tool(args: &Map<String, Value>) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), json!("file_search"));
+    if let Some(ids) = args.get("vectorStoreIds") {
+        obj.insert("vector_store_ids".into(), ids.clone());
+    }
+    if let Some(max) = args.get("maxNumResults") {
+        obj.insert("max_num_results".into(), max.clone());
+    }
+    if let Some(rank) = args.get("ranking").and_then(|v| v.as_object()) {
+        let mut opts = serde_json::Map::new();
+        if let Some(ranker) = rank.get("ranker") {
+            opts.insert("ranker".into(), ranker.clone());
+        }
+        if let Some(score) = rank.get("scoreThreshold") {
+            opts.insert("score_threshold".into(), score.clone());
+        }
+        if !opts.is_empty() {
+            obj.insert("ranking_options".into(), serde_json::Value::Object(opts));
+        }
+    }
+    if let Some(filters) = args.get("filters") {
+        obj.insert("filters".into(), filters.clone());
+    }
+    Value::Object(obj)
+}
+
+fn build_web_search_preview_provider_tool(args: &Map<String, Value>) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), json!("web_search_preview"));
+    if let Some(size) = args.get("searchContextSize") {
+        obj.insert("search_context_size".into(), size.clone());
+    }
+    if let Some(loc) = args.get("userLocation") {
+        obj.insert("user_location".into(), loc.clone());
+    }
+    Value::Object(obj)
+}
+
+fn build_web_search_provider_tool(args: &Map<String, Value>) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), json!("web_search"));
+    if let Some(filters) = args.get("filters").and_then(|v| v.as_object()) {
+        if let Some(allowed_domains) = filters.get("allowedDomains") {
+            obj.insert(
+                "filters".into(),
+                json!({"allowed_domains": allowed_domains}),
+            );
+        }
+    }
+    if let Some(access) = args.get("externalWebAccess") {
+        obj.insert("external_web_access".into(), access.clone());
+    }
+    if let Some(size) = args.get("searchContextSize") {
+        obj.insert("search_context_size".into(), size.clone());
+    }
+    if let Some(loc) = args.get("userLocation") {
+        obj.insert("user_location".into(), loc.clone());
+    }
+    Value::Object(obj)
+}
+
+fn build_code_interpreter_provider_tool(args: &Map<String, Value>) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), json!("code_interpreter"));
+    let container = match args.get("container") {
+        None | Some(serde_json::Value::Null) => json!({"type":"auto"}),
+        Some(serde_json::Value::String(val)) => json!(val),
+        Some(serde_json::Value::Object(map)) => {
+            let mut container = serde_json::Map::new();
+            container.insert("type".into(), json!("auto"));
+            if let Some(file_ids) = map.get("fileIds") {
+                container.insert("file_ids".into(), file_ids.clone());
+            }
+            serde_json::Value::Object(container)
+        }
+        Some(other) => other.clone(),
+    };
+    obj.insert("container".into(), container);
+    Value::Object(obj)
+}
+
+fn build_image_generation_provider_tool(args: &Map<String, Value>) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), json!("image_generation"));
+    for (src, dst) in [
+        ("background", "background"),
+        ("inputFidelity", "input_fidelity"),
+        ("model", "model"),
+        ("moderation", "moderation"),
+        ("partialImages", "partial_images"),
+        ("quality", "quality"),
+        ("outputCompression", "output_compression"),
+        ("outputFormat", "output_format"),
+        ("size", "size"),
+    ] {
+        if let Some(val) = args.get(src) {
+            obj.insert(dst.into(), val.clone());
+        }
+    }
+    if let Some(mask) = args.get("inputImageMask").and_then(|v| v.as_object()) {
+        let mut mask_obj = serde_json::Map::new();
+        if let Some(file_id) = mask.get("fileId") {
+            mask_obj.insert("file_id".into(), file_id.clone());
+        }
+        if let Some(image_url) = mask.get("imageUrl") {
+            mask_obj.insert("image_url".into(), image_url.clone());
+        }
+        if !mask_obj.is_empty() {
+            obj.insert(
+                "input_image_mask".into(),
+                serde_json::Value::Object(mask_obj),
+            );
+        }
+    }
+    Value::Object(obj)
+}
+
+fn build_mcp_provider_tool(args: &Map<String, Value>) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), json!("mcp"));
+    if let Some(val) = args.get("serverLabel") {
+        obj.insert("server_label".into(), val.clone());
+    }
+    if let Some(val) = args.get("authorization") {
+        obj.insert("authorization".into(), val.clone());
+    }
+    if let Some(val) = args.get("connectorId") {
+        obj.insert("connector_id".into(), val.clone());
+    }
+    if let Some(val) = args.get("headers") {
+        obj.insert("headers".into(), val.clone());
+    }
+    if let Some(val) = args.get("serverDescription") {
+        obj.insert("server_description".into(), val.clone());
+    }
+    if let Some(val) = args.get("serverUrl") {
+        obj.insert("server_url".into(), val.clone());
+    }
+    if let Some(allowed) = args.get("allowedTools") {
+        if let Some(list) = allowed.as_array() {
+            obj.insert(
+                "allowed_tools".into(),
+                serde_json::Value::Array(list.clone()),
+            );
+        } else if let Some(filter) = allowed.as_object() {
+            let mut allowed_obj = serde_json::Map::new();
+            if let Some(read_only) = filter.get("readOnly") {
+                allowed_obj.insert("read_only".into(), read_only.clone());
+            }
+            if let Some(tool_names) = filter.get("toolNames") {
+                allowed_obj.insert("tool_names".into(), tool_names.clone());
+            }
+            if !allowed_obj.is_empty() {
+                obj.insert(
+                    "allowed_tools".into(),
+                    serde_json::Value::Object(allowed_obj),
+                );
+            }
+        }
+    }
+    let require_approval = match args.get("requireApproval") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(val)) => Some(serde_json::Value::String(val.clone())),
+        Some(serde_json::Value::Object(map)) => map.get("never").map(|never| {
+            if let Some(filter) = never.as_object() {
+                let mut filter_obj = serde_json::Map::new();
+                if let Some(tool_names) = filter.get("toolNames") {
+                    filter_obj.insert("tool_names".into(), tool_names.clone());
+                }
+                json!({"never": filter_obj})
+            } else {
+                json!({"never": {}})
+            }
+        }),
+        Some(other) => Some(other.clone()),
+    };
+    obj.insert(
+        "require_approval".into(),
+        require_approval.unwrap_or_else(|| json!("never")),
+    );
+    Value::Object(obj)
+}
+
 pub(super) fn build_openai_provider_tool(
     tool: &v2t::ProviderTool,
 ) -> Result<Option<serde_json::Value>, SdkError> {
@@ -564,193 +811,342 @@ pub(super) fn build_openai_provider_tool(
     validate_openai_provider_tool_args(tool_type, tool)?;
     let args = tool.args.as_object().unwrap_or(&empty);
     let val = match tool_type {
-        "file_search" => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("type".into(), json!("file_search"));
-            if let Some(ids) = args.get("vectorStoreIds") {
-                obj.insert("vector_store_ids".into(), ids.clone());
-            }
-            if let Some(max) = args.get("maxNumResults") {
-                obj.insert("max_num_results".into(), max.clone());
-            }
-            if let Some(rank) = args.get("ranking").and_then(|v| v.as_object()) {
-                let mut opts = serde_json::Map::new();
-                if let Some(ranker) = rank.get("ranker") {
-                    opts.insert("ranker".into(), ranker.clone());
-                }
-                if let Some(score) = rank.get("scoreThreshold") {
-                    opts.insert("score_threshold".into(), score.clone());
-                }
-                if !opts.is_empty() {
-                    obj.insert("ranking_options".into(), serde_json::Value::Object(opts));
-                }
-            }
-            if let Some(filters) = args.get("filters") {
-                obj.insert("filters".into(), filters.clone());
-            }
-            Some(serde_json::Value::Object(obj))
-        }
+        "file_search" => Some(build_file_search_provider_tool(args)),
         "local_shell" => Some(json!({"type":"local_shell"})),
         "shell" => Some(json!({"type":"shell"})),
         "apply_patch" => Some(json!({"type":"apply_patch"})),
-        "web_search_preview" => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("type".into(), json!("web_search_preview"));
-            if let Some(size) = args.get("searchContextSize") {
-                obj.insert("search_context_size".into(), size.clone());
-            }
-            if let Some(loc) = args.get("userLocation") {
-                obj.insert("user_location".into(), loc.clone());
-            }
-            Some(serde_json::Value::Object(obj))
-        }
-        "web_search" => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("type".into(), json!("web_search"));
-            if let Some(filters) = args.get("filters").and_then(|v| v.as_object()) {
-                if let Some(allowed_domains) = filters.get("allowedDomains") {
-                    obj.insert(
-                        "filters".into(),
-                        json!({"allowed_domains": allowed_domains}),
-                    );
-                }
-            }
-            if let Some(access) = args.get("externalWebAccess") {
-                obj.insert("external_web_access".into(), access.clone());
-            }
-            if let Some(size) = args.get("searchContextSize") {
-                obj.insert("search_context_size".into(), size.clone());
-            }
-            if let Some(loc) = args.get("userLocation") {
-                obj.insert("user_location".into(), loc.clone());
-            }
-            Some(serde_json::Value::Object(obj))
-        }
-        "code_interpreter" => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("type".into(), json!("code_interpreter"));
-            let container = match args.get("container") {
-                None | Some(serde_json::Value::Null) => json!({"type":"auto"}),
-                Some(serde_json::Value::String(val)) => json!(val),
-                Some(serde_json::Value::Object(map)) => {
-                    let mut c = serde_json::Map::new();
-                    c.insert("type".into(), json!("auto"));
-                    if let Some(file_ids) = map.get("fileIds") {
-                        c.insert("file_ids".into(), file_ids.clone());
-                    }
-                    serde_json::Value::Object(c)
-                }
-                Some(other) => other.clone(),
-            };
-            obj.insert("container".into(), container);
-            Some(serde_json::Value::Object(obj))
-        }
-        "image_generation" => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("type".into(), json!("image_generation"));
-            for (src, dst) in [
-                ("background", "background"),
-                ("inputFidelity", "input_fidelity"),
-                ("model", "model"),
-                ("moderation", "moderation"),
-                ("partialImages", "partial_images"),
-                ("quality", "quality"),
-                ("outputCompression", "output_compression"),
-                ("outputFormat", "output_format"),
-                ("size", "size"),
-            ] {
-                if let Some(val) = args.get(src) {
-                    obj.insert(dst.into(), val.clone());
-                }
-            }
-            if let Some(mask) = args.get("inputImageMask").and_then(|v| v.as_object()) {
-                let mut mask_obj = serde_json::Map::new();
-                if let Some(file_id) = mask.get("fileId") {
-                    mask_obj.insert("file_id".into(), file_id.clone());
-                }
-                if let Some(image_url) = mask.get("imageUrl") {
-                    mask_obj.insert("image_url".into(), image_url.clone());
-                }
-                if !mask_obj.is_empty() {
-                    obj.insert(
-                        "input_image_mask".into(),
-                        serde_json::Value::Object(mask_obj),
-                    );
-                }
-            }
-            Some(serde_json::Value::Object(obj))
-        }
-        "mcp" => {
-            let mut obj = serde_json::Map::new();
-            obj.insert("type".into(), json!("mcp"));
-            if let Some(val) = args.get("serverLabel") {
-                obj.insert("server_label".into(), val.clone());
-            }
-            if let Some(val) = args.get("authorization") {
-                obj.insert("authorization".into(), val.clone());
-            }
-            if let Some(val) = args.get("connectorId") {
-                obj.insert("connector_id".into(), val.clone());
-            }
-            if let Some(val) = args.get("headers") {
-                obj.insert("headers".into(), val.clone());
-            }
-            if let Some(val) = args.get("serverDescription") {
-                obj.insert("server_description".into(), val.clone());
-            }
-            if let Some(val) = args.get("serverUrl") {
-                obj.insert("server_url".into(), val.clone());
-            }
-            if let Some(allowed) = args.get("allowedTools") {
-                if let Some(list) = allowed.as_array() {
-                    obj.insert(
-                        "allowed_tools".into(),
-                        serde_json::Value::Array(list.clone()),
-                    );
-                } else if let Some(filter) = allowed.as_object() {
-                    let mut allowed_obj = serde_json::Map::new();
-                    if let Some(read_only) = filter.get("readOnly") {
-                        allowed_obj.insert("read_only".into(), read_only.clone());
-                    }
-                    if let Some(tool_names) = filter.get("toolNames") {
-                        allowed_obj.insert("tool_names".into(), tool_names.clone());
-                    }
-                    if !allowed_obj.is_empty() {
-                        obj.insert(
-                            "allowed_tools".into(),
-                            serde_json::Value::Object(allowed_obj),
-                        );
-                    }
-                }
-            }
-            let require_approval = match args.get("requireApproval") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::String(val)) => {
-                    Some(serde_json::Value::String(val.clone()))
-                }
-                Some(serde_json::Value::Object(map)) => map.get("never").map(|never| {
-                    if let Some(filter) = never.as_object() {
-                        let mut filter_obj = serde_json::Map::new();
-                        if let Some(tool_names) = filter.get("toolNames") {
-                            filter_obj.insert("tool_names".into(), tool_names.clone());
-                        }
-                        json!({"never": filter_obj})
-                    } else {
-                        json!({"never": {}})
-                    }
-                }),
-                Some(other) => Some(other.clone()),
-            };
-            obj.insert(
-                "require_approval".into(),
-                require_approval.unwrap_or_else(|| json!("never")),
-            );
-            Some(serde_json::Value::Object(obj))
-        }
+        "web_search_preview" => Some(build_web_search_preview_provider_tool(args)),
+        "web_search" => Some(build_web_search_provider_tool(args)),
+        "code_interpreter" => Some(build_code_interpreter_provider_tool(args)),
+        "image_generation" => Some(build_image_generation_provider_tool(args)),
+        "mcp" => Some(build_mcp_provider_tool(args)),
         _ => None,
     };
     Ok(val)
 }
+
+fn build_output_item_base(
+    tool_type: &str,
+    tool_call_id: String,
+    item_id: Option<&String>,
+    provider_executed: bool,
+) -> serde_json::Map<String, Value> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("tool_type".into(), json!(tool_type));
+    obj.insert("tool_call_id".into(), json!(tool_call_id));
+    if let Some(id) = item_id {
+        obj.insert("item_id".into(), json!(id));
+    }
+    obj.insert("provider_executed".into(), json!(provider_executed));
+    obj
+}
+
+fn output_item_call_id(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<String> {
+    item.get("call_id")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .or_else(|| item_id.clone())
+}
+
+fn map_file_search_results(item: &serde_json::Map<String, Value>) -> Value {
+    let results_val = item.get("results").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|entry| entry.as_object())
+            .map(|entry| {
+                let mut mapped = serde_json::Map::new();
+                if let Some(attributes) = entry.get("attributes") {
+                    mapped.insert("attributes".into(), attributes.clone());
+                }
+                if let Some(file_id) = entry.get("file_id") {
+                    mapped.insert("fileId".into(), file_id.clone());
+                }
+                if let Some(filename) = entry.get("filename") {
+                    mapped.insert("filename".into(), filename.clone());
+                }
+                if let Some(score) = entry.get("score") {
+                    mapped.insert("score".into(), score.clone());
+                }
+                if let Some(text) = entry.get("text") {
+                    mapped.insert("text".into(), text.clone());
+                }
+                serde_json::Value::Object(mapped)
+            })
+            .collect::<Vec<_>>()
+    });
+    json!({
+        "queries": item.get("queries").cloned().unwrap_or(serde_json::Value::Null),
+        "results": results_val.map(serde_json::Value::Array).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+fn map_local_shell_input(item: &serde_json::Map<String, Value>) -> Value {
+    let action = item.get("action").and_then(|value| value.as_object());
+    let mut action_obj = serde_json::Map::new();
+    if let Some(action) = action {
+        if let Some(command) = action.get("command") {
+            action_obj.insert("command".into(), command.clone());
+        }
+        if let Some(timeout) = action.get("timeout_ms") {
+            action_obj.insert("timeoutMs".into(), timeout.clone());
+        }
+        if let Some(user) = action.get("user") {
+            action_obj.insert("user".into(), user.clone());
+        }
+        if let Some(dir) = action.get("working_directory") {
+            action_obj.insert("workingDirectory".into(), dir.clone());
+        }
+        if let Some(env) = action.get("env") {
+            action_obj.insert("env".into(), env.clone());
+        }
+    }
+    if action_obj.is_empty() {
+        json!({})
+    } else {
+        json!({ "action": action_obj })
+    }
+}
+
+fn map_shell_input(item: &serde_json::Map<String, Value>) -> Value {
+    let action = item.get("action").and_then(|value| value.as_object());
+    let mut action_obj = serde_json::Map::new();
+    if let Some(action) = action {
+        if let Some(commands) = action.get("commands") {
+            action_obj.insert("commands".into(), commands.clone());
+        }
+        if let Some(timeout) = action.get("timeout_ms") {
+            action_obj.insert("timeoutMs".into(), timeout.clone());
+        }
+        if let Some(max_len) = action.get("max_output_length") {
+            action_obj.insert("maxOutputLength".into(), max_len.clone());
+        }
+    }
+    if action_obj.is_empty() {
+        json!({})
+    } else {
+        json!({ "action": action_obj })
+    }
+}
+
+fn provider_tool_data_for_web_search(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = item_id.clone()?;
+    let mut obj = build_output_item_base("web_search", tool_call_id, item_id.as_ref(), true);
+    obj.insert("input".into(), json!({}));
+    if let Some(action) = item.get("action").and_then(map_web_search_output) {
+        obj.insert("result".into(), action);
+    }
+    Some(Value::Object(obj))
+}
+
+fn provider_tool_data_for_file_search(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = item_id.clone()?;
+    let mut obj = build_output_item_base("file_search", tool_call_id, item_id.as_ref(), true);
+    obj.insert("input".into(), json!({}));
+    obj.insert("result".into(), map_file_search_results(item));
+    Some(Value::Object(obj))
+}
+
+fn provider_tool_data_for_code_interpreter(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = item_id.clone()?;
+    let mut obj = build_output_item_base("code_interpreter", tool_call_id, item_id.as_ref(), true);
+    obj.insert(
+        "input".into(),
+        json!({
+            "code": item.get("code").cloned().unwrap_or(serde_json::Value::Null),
+            "containerId": item.get("container_id").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+    );
+    obj.insert(
+        "result".into(),
+        json!({
+            "outputs": item.get("outputs").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+    );
+    Some(Value::Object(obj))
+}
+
+fn provider_tool_data_for_image_generation(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = item_id.clone()?;
+    let mut obj = build_output_item_base("image_generation", tool_call_id, item_id.as_ref(), true);
+    obj.insert("input".into(), json!({}));
+    obj.insert(
+        "result".into(),
+        json!({
+            "result": item.get("result").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+    );
+    Some(Value::Object(obj))
+}
+
+fn provider_tool_data_for_computer_call(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = item_id.clone()?;
+    let mut obj = build_output_item_base("computer_use", tool_call_id, item_id.as_ref(), true);
+    obj.insert("input".into(), json!(""));
+    let status = item
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| json!("completed"));
+    obj.insert(
+        "result".into(),
+        json!({
+            "type": "computer_use_tool_result",
+            "status": status,
+        }),
+    );
+    Some(Value::Object(obj))
+}
+
+fn provider_tool_data_for_local_shell(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = output_item_call_id(item, item_id)?;
+    let mut obj = build_output_item_base("local_shell", tool_call_id, item_id.as_ref(), false);
+    obj.insert("input".into(), map_local_shell_input(item));
+    Some(Value::Object(obj))
+}
+
+fn provider_tool_data_for_shell(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = output_item_call_id(item, item_id)?;
+    let mut obj = build_output_item_base("shell", tool_call_id, item_id.as_ref(), false);
+    obj.insert("input".into(), map_shell_input(item));
+    Some(Value::Object(obj))
+}
+
+fn provider_tool_data_for_apply_patch(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = output_item_call_id(item, item_id)?;
+    let mut obj =
+        build_output_item_base("apply_patch", tool_call_id.clone(), item_id.as_ref(), false);
+    obj.insert(
+        "input".into(),
+        json!({
+            "callId": tool_call_id,
+            "operation": item.get("operation").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+    );
+    Some(Value::Object(obj))
+}
+
+fn provider_tool_data_for_mcp_call(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = item_id.clone()?;
+    let name = item
+        .get("name")
+        .and_then(|value| value.as_str())?
+        .to_string();
+    let mut obj = build_output_item_base("mcp", tool_call_id, item_id.as_ref(), true);
+    obj.insert(
+        "input".into(),
+        item.get("arguments").cloned().unwrap_or_else(|| json!("")),
+    );
+    obj.insert("mcp_name".into(), json!(name.clone()));
+    if let Some(approval_request_id) = item
+        .get("approval_request_id")
+        .and_then(|value| value.as_str())
+    {
+        obj.insert("approval_request_id".into(), json!(approval_request_id));
+    }
+    if let Some(server_label) = item.get("server_label") {
+        obj.insert("server_label".into(), server_label.clone());
+    }
+    let mut result = serde_json::Map::new();
+    result.insert("type".into(), json!("call"));
+    if let Some(server_label) = item.get("server_label") {
+        result.insert("serverLabel".into(), server_label.clone());
+    }
+    result.insert("name".into(), json!(name));
+    result.insert(
+        "arguments".into(),
+        item.get("arguments").cloned().unwrap_or_else(|| json!("")),
+    );
+    if let Some(output) = item.get("output") {
+        result.insert("output".into(), output.clone());
+    }
+    if let Some(error) = item.get("error") {
+        result.insert("error".into(), error.clone());
+    }
+    obj.insert("result".into(), Value::Object(result));
+    Some(Value::Object(obj))
+}
+
+fn provider_tool_data_for_mcp_approval_request(
+    item: &serde_json::Map<String, Value>,
+    item_id: &Option<String>,
+) -> Option<Value> {
+    let tool_call_id = item_id.clone()?;
+    let name = item
+        .get("name")
+        .and_then(|value| value.as_str())?
+        .to_string();
+    let mut obj = build_output_item_base("mcp", tool_call_id, item_id.as_ref(), true);
+    obj.insert(
+        "input".into(),
+        item.get("arguments").cloned().unwrap_or_else(|| json!("")),
+    );
+    obj.insert("mcp_name".into(), json!(name));
+    let approval_request_id = item
+        .get("approval_request_id")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .or_else(|| item_id.clone());
+    if let Some(approval_request_id) = approval_request_id {
+        obj.insert("approval_request_id".into(), json!(approval_request_id));
+    }
+    obj.insert("approval_request".into(), json!(true));
+    if let Some(server_label) = item.get("server_label") {
+        obj.insert("server_label".into(), server_label.clone());
+    }
+    Some(Value::Object(obj))
+}
+
+type OutputItemMapper = fn(&serde_json::Map<String, Value>, &Option<String>) -> Option<Value>;
+
+const OUTPUT_ITEM_MAPPERS: &[(&str, OutputItemMapper)] = &[
+    ("web_search_call", provider_tool_data_for_web_search),
+    ("file_search_call", provider_tool_data_for_file_search),
+    (
+        "code_interpreter_call",
+        provider_tool_data_for_code_interpreter,
+    ),
+    (
+        "image_generation_call",
+        provider_tool_data_for_image_generation,
+    ),
+    ("computer_call", provider_tool_data_for_computer_call),
+    ("local_shell_call", provider_tool_data_for_local_shell),
+    ("shell_call", provider_tool_data_for_shell),
+    ("apply_patch_call", provider_tool_data_for_apply_patch),
+    ("mcp_call", provider_tool_data_for_mcp_call),
+    (
+        "mcp_approval_request",
+        provider_tool_data_for_mcp_approval_request,
+    ),
+];
 
 pub(super) fn provider_tool_data_from_output_item(
     item: &serde_json::Map<String, Value>,
@@ -760,287 +1156,11 @@ pub(super) fn provider_tool_data_from_output_item(
         .get("id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    match item_type {
-        "web_search_call" => {
-            let tool_call_id = item_id.clone()?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("web_search"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(true));
-            obj.insert("input".into(), json!({}));
-            if let Some(action) = item.get("action").and_then(map_web_search_output) {
-                obj.insert("result".into(), action);
-            }
-            Some(serde_json::Value::Object(obj))
-        }
-        "file_search_call" => {
-            let tool_call_id = item_id.clone()?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("file_search"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(true));
-            obj.insert("input".into(), json!({}));
-            let results_val = item.get("results").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter()
-                    .filter_map(|entry| entry.as_object())
-                    .map(|entry| {
-                        let mut mapped = serde_json::Map::new();
-                        if let Some(attributes) = entry.get("attributes") {
-                            mapped.insert("attributes".into(), attributes.clone());
-                        }
-                        if let Some(file_id) = entry.get("file_id") {
-                            mapped.insert("fileId".into(), file_id.clone());
-                        }
-                        if let Some(filename) = entry.get("filename") {
-                            mapped.insert("filename".into(), filename.clone());
-                        }
-                        if let Some(score) = entry.get("score") {
-                            mapped.insert("score".into(), score.clone());
-                        }
-                        if let Some(text) = entry.get("text") {
-                            mapped.insert("text".into(), text.clone());
-                        }
-                        serde_json::Value::Object(mapped)
-                    })
-                    .collect::<Vec<_>>()
-            });
-            let result = json!({
-                "queries": item.get("queries").cloned().unwrap_or(serde_json::Value::Null),
-                "results": results_val.map(serde_json::Value::Array).unwrap_or(serde_json::Value::Null),
-            });
-            obj.insert("result".into(), result);
-            Some(serde_json::Value::Object(obj))
-        }
-        "code_interpreter_call" => {
-            let tool_call_id = item_id.clone()?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("code_interpreter"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(true));
-            let input = json!({
-                "code": item.get("code").cloned().unwrap_or(serde_json::Value::Null),
-                "containerId": item.get("container_id").cloned().unwrap_or(serde_json::Value::Null),
-            });
-            obj.insert("input".into(), input);
-            let result = json!({
-                "outputs": item.get("outputs").cloned().unwrap_or(serde_json::Value::Null),
-            });
-            obj.insert("result".into(), result);
-            Some(serde_json::Value::Object(obj))
-        }
-        "image_generation_call" => {
-            let tool_call_id = item_id.clone()?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("image_generation"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(true));
-            obj.insert("input".into(), json!({}));
-            let result = json!({
-                "result": item.get("result").cloned().unwrap_or(serde_json::Value::Null),
-            });
-            obj.insert("result".into(), result);
-            Some(serde_json::Value::Object(obj))
-        }
-        "computer_call" => {
-            let tool_call_id = item_id.clone()?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("computer_use"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(true));
-            obj.insert("input".into(), json!(""));
-            let status = item
-                .get("status")
-                .cloned()
-                .unwrap_or_else(|| json!("completed"));
-            obj.insert(
-                "result".into(),
-                json!({
-                    "type": "computer_use_tool_result",
-                    "status": status,
-                }),
-            );
-            Some(serde_json::Value::Object(obj))
-        }
-        "local_shell_call" => {
-            let tool_call_id = item
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| item_id.clone())?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("local_shell"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(false));
-            let action = item.get("action").and_then(|v| v.as_object());
-            let mut action_obj = serde_json::Map::new();
-            if let Some(action) = action {
-                if let Some(command) = action.get("command") {
-                    action_obj.insert("command".into(), command.clone());
-                }
-                if let Some(timeout) = action.get("timeout_ms") {
-                    action_obj.insert("timeoutMs".into(), timeout.clone());
-                }
-                if let Some(user) = action.get("user") {
-                    action_obj.insert("user".into(), user.clone());
-                }
-                if let Some(dir) = action.get("working_directory") {
-                    action_obj.insert("workingDirectory".into(), dir.clone());
-                }
-                if let Some(env) = action.get("env") {
-                    action_obj.insert("env".into(), env.clone());
-                }
-            }
-            if !action_obj.is_empty() {
-                obj.insert("input".into(), json!({ "action": action_obj }));
-            } else {
-                obj.insert("input".into(), json!({}));
-            }
-            Some(serde_json::Value::Object(obj))
-        }
-        "shell_call" => {
-            let tool_call_id = item
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| item_id.clone())?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("shell"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(false));
-            let action = item.get("action").and_then(|v| v.as_object());
-            let mut action_obj = serde_json::Map::new();
-            if let Some(action) = action {
-                if let Some(commands) = action.get("commands") {
-                    action_obj.insert("commands".into(), commands.clone());
-                }
-                if let Some(timeout) = action.get("timeout_ms") {
-                    action_obj.insert("timeoutMs".into(), timeout.clone());
-                }
-                if let Some(max_len) = action.get("max_output_length") {
-                    action_obj.insert("maxOutputLength".into(), max_len.clone());
-                }
-            }
-            if !action_obj.is_empty() {
-                obj.insert("input".into(), json!({ "action": action_obj }));
-            } else {
-                obj.insert("input".into(), json!({}));
-            }
-            Some(serde_json::Value::Object(obj))
-        }
-        "apply_patch_call" => {
-            let tool_call_id = item
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| item_id.clone())?;
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("apply_patch"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id.clone()));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(false));
-            let input = json!({
-                "callId": tool_call_id,
-                "operation": item.get("operation").cloned().unwrap_or(serde_json::Value::Null),
-            });
-            obj.insert("input".into(), input);
-            Some(serde_json::Value::Object(obj))
-        }
-        "mcp_call" => {
-            let tool_call_id = item_id.clone()?;
-            let name = item.get("name").and_then(|v| v.as_str())?.to_string();
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("mcp"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(true));
-            obj.insert(
-                "input".into(),
-                item.get("arguments").cloned().unwrap_or_else(|| json!("")),
-            );
-            obj.insert("mcp_name".into(), json!(name.clone()));
-            if let Some(approval_request_id) =
-                item.get("approval_request_id").and_then(|v| v.as_str())
-            {
-                obj.insert("approval_request_id".into(), json!(approval_request_id));
-            }
-            if let Some(server_label) = item.get("server_label") {
-                obj.insert("server_label".into(), server_label.clone());
-            }
-            let mut result = serde_json::Map::new();
-            result.insert("type".into(), json!("call"));
-            if let Some(server_label) = item.get("server_label") {
-                result.insert("serverLabel".into(), server_label.clone());
-            }
-            result.insert("name".into(), json!(name));
-            result.insert(
-                "arguments".into(),
-                item.get("arguments").cloned().unwrap_or_else(|| json!("")),
-            );
-            if let Some(output) = item.get("output") {
-                result.insert("output".into(), output.clone());
-            }
-            if let Some(error) = item.get("error") {
-                result.insert("error".into(), error.clone());
-            }
-            obj.insert("result".into(), serde_json::Value::Object(result));
-            Some(serde_json::Value::Object(obj))
-        }
-        "mcp_approval_request" => {
-            let tool_call_id = item_id.clone()?;
-            let name = item.get("name").and_then(|v| v.as_str())?.to_string();
-            let mut obj = serde_json::Map::new();
-            obj.insert("tool_type".into(), json!("mcp"));
-            obj.insert("tool_call_id".into(), json!(tool_call_id));
-            if let Some(id) = item_id.as_ref() {
-                obj.insert("item_id".into(), json!(id));
-            }
-            obj.insert("provider_executed".into(), json!(true));
-            obj.insert(
-                "input".into(),
-                item.get("arguments").cloned().unwrap_or_else(|| json!("")),
-            );
-            obj.insert("mcp_name".into(), json!(name));
-            let approval_request_id = item
-                .get("approval_request_id")
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string())
-                .or_else(|| item_id.clone());
-            if let Some(approval_request_id) = approval_request_id {
-                obj.insert("approval_request_id".into(), json!(approval_request_id));
-            }
-            obj.insert("approval_request".into(), json!(true));
-            if let Some(server_label) = item.get("server_label") {
-                obj.insert("server_label".into(), server_label.clone());
-            }
-            Some(serde_json::Value::Object(obj))
-        }
-        _ => None,
-    }
+
+    OUTPUT_ITEM_MAPPERS
+        .iter()
+        .find(|(candidate, _)| *candidate == item_type)
+        .and_then(|(_, mapper)| mapper(item, &item_id))
 }
 
 pub(super) struct ProviderToolParts {

@@ -1,7 +1,9 @@
 use std::any::TypeId;
 use std::path::Path;
 
-use ai_sdk_rs::core::{types as v2t, EmbeddingModel, ImageModel, LanguageModel, SdkError, TransportError};
+use ai_sdk_rs::core::{
+    types as v2t, EmbeddingModel, ImageModel, LanguageModel, SdkError, TransportError,
+};
 use ai_sdk_rs::provider::{Credentials, ProviderBootstrapHeaders};
 use ai_sdk_rs::providers::{
     anthropic::AnthropicMessagesLanguageModel,
@@ -171,7 +173,9 @@ fn quick_start_points_at_workspace_validated_v2_examples() {
         "expected the generate-text example package to exist on disk",
     );
     assert!(
-        !repo_root.join("examples/anthropic-thinking/Cargo.toml").exists(),
+        !repo_root
+            .join("examples/anthropic-thinking/Cargo.toml")
+            .exists(),
         "expected the orphaned anthropic-thinking package to be removed",
     );
     assert!(

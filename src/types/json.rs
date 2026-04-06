@@ -16,17 +16,7 @@ pub fn parse_json_loose(s: &str) -> Option<Value> {
 
     // Find the first opening bracket for JSON object or array
     let bytes = s.as_bytes();
-    let mut start_idx: Option<usize> = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'{' || b == b'[' {
-            start_idx = Some(i);
-            break;
-        }
-    }
-    let start = match start_idx {
-        Some(i) => i,
-        None => return None,
-    };
+    let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
 
     // Scan forward to find the matching closing bracket using a stack.
     // Handle quoted strings and escapes to avoid counting braces inside strings.
@@ -36,13 +26,11 @@ pub fn parse_json_loose(s: &str) -> Option<Value> {
         Square,
     }
 
-    let mut stack: Vec<Br> = Vec::new();
-    // Push the first bracket
-    stack.push(if bytes[start] == b'{' {
+    let mut stack = vec![if bytes[start] == b'{' {
         Br::Curly
     } else {
         Br::Square
-    });
+    }];
     let mut in_str = false;
     let mut escape = false;
     let mut end = None;
@@ -57,41 +45,41 @@ pub fn parse_json_loose(s: &str) -> Option<Value> {
                 in_str = false;
             }
             continue;
-        } else {
-            match b {
-                b'"' => {
-                    in_str = true;
-                }
-                b'{' => stack.push(Br::Curly),
-                b'[' => stack.push(Br::Square),
-                b'}' => {
-                    if let Some(top) = stack.pop() {
-                        if top != Br::Curly {
-                            return None;
-                        }
-                        if stack.is_empty() {
-                            end = Some(start + 1 + offset + 1); // inclusive end index
-                            break;
-                        }
-                    } else {
-                        return None;
-                    }
-                }
-                b']' => {
-                    if let Some(top) = stack.pop() {
-                        if top != Br::Square {
-                            return None;
-                        }
-                        if stack.is_empty() {
-                            end = Some(start + 1 + offset + 1);
-                            break;
-                        }
-                    } else {
-                        return None;
-                    }
-                }
-                _ => {}
+        }
+
+        match b {
+            b'"' => {
+                in_str = true;
             }
+            b'{' => stack.push(Br::Curly),
+            b'[' => stack.push(Br::Square),
+            b'}' => {
+                if let Some(top) = stack.pop() {
+                    if top != Br::Curly {
+                        return None;
+                    }
+                    if stack.is_empty() {
+                        end = Some(start + offset + 2);
+                        break;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            b']' => {
+                if let Some(top) = stack.pop() {
+                    if top != Br::Square {
+                        return None;
+                    }
+                    if stack.is_empty() {
+                        end = Some(start + offset + 2);
+                        break;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -104,8 +92,5 @@ pub fn parse_json_loose(s: &str) -> Option<Value> {
 /// If a valid first balanced JSON object/array is found and parses,
 /// return its string; otherwise, return the original `raw` unchanged.
 pub fn sanitize_json_fragment(raw: &str) -> String {
-    match parse_json_loose(raw) {
-        Some(v) => v.to_string(),
-        None => raw.to_string(),
-    }
+    parse_json_loose(raw).map_or_else(|| raw.to_string(), |v| v.to_string())
 }

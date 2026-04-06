@@ -483,6 +483,7 @@ mod tests {
     use crate::ai_sdk_types::v2 as v2t;
     use crate::ai_sdk_types::{Event, TokenUsage};
     use futures_util::{stream, TryStreamExt};
+    use serde_json::json;
     use std::collections::HashSet;
 
     #[tokio::test]
@@ -529,52 +530,60 @@ mod tests {
         .await
         .expect("stream parts");
 
-        assert!(
-            matches!(&parts[0], v2t::StreamPart::StreamStart { warnings } if warnings.is_empty())
+        assert_eq!(
+            serde_json::to_value(&parts).expect("serialize stream parts"),
+            json!([
+                {
+                    "type": "stream-start",
+                    "warnings": []
+                },
+                {
+                    "type": "text-start",
+                    "id": "text-1"
+                },
+                {
+                    "type": "text-delta",
+                    "id": "text-1",
+                    "delta": "hello"
+                },
+                {
+                    "type": "tool-input-start",
+                    "id": "tool-1",
+                    "tool_name": "weather",
+                    "providerExecuted": false
+                },
+                {
+                    "type": "tool-input-delta",
+                    "id": "tool-1",
+                    "delta": "{\"city\":\"SF\"}",
+                    "providerExecuted": false
+                },
+                {
+                    "type": "tool-input-end",
+                    "id": "tool-1",
+                    "providerExecuted": false
+                },
+                {
+                    "type": "tool-call",
+                    "toolCallId": "tool-1",
+                    "toolName": "weather",
+                    "input": "{\"city\":\"SF\"}",
+                    "providerExecuted": false
+                },
+                {
+                    "type": "text-end",
+                    "id": "text-1"
+                },
+                {
+                    "type": "finish",
+                    "usage": {
+                        "input_tokens": 2,
+                        "output_tokens": 3,
+                        "total_tokens": 5
+                    },
+                    "finish_reason": "tool-calls"
+                }
+            ])
         );
-        assert!(matches!(
-            &parts[1],
-            v2t::StreamPart::TextStart { id, .. } if id == "text-1"
-        ));
-        assert!(matches!(
-            &parts[2],
-            v2t::StreamPart::TextDelta { id, delta, .. }
-                if id == "text-1" && delta == "hello"
-        ));
-        assert!(matches!(
-            &parts[3],
-            v2t::StreamPart::ToolInputStart { id, tool_name, provider_executed, .. }
-                if id == "tool-1" && tool_name == "weather" && !provider_executed
-        ));
-        assert!(matches!(
-            &parts[4],
-            v2t::StreamPart::ToolInputDelta { id, delta, provider_executed, .. }
-                if id == "tool-1" && delta == "{\"city\":\"SF\"}" && !provider_executed
-        ));
-        assert!(matches!(
-            &parts[5],
-            v2t::StreamPart::ToolInputEnd { id, provider_executed, .. }
-                if id == "tool-1" && !provider_executed
-        ));
-        assert!(matches!(
-            &parts[6],
-            v2t::StreamPart::ToolCall(call)
-                if call.tool_call_id == "tool-1"
-                    && call.tool_name == "weather"
-                    && call.input == "{\"city\":\"SF\"}"
-                    && !call.provider_executed
-        ));
-        assert!(matches!(
-            &parts[7],
-            v2t::StreamPart::TextEnd { id, .. } if id == "text-1"
-        ));
-        assert!(matches!(
-            &parts[8],
-            v2t::StreamPart::Finish { usage, finish_reason, .. }
-                if usage.input_tokens == Some(2)
-                    && usage.output_tokens == Some(3)
-                    && usage.total_tokens == Some(5)
-                    && matches!(finish_reason, v2t::FinishReason::ToolCalls)
-        ));
     }
 }

@@ -13,7 +13,7 @@ use crate::providers::amazon_bedrock::config::BedrockConfig;
 use crate::providers::amazon_bedrock::error::map_transport_error;
 use crate::providers::amazon_bedrock::messages::{convert_prompt, ConvertedPrompt};
 use crate::providers::amazon_bedrock::options::{
-    map_to_owned, parse_bedrock_provider_options, BedrockProviderOptions,
+    map_to_owned, parse_bedrock_provider_options, BedrockProviderOptions, BedrockReasoningConfig,
 };
 use crate::providers::amazon_bedrock::signing::{prepare_request, PreparedRequest};
 
@@ -166,12 +166,16 @@ struct BuildCommandResult {
     provider_metadata_seed: Option<JsonMap<String, JsonValue>>,
 }
 
-fn build_command(
-    _model_id: &str,
-    options: &v2t::CallOptions,
-) -> Result<BuildCommandResult, SdkError> {
-    let mut warnings: Vec<v2t::CallWarning> = Vec::new();
+struct BedrockToolRequest {
+    tools: Vec<v2t::FunctionTool>,
+    tool_choice: Option<v2t::ToolChoice>,
+    uses_json_response_tool: bool,
+}
 
+fn collect_bedrock_unsupported_option_warnings(
+    options: &v2t::CallOptions,
+    warnings: &mut Vec<v2t::CallWarning>,
+) {
     if options.frequency_penalty.is_some() {
         warnings.push(v2t::CallWarning::UnsupportedSetting {
             setting: "frequencyPenalty".into(),
@@ -190,97 +194,94 @@ fn build_command(
             details: None,
         });
     }
+}
 
-    let bedrock_opts = parse_bedrock_provider_options(&options.provider_options)
-        .unwrap_or_else(|| BedrockProviderOptions::default());
+fn resolve_bedrock_json_response_tool(
+    options: &v2t::CallOptions,
+    warnings: &mut Vec<v2t::CallWarning>,
+) -> Option<v2t::FunctionTool> {
+    let Some(response_format) = &options.response_format else {
+        return None;
+    };
 
-    let mut uses_json_response_tool = false;
-    let mut json_response_tool: Option<v2t::FunctionTool> = None;
-    if let Some(response_format) = &options.response_format {
-        match response_format {
-            v2t::ResponseFormat::Text => {}
-            v2t::ResponseFormat::Json { schema, .. } => {
-                if let Some(schema) = schema {
-                    uses_json_response_tool = true;
-                    json_response_tool = Some(v2t::FunctionTool {
-                        name: "json".into(),
-                        description: Some("Respond with a JSON object.".into()),
-                        input_schema: schema.clone(),
-                        strict: None,
-                        provider_options: None,
-                        r#type: v2t::FunctionToolType::Function,
-                    });
-                } else {
-                    warnings.push(v2t::CallWarning::UnsupportedSetting {
-                        setting: "responseFormat".into(),
-                        details: Some(
-                            "JSON response format requires a schema; request ignored.".into(),
-                        ),
-                    });
-                }
+    match response_format {
+        v2t::ResponseFormat::Text => None,
+        v2t::ResponseFormat::Json { schema, .. } => match schema {
+            Some(schema) => Some(v2t::FunctionTool {
+                name: "json".into(),
+                description: Some("Respond with a JSON object.".into()),
+                input_schema: schema.clone(),
+                strict: None,
+                provider_options: None,
+                r#type: v2t::FunctionToolType::Function,
+            }),
+            None => {
+                warnings.push(v2t::CallWarning::UnsupportedSetting {
+                    setting: "responseFormat".into(),
+                    details: Some(
+                        "JSON response format requires a schema; request ignored.".into(),
+                    ),
+                });
+                None
             }
-        }
+        },
     }
+}
 
-    let mut tools_for_request: Vec<v2t::FunctionTool> = Vec::new();
+fn build_bedrock_tool_request(
+    options: &v2t::CallOptions,
+    warnings: &mut Vec<v2t::CallWarning>,
+) -> BedrockToolRequest {
+    let json_response_tool = resolve_bedrock_json_response_tool(options, warnings);
+    let uses_json_response_tool = json_response_tool.is_some();
+    let mut tools = Vec::new();
+
     for tool in &options.tools {
         match tool {
-            v2t::Tool::Function(f) => tools_for_request.push(f.clone()),
-            v2t::Tool::Provider(p) => {
+            v2t::Tool::Function(tool) => tools.push(tool.clone()),
+            v2t::Tool::Provider(tool) => {
                 warnings.push(v2t::CallWarning::UnsupportedTool {
-                    tool_name: p.name.clone(),
+                    tool_name: tool.name.clone(),
                     details: Some("provider tools are not supported".into()),
                 });
             }
         }
     }
+
     if uses_json_response_tool {
-        if !tools_for_request.is_empty() {
+        if !tools.is_empty() {
             warnings.push(v2t::CallWarning::Other {
                 message: "JSON response format does not support additional tools. Provided tools are ignored.".into(),
             });
-            tools_for_request.clear();
+            tools.clear();
         }
-        if let Some(tool) = json_response_tool.clone() {
-            tools_for_request.push(tool);
+        if let Some(tool) = json_response_tool {
+            tools.push(tool);
         }
     }
 
-    let mut tool_choice = options.tool_choice.clone();
-    if uses_json_response_tool {
-        tool_choice = Some(v2t::ToolChoice::Tool {
+    let tool_choice = if uses_json_response_tool {
+        Some(v2t::ToolChoice::Tool {
             name: "json".into(),
-        });
+        })
+    } else {
+        options.tool_choice.clone()
+    };
+
+    BedrockToolRequest {
+        tools,
+        tool_choice,
+        uses_json_response_tool,
     }
+}
 
-    let PreparedTools {
-        tool_config,
-        mut additional_model_fields,
-        betas,
-        mut tool_warnings,
-        has_tools,
-    } = prepare_tools(&tools_for_request, &tool_choice);
-    warnings.extend(tool_warnings.drain(..));
-
-    let (filtered_prompt, prompt_warnings) = filter_prompt_if_no_tools(&options.prompt, has_tools);
-    if let Some(w) = prompt_warnings {
-        warnings.push(w);
-    }
-
-    let ConvertedPrompt { system, messages } = convert_prompt(&filtered_prompt)?;
-
-    let mut command = JsonMap::new();
-    if !system.is_empty() {
-        command.insert("system".into(), JsonValue::Array(system));
-    }
-    command.insert("messages".into(), JsonValue::Array(messages));
-
+fn build_inference_config(options: &v2t::CallOptions) -> JsonMap<String, JsonValue> {
     let mut inference = JsonMap::new();
     if let Some(max_tokens) = options.max_output_tokens {
         inference.insert("maxTokens".into(), json!(max_tokens));
     }
-    if let Some(temp) = options.temperature {
-        inference.insert("temperature".into(), json!(temp));
+    if let Some(temperature) = options.temperature {
+        inference.insert("temperature".into(), json!(temperature));
     }
     if let Some(top_p) = options.top_p {
         inference.insert("topP".into(), json!(top_p));
@@ -288,102 +289,197 @@ fn build_command(
     if let Some(top_k) = options.top_k {
         inference.insert("topK".into(), json!(top_k));
     }
-    if let Some(stops) = options.stop_sequences.as_ref() {
-        if !stops.is_empty() {
-            inference.insert("stopSequences".into(), json!(stops));
+    if let Some(stop_sequences) = options.stop_sequences.as_ref() {
+        if !stop_sequences.is_empty() {
+            inference.insert("stopSequences".into(), json!(stop_sequences));
+        }
+    }
+    inference
+}
+
+fn remove_reasoning_incompatible_inference_setting(
+    inference: &mut JsonMap<String, JsonValue>,
+    field: &str,
+    setting: &str,
+    details: &str,
+    warnings: &mut Vec<v2t::CallWarning>,
+) {
+    if inference.remove(field).is_some() {
+        warnings.push(v2t::CallWarning::UnsupportedSetting {
+            setting: setting.into(),
+            details: Some(details.into()),
+        });
+    }
+}
+
+fn apply_bedrock_reasoning_config(
+    reasoning_config: Option<&BedrockReasoningConfig>,
+    inference: &mut JsonMap<String, JsonValue>,
+    additional_model_fields: &mut Option<JsonMap<String, JsonValue>>,
+    warnings: &mut Vec<v2t::CallWarning>,
+) {
+    let Some(reasoning) = reasoning_config else {
+        return;
+    };
+    if !matches!(reasoning.r#type.as_deref(), Some("enabled")) {
+        return;
+    }
+
+    let budget = reasoning.budget_tokens.unwrap_or(0) as u64;
+    if budget > 0 {
+        let entry = additional_model_fields
+            .get_or_insert_with(JsonMap::new)
+            .entry("thinking".to_string())
+            .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+        if let JsonValue::Object(map) = entry {
+            map.insert("type".into(), JsonValue::String("enabled".into()));
+            map.insert("budget_tokens".into(), JsonValue::Number(budget.into()));
+        }
+        if let Some(existing) = inference.get_mut("maxTokens") {
+            if let Some(value) = existing.as_u64() {
+                *existing = JsonValue::Number((value + budget).into());
+            }
+        } else {
+            inference.insert(
+                "maxTokens".into(),
+                JsonValue::Number((budget + 4096).into()),
+            );
         }
     }
 
-    let mut provider_metadata_seed: Option<JsonMap<String, JsonValue>> = None;
-    if let Some(reasoning) = bedrock_opts.reasoning_config.as_ref() {
-        if matches!(reasoning.r#type.as_deref(), Some("enabled")) {
-            let budget = reasoning.budget_tokens.unwrap_or(0) as u64;
-            if budget > 0 {
-                let entry = additional_model_fields
-                    .get_or_insert_with(JsonMap::new)
-                    .entry("thinking".to_string())
-                    .or_insert_with(|| JsonValue::Object(JsonMap::new()));
-                if let JsonValue::Object(map) = entry {
-                    map.insert("type".into(), JsonValue::String("enabled".into()));
-                    map.insert("budget_tokens".into(), JsonValue::Number(budget.into()));
-                }
-                if let Some(existing) = inference.get_mut("maxTokens") {
-                    if let Some(v) = existing.as_u64() {
-                        *existing = JsonValue::Number((v + budget).into());
-                    }
-                } else {
-                    inference.insert(
-                        "maxTokens".into(),
-                        JsonValue::Number((budget + 4096).into()),
-                    );
-                }
-            }
-            if let Some(temp) = inference.remove("temperature") {
-                let _ = temp;
-                warnings.push(v2t::CallWarning::UnsupportedSetting {
-                    setting: "temperature".into(),
-                    details: Some("temperature is not supported when reasoning is enabled".into()),
-                });
-            }
-            if let Some(val) = inference.remove("topP") {
-                let _ = val;
-                warnings.push(v2t::CallWarning::UnsupportedSetting {
-                    setting: "topP".into(),
-                    details: Some("topP is not supported when reasoning is enabled".into()),
-                });
-            }
-            if let Some(val) = inference.remove("topK") {
-                let _ = val;
-                warnings.push(v2t::CallWarning::UnsupportedSetting {
-                    setting: "topK".into(),
-                    details: Some("topK is not supported when reasoning is enabled".into()),
-                });
-            }
+    remove_reasoning_incompatible_inference_setting(
+        inference,
+        "temperature",
+        "temperature",
+        "temperature is not supported when reasoning is enabled",
+        warnings,
+    );
+    remove_reasoning_incompatible_inference_setting(
+        inference,
+        "topP",
+        "topP",
+        "topP is not supported when reasoning is enabled",
+        warnings,
+    );
+    remove_reasoning_incompatible_inference_setting(
+        inference,
+        "topK",
+        "topK",
+        "topK is not supported when reasoning is enabled",
+        warnings,
+    );
+}
+
+fn build_base_bedrock_command(converted_prompt: ConvertedPrompt) -> JsonMap<String, JsonValue> {
+    let ConvertedPrompt { system, messages } = converted_prompt;
+    let mut command = JsonMap::new();
+    if !system.is_empty() {
+        command.insert("system".into(), JsonValue::Array(system));
+    }
+    command.insert("messages".into(), JsonValue::Array(messages));
+    command
+}
+
+fn insert_nonempty_command_object(
+    command: &mut JsonMap<String, JsonValue>,
+    field: &str,
+    value: JsonMap<String, JsonValue>,
+) {
+    if !value.is_empty() {
+        command.insert(field.into(), JsonValue::Object(value));
+    }
+}
+
+fn insert_tool_config(command: &mut JsonMap<String, JsonValue>, tool_config: Option<JsonValue>) {
+    let Some(tool_config) = tool_config else {
+        return;
+    };
+    match tool_config {
+        JsonValue::Object(obj) if obj.is_empty() => {}
+        value if value.is_null() => {}
+        value => {
+            command.insert("toolConfig".into(), value);
         }
     }
+}
 
-    if !inference.is_empty() {
-        command.insert("inferenceConfig".into(), JsonValue::Object(inference));
-    }
-
-    if let Some(mut tool_cfg) = tool_config {
-        if let JsonValue::Object(obj) = &mut tool_cfg {
-            if obj.is_empty() {
-                tool_cfg = JsonValue::Null;
-            }
-        }
-        if !tool_cfg.is_null() {
-            command.insert("toolConfig".into(), tool_cfg);
-        }
-    }
-
+fn merge_additional_model_request_fields(
+    additional_model_fields: &mut Option<JsonMap<String, JsonValue>>,
+    bedrock_opts: &BedrockProviderOptions,
+) {
     if let Some(extra) = map_to_owned(&bedrock_opts.additional_model_request_fields) {
         additional_model_fields
             .get_or_insert_with(JsonMap::new)
             .extend(extra);
     }
+}
 
-    if let Some(guardrails) = map_to_owned(&bedrock_opts.guardrail_config) {
-        command.insert("guardrailConfig".into(), JsonValue::Object(guardrails));
+fn insert_optional_bedrock_map(
+    command: &mut JsonMap<String, JsonValue>,
+    field: &str,
+    map: &Option<JsonMap<String, JsonValue>>,
+) {
+    if let Some(map) = map_to_owned(map) {
+        command.insert(field.into(), JsonValue::Object(map));
     }
-    if let Some(guardrails_stream) = map_to_owned(&bedrock_opts.guardrail_stream_config) {
-        command.insert(
-            "guardrailStreamConfig".into(),
-            JsonValue::Object(guardrails_stream),
+}
+
+fn build_command(
+    _model_id: &str,
+    options: &v2t::CallOptions,
+) -> Result<BuildCommandResult, SdkError> {
+    let mut warnings = Vec::new();
+    collect_bedrock_unsupported_option_warnings(options, &mut warnings);
+
+    let bedrock_opts =
+        parse_bedrock_provider_options(&options.provider_options).unwrap_or_default();
+    let BedrockToolRequest {
+        tools,
+        tool_choice,
+        uses_json_response_tool,
+    } = build_bedrock_tool_request(options, &mut warnings);
+
+    let PreparedTools {
+        tool_config,
+        mut additional_model_fields,
+        betas,
+        mut tool_warnings,
+        has_tools,
+    } = prepare_tools(&tools, &tool_choice);
+    warnings.extend(tool_warnings.drain(..));
+
+    let (filtered_prompt, prompt_warnings) = filter_prompt_if_no_tools(&options.prompt, has_tools);
+    if let Some(warning) = prompt_warnings {
+        warnings.push(warning);
+    }
+
+    let mut command = build_base_bedrock_command(convert_prompt(&filtered_prompt)?);
+    let mut inference = build_inference_config(options);
+    apply_bedrock_reasoning_config(
+        bedrock_opts.reasoning_config.as_ref(),
+        &mut inference,
+        &mut additional_model_fields,
+        &mut warnings,
+    );
+    insert_nonempty_command_object(&mut command, "inferenceConfig", inference);
+    insert_tool_config(&mut command, tool_config);
+    merge_additional_model_request_fields(&mut additional_model_fields, &bedrock_opts);
+    insert_optional_bedrock_map(
+        &mut command,
+        "guardrailConfig",
+        &bedrock_opts.guardrail_config,
+    );
+    insert_optional_bedrock_map(
+        &mut command,
+        "guardrailStreamConfig",
+        &bedrock_opts.guardrail_stream_config,
+    );
+    if let Some(additional_model_fields) = additional_model_fields {
+        insert_nonempty_command_object(
+            &mut command,
+            "additionalModelRequestFields",
+            additional_model_fields,
         );
-    }
-
-    if let Some(extra) = additional_model_fields {
-        if !extra.is_empty() {
-            command.insert(
-                "additionalModelRequestFields".into(),
-                JsonValue::Object(extra),
-            );
-        }
-    }
-
-    if uses_json_response_tool {
-        provider_metadata_seed = Some(JsonMap::new());
     }
 
     Ok(BuildCommandResult {
@@ -391,7 +487,11 @@ fn build_command(
         warnings,
         uses_json_response_tool,
         betas,
-        provider_metadata_seed,
+        provider_metadata_seed: if uses_json_response_tool {
+            Some(JsonMap::new())
+        } else {
+            None
+        },
     })
 }
 

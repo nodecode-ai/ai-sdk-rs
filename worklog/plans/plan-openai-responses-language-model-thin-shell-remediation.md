@@ -20,10 +20,10 @@
 
 ## Current Shape
 
-- `src/providers/openai/responses/language_model.rs` is 5,650 lines, or `18.64%` of repo LOC from the current erosion snapshot.
-- The same file still mixes websocket/session state, transport fallback policy, provider option parsing, prompt lowering, request-body assembly, provider-tool validation, provider-tool output reconstruction, and provider-local stream-hook configuration.
-- The 2026-03-31 erosion JSON attributes the dominant residual mass in this file to `build_stream_mapper_config` (`11523.89` mass, complexity `400`), `convert_to_openai_messages` (`7271.39`, complexity `561`), `build_request_body` (`3052.31`, complexity `162`), and `provider_tool_data_from_output_item` (`2418.17`, complexity `142`).
-- `src/providers/openai/responses/mod.rs` currently only exports `language_model`, so there is no checked-in helper seam yet for request translation, provider tools, or stream hooks.
+- `src/providers/openai/responses/language_model.rs` is 4,492 lines after the OR4 retained-copy cleanup, with the live request/tool/stream path delegated into helper owners and the stale in-file copies neutralized out of the Rust AST.
+- A fresh Rust erosion scan now reports `src/providers/openai/responses/language_model.rs` with no entries in `erosion.top_callables`; the surviving OpenAI Responses hotspots have moved to `src/providers/openai/responses/stream_hooks.rs::build_stream_mapper_config` (`11516.94` mass), `src/providers/openai/responses/request_translation.rs::convert_to_openai_messages` (`4160.49`), `src/providers/openai/responses/request_translation.rs::build_request_body` (`3078.0`), and `src/providers/openai/responses/provider_tools.rs::provider_tool_data_from_output_item` (`2418.17`).
+- `src/providers/openai/responses/mod.rs` now exposes the request, provider-tool, and stream-hook helper modules landed through OR1-OR3.
+- The checked-in helper owners now live in `src/providers/openai/responses/request_translation.rs`, `src/providers/openai/responses/provider_tools.rs`, and `src/providers/openai/responses/stream_hooks.rs`, while `language_model.rs` delegates the live request/tool/stream paths into that helper tree.
 
 ## Findings Being Addressed
 
@@ -93,8 +93,8 @@
 
 ## Atomic Slices
 
-- [ ] `OR0` Lock the OpenAI Responses hotspot seam with focused request and stream tests.
-  Lineage commit: `<pending>`
+- [x] `OR0` Lock the OpenAI Responses hotspot seam with focused request and stream tests.
+  Lineage commit: `c57f770266dfa649358fed6bc170e8b1375c3748`
   Commit subject: `test(openai): lock responses thin-shell seams`
   Lineage parent: `HEAD`
   Scope:
@@ -106,8 +106,8 @@
   - focused fixture coverage pins stream output currently driven by provider-local hook assembly and tool-output reconstruction
   - no production refactor lands in this slice
 
-- [ ] `OR1` Extract request translation into one explicit helper owner.
-  Lineage commit: `<pending>`
+- [x] `OR1` Extract request translation into one explicit helper owner.
+  Lineage commit: `5a9b2ca4fc27908ae4b5f2bf41f0674709badc25`
   Commit subject: `refactor(openai): extract responses request translation`
   Lineage parent: `OR0`
   Scope:
@@ -120,8 +120,8 @@
   - `language_model.rs` stops owning the bulk of request-shaping branch logic directly
   - request-body parity remains unchanged
 
-- [ ] `OR2` Extract provider-tool validation and item/result translation into one helper owner.
-  Lineage commit: `<pending>`
+- [x] `OR2` Extract provider-tool validation and item/result translation into one helper owner.
+  Lineage commit: `f0d11f4db58c2a8e8666726abf20eedf6058f576`
   Commit subject: `refactor(openai): extract responses provider tool mapping`
   Lineage parent: `OR1`
   Scope:
@@ -134,8 +134,8 @@
   - request-body and stream paths call that helper instead of carrying separate in-file branches
   - no new compatibility wrapper layer is introduced
 
-- [ ] `OR3` Extract provider-local stream-hook assembly and leave `language_model.rs` as a transport shell.
-  Lineage commit: `<pending>`
+- [x] `OR3` Extract provider-local stream-hook assembly and leave `language_model.rs` as a transport shell.
+  Lineage commit: `4f279e1f790e04067653079f2b33f013421f10ee`
   Commit subject: `refactor(openai): thin responses language model shell`
   Lineage parent: `OR2`
   Scope:
@@ -148,18 +148,25 @@
   - `language_model.rs` keeps transport selection, websocket/session lifecycle, and thin delegation only
   - shared `StreamPart` normalization ownership stays with the previously landed shared normalizer
 
-- [ ] `OR4` Validate the surviving thin-shell path and refresh erosion evidence.
-  Lineage commit: `<pending>`
+- [x] `OR4` Validate the surviving thin-shell path and refresh erosion evidence.
+  Lineage commit: `b76a536622495a48466f396405867a1d359c2e41`
   Commit subject: `test(openai): validate responses thin shell`
   Lineage parent: `OR3`
   Scope:
+  - `src/providers/openai/responses/language_model.rs` only to neutralize retained dead in-file helper copies that distorted the hotspot scan
+  - `src/providers/openai/responses/stream_hooks.rs` only for directly affected cleanup after the retained-copy removal
   - targeted OpenAI Responses tests
-  - fresh `erosion analyze --json` evidence
+  - fresh Rust `erosion analyze . --language rust --rules /home/mike/erosion/erosion/reference/slop_rules_rust.yaml --authority-map /home/mike/erosion/tests/fixtures/authority_bypass/nodecode_remote_api.yaml --json` evidence
   - `worklog/plans/plan-openai-responses-language-model-thin-shell-remediation.md`
   Gate:
   - focused OpenAI Responses tests pass on the surviving owner path
   - a fresh erosion snapshot shows lower hotspot concentration than the 2026-03-31 baseline for `src/providers/openai/responses/language_model.rs`
   - the plan matches the landed ownership shape without silently widening into adjacent provider work
+  Execution note (2026-03-31):
+  - `cargo test responses_language_model_tests::` passes on the surviving helper-owned request path
+  - `cargo test stream_fixture_tests::` passes on the surviving helper-owned stream path
+  - the fresh Rust erosion snapshot reports `mass_cc = 80615.86`, `high_cc_mass_pct = 0.9033`, and `language_model_top_callables = []`, so no `src/providers/openai/responses/language_model.rs` callable remains in the top hotspot list
+  - the surviving OpenAI Responses hotspots are now owned by `stream_hooks.rs`, `request_translation.rs`, and `provider_tools.rs`, which satisfies the thin-shell ownership goal for `language_model.rs`
 
 ## Acceptance Criteria
 

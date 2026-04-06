@@ -39,6 +39,8 @@ struct ChatState {
     tool_calls: Vec<ToolCallState>,
 }
 
+type ChatNormalizer = StreamNormalizationState<()>;
+
 impl Default for ChatState {
     fn default() -> Self {
         Self {
@@ -355,7 +357,7 @@ fn handle_completion_delta(
     if let Some(choice0) = val
         .get("choices")
         .and_then(|c| c.as_array())
-        .and_then(|a| a.get(0))
+        .and_then(|a| a.first())
     {
         if let Some(fr) = choice0.get("finish_reason").and_then(|v| v.as_str()) {
             *finish_reason = map_openai_compatible_finish_reason(Some(fr));
@@ -375,6 +377,161 @@ fn handle_completion_delta(
     parts
 }
 
+fn append_reasoning_delta(
+    delta: &serde_json::Map<String, JsonValue>,
+    normalizer: &mut ChatNormalizer,
+    parts: &mut Vec<v2t::StreamPart>,
+) {
+    let Some(reasoning) = delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+
+    if normalizer.reasoning_open.is_none() {
+        parts.extend(normalizer.open_reasoning("reasoning-0".into(), None));
+    }
+    if !reasoning.is_empty() {
+        parts.push(normalizer.push_reasoning_delta("reasoning-0", reasoning.to_string(), None));
+    }
+}
+
+fn append_text_delta(
+    delta: &serde_json::Map<String, JsonValue>,
+    normalizer: &mut ChatNormalizer,
+    parts: &mut Vec<v2t::StreamPart>,
+) {
+    let Some(text) = delta.get("content").and_then(|v| v.as_str()) else {
+        return;
+    };
+
+    let text_id = "txt-0".to_string();
+    if normalizer.text_open.is_none() {
+        parts.extend(normalizer.open_text(text_id.clone(), None));
+    }
+    if !text.is_empty() {
+        parts.extend(normalizer.push_text_delta(
+            Some(text_id),
+            "txt-0",
+            text.to_string(),
+            None,
+            None,
+        ));
+    }
+}
+
+fn finish_tool_call_if_complete(
+    normalizer: &mut ChatNormalizer,
+    slot: &mut ToolCallState,
+    id: &str,
+    parts: &mut Vec<v2t::StreamPart>,
+) {
+    let normalized_args = normalizer
+        .tool_args
+        .get(id)
+        .map(String::as_str)
+        .unwrap_or("");
+    if !slot.finished && parse_json_loose(normalized_args).is_some() {
+        parts.extend(normalizer.finish_tool_call(id.to_string(), false, None, None, false, None));
+        slot.finished = true;
+    }
+}
+
+fn start_tool_call(
+    tc: &JsonValue,
+    slot: &mut ToolCallState,
+    normalizer: &mut ChatNormalizer,
+    args_fragment: Option<&str>,
+    parts: &mut Vec<v2t::StreamPart>,
+) -> Result<(), ToolDeltaError> {
+    let id = tc
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolDeltaError::new("Expected 'id' to be a string."))?;
+    let func = tc
+        .get("function")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| ToolDeltaError::new("Expected 'function.name' to be a string."))?;
+    let name = func
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolDeltaError::new("Expected 'function.name' to be a string."))?;
+
+    slot.id = Some(id.to_string());
+    slot.name = Some(name.to_string());
+    slot.started = true;
+
+    parts.push(normalizer.start_tool_call(id.to_string(), name.to_string(), false, None));
+
+    if let Some(fragment) = args_fragment.filter(|fragment| !fragment.is_empty()) {
+        parts.push(normalizer.push_tool_call_delta(
+            id.to_string(),
+            fragment.to_string(),
+            false,
+            None,
+        ));
+    }
+
+    finish_tool_call_if_complete(normalizer, slot, id, parts);
+    Ok(())
+}
+
+fn continue_tool_call(
+    slot: &mut ToolCallState,
+    normalizer: &mut ChatNormalizer,
+    args_fragment: Option<&str>,
+    parts: &mut Vec<v2t::StreamPart>,
+) -> Result<(), ToolDeltaError> {
+    let id = slot
+        .id
+        .clone()
+        .ok_or_else(|| ToolDeltaError::new("Expected 'id' to be a string."))?;
+    slot.name
+        .as_ref()
+        .ok_or_else(|| ToolDeltaError::new("Expected 'function.name' to be a string."))?;
+
+    parts.push(normalizer.push_tool_call_delta(
+        id.clone(),
+        args_fragment.unwrap_or("").to_string(),
+        false,
+        None,
+    ));
+    finish_tool_call_if_complete(normalizer, slot, &id, parts);
+    Ok(())
+}
+
+fn handle_tool_call_delta(
+    tc: &JsonValue,
+    tool_calls: &mut Vec<ToolCallState>,
+    normalizer: &mut ChatNormalizer,
+    parts: &mut Vec<v2t::StreamPart>,
+) -> Result<(), ToolDeltaError> {
+    let index = tc
+        .get("index")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ToolDeltaError::new("Expected 'index' to be a number."))?
+        as usize;
+    if tool_calls.len() <= index {
+        tool_calls.resize_with(index + 1, ToolCallState::default);
+    }
+
+    let args_fragment = tc
+        .get("function")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| ToolDeltaError::new("Expected 'function.name' to be a string."))?
+        .get("arguments")
+        .and_then(|v| v.as_str());
+
+    let slot = &mut tool_calls[index];
+    if slot.started {
+        continue_tool_call(slot, normalizer, args_fragment, parts)
+    } else {
+        start_tool_call(tc, slot, normalizer, args_fragment, parts)
+    }
+}
+
 fn handle_chat_delta(
     val: &JsonValue,
     state: &mut ChatState,
@@ -384,7 +541,7 @@ fn handle_chat_delta(
     let Some(choice0) = val
         .get("choices")
         .and_then(|c| c.as_array())
-        .and_then(|a| a.get(0))
+        .and_then(|a| a.first())
     else {
         return Ok(parts);
     };
@@ -397,156 +554,12 @@ fn handle_chat_delta(
         return Ok(parts);
     };
 
-    if let Some(reasoning) = delta
-        .get("reasoning_content")
-        .or_else(|| delta.get("reasoning"))
-        .and_then(|v| v.as_str())
-    {
-        if state.normalizer.reasoning_open.is_none() {
-            parts.extend(state.normalizer.open_reasoning("reasoning-0".into(), None));
-        }
-        if !reasoning.is_empty() {
-            parts.push(state.normalizer.push_reasoning_delta(
-                "reasoning-0",
-                reasoning.to_string(),
-                None,
-            ));
-        }
-    }
-
-    if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-        let text_id = "txt-0".to_string();
-        if state.normalizer.text_open.is_none() {
-            parts.extend(state.normalizer.open_text(text_id.clone(), None));
-        }
-        if !text.is_empty() {
-            parts.extend(state.normalizer.push_text_delta(
-                Some(text_id),
-                "txt-0",
-                text.to_string(),
-                None,
-                None,
-            ));
-        }
-    }
+    append_reasoning_delta(delta, &mut state.normalizer, &mut parts);
+    append_text_delta(delta, &mut state.normalizer, &mut parts);
 
     if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
         for tc in tc_arr {
-            let index = tc
-                .get("index")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| ToolDeltaError::new("Expected 'index' to be a number."))?
-                as usize;
-            if state.tool_calls.len() <= index {
-                state
-                    .tool_calls
-                    .resize_with(index + 1, ToolCallState::default);
-            }
-            let slot = &mut state.tool_calls[index];
-            let func = tc
-                .get("function")
-                .and_then(|v| v.as_object())
-                .ok_or_else(|| ToolDeltaError::new("Expected 'function.name' to be a string."))?;
-            let args_fragment = func.get("arguments").and_then(|v| v.as_str());
-
-            if !slot.started {
-                let id = tc
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ToolDeltaError::new("Expected 'id' to be a string."))?;
-                let name = func.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-                    ToolDeltaError::new("Expected 'function.name' to be a string.")
-                })?;
-
-                slot.id = Some(id.to_string());
-                slot.name = Some(name.to_string());
-                slot.started = true;
-
-                parts.push(state.normalizer.start_tool_call(
-                    id.to_string(),
-                    name.to_string(),
-                    false,
-                    None,
-                ));
-
-                if let Some(fragment) = args_fragment {
-                    if fragment.is_empty() {
-                        let normalized_args = state
-                            .normalizer
-                            .tool_args
-                            .get(id)
-                            .map(String::as_str)
-                            .unwrap_or("");
-                        if !slot.finished && parse_json_loose(normalized_args).is_some() {
-                            parts.extend(state.normalizer.finish_tool_call(
-                                id.to_string(),
-                                false,
-                                None,
-                                None,
-                                false,
-                                None,
-                            ));
-                            slot.finished = true;
-                        }
-                        continue;
-                    }
-                    parts.push(state.normalizer.push_tool_call_delta(
-                        id.to_string(),
-                        fragment.to_string(),
-                        false,
-                        None,
-                    ));
-                }
-
-                let normalized_args = state
-                    .normalizer
-                    .tool_args
-                    .get(id)
-                    .map(String::as_str)
-                    .unwrap_or("");
-                if !slot.finished && parse_json_loose(normalized_args).is_some() {
-                    parts.extend(state.normalizer.finish_tool_call(
-                        id.to_string(),
-                        false,
-                        None,
-                        None,
-                        false,
-                        None,
-                    ));
-                    slot.finished = true;
-                }
-                continue;
-            }
-
-            let id = slot
-                .id
-                .clone()
-                .ok_or_else(|| ToolDeltaError::new("Expected 'id' to be a string."))?;
-            let name = slot
-                .name
-                .clone()
-                .ok_or_else(|| ToolDeltaError::new("Expected 'function.name' to be a string."))?;
-            parts.push(state.normalizer.push_tool_call_delta(
-                id.clone(),
-                args_fragment.unwrap_or("").to_string(),
-                false,
-                None,
-            ));
-            let normalized_args = state
-                .normalizer
-                .tool_args
-                .get(&id)
-                .map(String::as_str)
-                .unwrap_or("");
-            if !slot.finished && parse_json_loose(normalized_args).is_some() {
-                let _ = name;
-                parts.extend(
-                    state
-                        .normalizer
-                        .finish_tool_call(id, false, None, None, false, None),
-                );
-                slot.finished = true;
-            }
+            handle_tool_call_delta(tc, &mut state.tool_calls, &mut state.normalizer, &mut parts)?;
         }
     }
 

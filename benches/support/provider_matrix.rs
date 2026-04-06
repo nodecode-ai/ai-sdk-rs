@@ -766,7 +766,8 @@ async fn run_gateway_backpressure_replay() {
 }
 
 async fn run_openai_compatible_backpressure_replay() {
-    let responses = join_all((0..4).map(|_| collect_openai_compatible_adversarial_parts(true))).await;
+    let responses =
+        join_all((0..4).map(|_| collect_openai_compatible_adversarial_parts(true))).await;
     std::hint::black_box(responses);
 }
 
@@ -848,10 +849,7 @@ fn scaled_provider_events() -> Vec<Event> {
         for segment in 0..32 {
             events.push(Event::ToolCallDelta {
                 id: id.clone(),
-                args_json: format!(
-                    "\"segment_{segment}\":\"{}\",",
-                    "value".repeat(4)
-                ),
+                args_json: format!("\"segment_{segment}\":\"{}\",", "value".repeat(4)),
             });
         }
         events.push(Event::ToolCallEnd { id });

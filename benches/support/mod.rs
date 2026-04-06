@@ -15,10 +15,9 @@ pub use openai_responses::{
 };
 pub use provider_matrix::{
     concurrent_replay_scenarios, event_mapping_scenarios, json_parse_scenarios,
-    provider_matrix_families, provider_parse_scenarios, run_anthropic_stream,
-    run_azure_generate, run_bedrock_generate, run_gateway_generate, run_google_generate,
-    run_google_vertex_generate, run_openai_compatible_stream, run_openai_generate,
-    stream_collection_scenarios,
+    provider_matrix_families, provider_parse_scenarios, run_anthropic_stream, run_azure_generate,
+    run_bedrock_generate, run_gateway_generate, run_google_generate, run_google_vertex_generate,
+    run_openai_compatible_stream, run_openai_generate, stream_collection_scenarios,
 };
 
 pub fn benchmark_runtime() -> tokio::runtime::Runtime {

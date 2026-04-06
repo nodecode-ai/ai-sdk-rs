@@ -1,6 +1,7 @@
 use crate::providers::openai_compatible::chat::convert::convert_to_openai_compatible_chat_messages;
 use crate::types::v2 as v2t;
 use serde_json::json;
+use std::collections::HashMap;
 
 #[test]
 fn user_text_collapses_to_string_content() {
@@ -128,5 +129,34 @@ fn tool_calls_and_results_are_stringified() {
                 "content": json!({"oof":"321rab"}).to_string()
             })
         ]
+    );
+}
+
+#[test]
+fn collapsed_user_text_merges_message_and_part_metadata() {
+    let prompt = vec![v2t::PromptMessage::User {
+        content: vec![v2t::UserPart::Text {
+            text: "Hello".into(),
+            provider_options: Some(HashMap::from([(
+                "test-provider".into(),
+                HashMap::from([("partKey".into(), json!("part-value"))]),
+            )])),
+        }],
+        provider_options: Some(HashMap::from([(
+            "test-provider".into(),
+            HashMap::from([("messageKey".into(), json!("message-value"))]),
+        )])),
+    }];
+
+    let result = convert_to_openai_compatible_chat_messages("test-provider", &prompt);
+
+    assert_eq!(
+        result,
+        vec![json!({
+            "role":"user",
+            "content":"Hello",
+            "messageKey":"message-value",
+            "partKey":"part-value"
+        })]
     );
 }

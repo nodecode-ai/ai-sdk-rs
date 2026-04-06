@@ -20,14 +20,6 @@ pub type ProviderMetadata =
 /// HTTP headers map for response metadata.
 pub type Headers = HashMap<String, String>;
 
-pub(crate) fn headers_is_empty(map: &HashMap<String, String>) -> bool {
-    map.is_empty()
-}
-
-pub(crate) fn provider_options_is_empty(map: &ProviderOptions) -> bool {
-    map.is_empty()
-}
-
 pub(crate) fn bool_is_false(value: &bool) -> bool {
     !*value
 }
@@ -206,7 +198,7 @@ pub enum ToolResultInlineContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultPart {
-    #[serde(rename = "type", default = "tool_result_part_type_default")]
+    #[serde(rename = "type", default)]
     pub r#type: ToolResultPartType,
     #[serde(rename = "toolCallId")]
     pub tool_call_id: String,
@@ -222,14 +214,11 @@ pub struct ToolResultPart {
     pub provider_options: Option<ProviderOptions>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolResultPartType {
+    #[default]
     ToolResult,
-}
-
-fn tool_result_part_type_default() -> ToolResultPartType {
-    ToolResultPartType::ToolResult
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,7 +230,7 @@ pub enum ToolMessagePart {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolApprovalResponsePart {
-    #[serde(rename = "type", default = "tool_approval_response_type_default")]
+    #[serde(rename = "type", default)]
     pub r#type: ToolApprovalResponsePartType,
     #[serde(rename = "approvalId")]
     pub approval_id: String,
@@ -254,14 +243,11 @@ pub struct ToolApprovalResponsePart {
     pub provider_options: Option<ProviderOptions>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolApprovalResponsePartType {
+    #[default]
     ToolApprovalResponse,
-}
-
-fn tool_approval_response_type_default() -> ToolApprovalResponsePartType {
-    ToolApprovalResponsePartType::ToolApprovalResponse
 }
 
 // ---------- Call options ----------
@@ -293,9 +279,9 @@ pub struct CallOptions {
     pub tool_choice: Option<ToolChoice>,
     #[serde(default)]
     pub include_raw_chunks: bool,
-    #[serde(default, skip_serializing_if = "headers_is_empty")]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
-    #[serde(default, skip_serializing_if = "provider_options_is_empty")]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub provider_options: ProviderOptions,
 }
 
@@ -332,7 +318,7 @@ pub enum ResponseFormat {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionTool {
-    #[serde(rename = "type", default = "function_tool_type_default")]
+    #[serde(rename = "type", default)]
     pub r#type: FunctionToolType,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -349,14 +335,11 @@ pub struct FunctionTool {
     pub provider_options: Option<ProviderOptions>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FunctionToolType {
+    #[default]
     Function,
-}
-
-fn function_tool_type_default() -> FunctionToolType {
-    FunctionToolType::Function
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,7 +351,7 @@ pub enum Tool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderTool {
-    #[serde(rename = "type", default = "provider_tool_type_default")]
+    #[serde(rename = "type", default)]
     pub r#type: ProviderToolType,
     /// The provider tool id, formatted as "<provider>.<tool>".
     pub id: String,
@@ -378,14 +361,11 @@ pub struct ProviderTool {
     pub args: JsonValue,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderToolType {
+    #[default]
     Provider,
-}
-
-fn provider_tool_type_default() -> ProviderToolType {
-    ProviderToolType::Provider
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

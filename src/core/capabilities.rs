@@ -32,9 +32,10 @@ fn default_index_path() -> PathBuf {
     if let Some(proj) = directories::ProjectDirs::from("com", "clixode", "clixode") {
         return proj.cache_dir().join("api").join("api.json");
     }
-    // Fallback to home dir if dirs not available (unlikely)
-    let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    p.push(".cache/clixode/api/api.json");
+    let mut p = directories::BaseDirs::new()
+        .map(|base| base.cache_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    p.push("clixode/api/api.json");
     p
 }
 

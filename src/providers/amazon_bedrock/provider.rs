@@ -17,34 +17,33 @@ use crate::providers::amazon_bedrock::language_model::BedrockLanguageModel;
 
 const TRACE_PREFIX: &str = "[BEDROCK]";
 const DEFAULT_BASE_URL_FMT: &str = "https://bedrock-runtime.{region}.amazonaws.com";
+const BEDROCK_TIMEOUT_SECS: u64 = 45;
 
 fn match_bedrock(def: &ProviderDefinition) -> bool {
     matches!(def.sdk_type, SdkType::AmazonBedrock)
 }
 
-fn build_bedrock(
-    def: &ProviderDefinition,
-    model: &str,
-    creds: &Credentials,
-) -> Result<Arc<dyn LanguageModel>, SdkError> {
-    let mut base_headers: Vec<(String, String)> = Vec::new();
-    base_headers.push(("content-type".into(), "application/json".into()));
-    base_headers.push(("accept".into(), "application/json".into()));
+fn default_headers() -> Vec<(String, String)> {
+    vec![
+        ("content-type".into(), "application/json".into()),
+        ("accept".into(), "application/json".into()),
+    ]
+}
 
-    let api_key_from_creds = creds
+fn resolve_bedrock_api_key(creds: &Credentials) -> Option<String> {
+    creds
         .as_api_key()
-        .filter(|s| !s.trim().is_empty())
+        .filter(|value| !value.trim().is_empty())
         .or_else(|| {
             creds
                 .as_bearer()
-                .map(|b| b.trim_start_matches("Bearer ").to_string())
+                .map(|value| value.trim_start_matches("Bearer ").to_string())
         })
-        .filter(|s| !s.trim().is_empty());
-
-    let api_key = api_key_from_creds
         .or_else(|| std::env::var("AWS_BEARER_TOKEN_BEDROCK").ok())
-        .filter(|s| !s.trim().is_empty());
+        .filter(|value| !value.trim().is_empty())
+}
 
+fn resolve_bedrock_base_url_and_region(def: &ProviderDefinition) -> (String, String) {
     let mut region = extract_region_hint(def);
 
     let base_url = if def.base_url.trim().is_empty() {
@@ -55,50 +54,74 @@ fn build_bedrock(
         def.base_url.clone()
     };
 
-    if region.is_none() {
-        region = infer_region_from_url(&base_url);
-    }
     let region = region
+        .or_else(|| infer_region_from_url(&base_url))
         .unwrap_or_else(|| std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()));
 
-    let auth = if let Some(key) = api_key {
-        base_headers.push(("authorization".into(), format!("Bearer {}", key)));
-        BedrockAuth::ApiKey { token: key }
-    } else {
-        let access_key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| SdkError::Unauthorized)?;
-        let secret_key =
-            std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| SdkError::Unauthorized)?;
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        BedrockAuth::SigV4(SigV4Config {
-            access_key_id: access_key,
-            secret_access_key: secret_key,
-            session_token,
-            region: region.clone(),
-        })
-    };
+    (base_url, region)
+}
 
-    let mut header_map: BTreeMap<String, (String, String)> = BTreeMap::new();
-    for (k, v) in base_headers {
-        header_map.insert(k.to_ascii_lowercase(), (k, v));
+fn resolve_bedrock_auth(
+    api_key: Option<String>,
+    region: &str,
+    headers: &mut Vec<(String, String)>,
+) -> Result<BedrockAuth, SdkError> {
+    if let Some(token) = api_key {
+        headers.push(("authorization".into(), format!("Bearer {}", token)));
+        return Ok(BedrockAuth::ApiKey { token });
     }
 
+    let access_key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| SdkError::Unauthorized)?;
+    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| SdkError::Unauthorized)?;
+    let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+    Ok(BedrockAuth::SigV4(SigV4Config {
+        access_key_id: access_key,
+        secret_access_key: secret_key,
+        session_token,
+        region: region.to_string(),
+    }))
+}
+
+fn merge_provider_headers(
+    def: &ProviderDefinition,
+    headers: Vec<(String, String)>,
+) -> (Vec<(String, String)>, Option<v2t::ProviderOptions>) {
+    let mut header_map: BTreeMap<String, (String, String)> = headers
+        .into_iter()
+        .map(|(key, value)| (key.to_ascii_lowercase(), (key, value)))
+        .collect();
+
     let mut default_options: Option<v2t::ProviderOptions> = None;
-    for (k, v) in def.headers.iter() {
-        if crate::core::options::is_internal_sdk_header(k) {
+    for (key, value) in &def.headers {
+        if crate::core::options::is_internal_sdk_header(key) {
             if default_options.is_none() {
-                if let Ok(json) = serde_json::from_str::<JsonValue>(v) {
+                if let Ok(json) = serde_json::from_str::<JsonValue>(value) {
                     default_options = provider_defaults_from_json(&def.name, &json);
                 }
             }
             continue;
         }
-        header_map.insert(k.to_ascii_lowercase(), (k.clone(), v.clone()));
+        header_map.insert(key.to_ascii_lowercase(), (key.clone(), value.clone()));
     }
 
-    let headers: Vec<(String, String)> = header_map.into_values().collect();
+    (header_map.into_values().collect(), default_options)
+}
 
-    let transport_cfg =
-        build_provider_transport_config(def, Some(std::time::Duration::from_secs(45)));
+fn build_bedrock(
+    def: &ProviderDefinition,
+    model: &str,
+    creds: &Credentials,
+) -> Result<Arc<dyn LanguageModel>, SdkError> {
+    let mut headers = default_headers();
+    let api_key = resolve_bedrock_api_key(creds);
+    let (base_url, region) = resolve_bedrock_base_url_and_region(def);
+    let auth = resolve_bedrock_auth(api_key, &region, &mut headers)?;
+    let (headers, default_options) = merge_provider_headers(def, headers);
+
+    let transport_cfg = build_provider_transport_config(
+        def,
+        Some(std::time::Duration::from_secs(BEDROCK_TIMEOUT_SECS)),
+    );
 
     let http = crate::transport_reqwest::ReqwestTransport::try_new(&transport_cfg)
         .map_err(SdkError::Transport)?;

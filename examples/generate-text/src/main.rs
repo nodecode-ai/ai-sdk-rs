@@ -1,7 +1,7 @@
-use anyhow::Result;
 use ai_sdk_rs::core::types as v2t;
 use ai_sdk_rs::core::LanguageModel;
 use ai_sdk_rs::providers::openai::OpenAIResponsesLanguageModel;
+use anyhow::Result;
 
 // Run with:
 //   OPENAI_API_KEY=sk-... cargo run -p generate-text

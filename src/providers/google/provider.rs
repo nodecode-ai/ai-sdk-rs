@@ -14,6 +14,20 @@ use crate::providers::google::gen_ai::language_model::{
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+fn regex_escape_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn default_headers_from_api_key(api_key: Option<String>) -> Vec<(String, String)> {
     let mut h = vec![
         ("content-type".to_string(), "application/json".to_string()),
@@ -64,7 +78,7 @@ fn build_google(
         "*".to_string(),
         vec![
             // files endpoint under base_url
-            format!(r"^{}{}$", regex::escape(&base_url), "/files/.*"),
+            format!(r"^{}{}$", regex_escape_literal(&base_url), "/files/.*"),
             // YouTube URLs
             String::from(r"^https://(?:www\.)?youtube\.com/watch\?v=[\w-]+(?:&[\w=&.-]*)?$"),
             String::from(r"^https://youtu\.be/[\w-]+(?:\?[\w=&.-]*)?$"),
@@ -104,4 +118,17 @@ pub(crate) fn provider_registrations() -> &'static [ProviderRegistration] {
     }];
 
     REGISTRATIONS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::regex_escape_literal;
+
+    #[test]
+    fn escapes_regex_meta_characters_in_base_url() {
+        assert_eq!(
+            regex_escape_literal("https://api.example.com/v1?x=(a+b)"),
+            r"https://api\.example\.com/v1\?x=\(a\+b\)"
+        );
+    }
 }

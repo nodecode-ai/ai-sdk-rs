@@ -514,16 +514,6 @@ async fn consume_until_finish_and_drop(response: crate::core::StreamResponse) {
     }
 }
 
-fn request_shape_without_incremental_fields(value: &Value) -> Value {
-    let mut value = value.clone();
-    if let Some(object) = value.as_object_mut() {
-        object.remove("input");
-        object.remove("previous_response_id");
-        object.remove("generate");
-    }
-    value
-}
-
 #[tokio::test]
 async fn stream_uses_wss_for_codex_oauth_endpoint_path() {
     let cfg = OpenAIConfig {
