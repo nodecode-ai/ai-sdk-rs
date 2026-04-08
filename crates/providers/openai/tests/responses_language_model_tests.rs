@@ -1262,7 +1262,7 @@ async fn cold_codex_turn_session_skips_prewarm_when_first_request_succeeds() {
 }
 
 #[tokio::test]
-async fn explicit_previous_response_id_is_ignored_after_websocket_reconnect_reset() {
+async fn explicit_previous_response_id_survives_websocket_reconnect_reset() {
     let cfg = OpenAIConfig {
         provider_name: "openai.responses".into(),
         provider_scope_name: "openai".into(),
@@ -1355,7 +1355,7 @@ async fn explicit_previous_response_id_is_ignored_after_websocket_reconnect_rese
         request_bodies[1]
             .get("previous_response_id")
             .and_then(|value| value.as_str()),
-        None
+        Some("resp-1")
     );
     assert_eq!(
         second_headers
@@ -1367,7 +1367,7 @@ async fn explicit_previous_response_id_is_ignored_after_websocket_reconnect_rese
         second_headers
             .get("x-ai-sdk-provider-previous-response-id-used")
             .map(String::as_str),
-        Some("false")
+        Some("true")
     );
 }
 

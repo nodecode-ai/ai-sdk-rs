@@ -866,19 +866,18 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
             )
         };
         if let Some(explicit_previous_response_id) = explicit_previous_response_id {
-            if reset_reason.is_none() {
-                if let Some(object) = body.as_object_mut() {
-                    object.insert(
-                        "previous_response_id".to_string(),
-                        Value::String(explicit_previous_response_id),
-                    );
-                    previous_response_id_used = true;
-                }
-            } else {
+            if reset_reason.is_some() {
                 tracing::info!(
                     reason = ?reset_reason,
-                    "ignoring explicit previous_response_id after provider-session reset"
+                    "preserving explicit previous_response_id across provider-session reset"
                 );
+            }
+            if let Some(object) = body.as_object_mut() {
+                object.insert(
+                    "previous_response_id".to_string(),
+                    Value::String(explicit_previous_response_id),
+                );
+                previous_response_id_used = true;
             }
         } else if let Some(last_response_id) = last_response_id {
             if request_shape_matches_previous(last_request.as_ref(), &body) {
