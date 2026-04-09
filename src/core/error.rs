@@ -89,6 +89,23 @@ impl SdkError {
     }
 }
 
+pub const CODEX_WEBSOCKET_RECONNECT_REPLAY_RETRY_MESSAGE: &str =
+    "codex websocket reconnect requires caller replay retry";
+
+pub fn codex_websocket_reconnect_replay_retry_error() -> SdkError {
+    SdkError::Transport(TransportError::Other(
+        CODEX_WEBSOCKET_RECONNECT_REPLAY_RETRY_MESSAGE.to_string(),
+    ))
+}
+
+pub fn is_codex_websocket_reconnect_replay_retry_error(err: &SdkError) -> bool {
+    matches!(
+        err,
+        SdkError::Transport(TransportError::Other(message))
+            if message == CODEX_WEBSOCKET_RECONNECT_REPLAY_RETRY_MESSAGE
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("http status {status}: {sanitized}")]

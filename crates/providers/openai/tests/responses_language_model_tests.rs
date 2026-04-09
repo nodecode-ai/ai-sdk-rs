@@ -1,4 +1,6 @@
-use crate::core::error::{SdkError, TransportError};
+use crate::core::error::{
+    is_codex_websocket_reconnect_replay_retry_error, SdkError, TransportError,
+};
 use crate::core::transport::{
     HttpTransport, JsonStreamWebsocketConnection, TransportConfig, TransportStream,
 };
@@ -1369,6 +1371,107 @@ async fn explicit_previous_response_id_survives_websocket_reconnect_reset() {
             .map(String::as_str),
         Some("true")
     );
+    assert!(transport.last_headers().iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("x-codex-turn-state") && value == "ts-1"
+    }));
+}
+
+#[tokio::test]
+async fn explicit_previous_response_id_without_turn_state_requests_replay_retry_after_websocket_reconnect_reset(
+) {
+    let cfg = OpenAIConfig {
+        provider_name: "openai.responses".into(),
+        provider_scope_name: "openai".into(),
+        base_url: "https://chatgpt.com".into(),
+        endpoint_path: "/backend-api/codex/responses".into(),
+        headers: vec![],
+        query_params: vec![],
+        supported_urls: HashMap::new(),
+        file_id_prefixes: Some(vec!["file-".into()]),
+        default_options: None,
+        request_defaults: None,
+    };
+    let transport = TestTransport::new()
+        .with_close_websocket_after_send()
+        .with_stream_behavior(StreamBehavior::Chunks(vec![Ok(Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        ))]));
+    let model = OpenAIResponsesLanguageModel::new(
+        "gpt-5.3-codex",
+        cfg,
+        transport.clone(),
+        TransportConfig::default(),
+    );
+
+    let mut session = model.new_turn_session();
+    let first = session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "hello".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            provider_options: websocket_transport_options(),
+            ..Default::default()
+        })
+        .await
+        .expect("first stream response");
+    drain_stream_response(first).await;
+
+    let err = match session
+        .do_stream(v2t::CallOptions {
+            prompt: vec![v2t::PromptMessage::User {
+                content: vec![v2t::UserPart::Text {
+                    text: "third".into(),
+                    provider_options: None,
+                }],
+                provider_options: None,
+            }],
+            provider_options: v2t::ProviderOptions::from([(
+                "openai".into(),
+                HashMap::from([
+                    (
+                        "transport".into(),
+                        json!({
+                            "mode": "websocket",
+                            "fallback": "http",
+                        }),
+                    ),
+                    ("previousResponseId".into(), json!("resp-1")),
+                ]),
+            )]),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(_) => panic!("reconnect without turn_state should request caller replay retry"),
+        Err(err) => err,
+    };
+
+    assert!(is_codex_websocket_reconnect_replay_retry_error(&err));
+    assert_eq!(
+        transport.websocket_connect_urls(),
+        vec![
+            "wss://chatgpt.com/backend-api/codex/responses".to_string(),
+            "wss://chatgpt.com/backend-api/codex/responses".to_string(),
+        ]
+    );
+    assert_eq!(
+        transport.websocket_request_bodies().len(),
+        1,
+        "the unsafe reconnect request must be rejected before a second websocket send"
+    );
+    assert_eq!(
+        transport.stream_urls(),
+        Vec::<String>::new(),
+        "the replay-retry signal must not silently fall back to HTTP"
+    );
+    assert!(transport
+        .last_headers()
+        .iter()
+        .all(|(name, _)| !name.eq_ignore_ascii_case("x-codex-turn-state")));
 }
 
 #[tokio::test]

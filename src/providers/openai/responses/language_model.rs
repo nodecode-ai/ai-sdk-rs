@@ -4,7 +4,10 @@ use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use crate::ai_sdk_core::error::{SdkError, TransportError};
+use crate::ai_sdk_core::error::{
+    codex_websocket_reconnect_replay_retry_error, is_codex_websocket_reconnect_replay_retry_error,
+    SdkError, TransportError,
+};
 use crate::ai_sdk_core::transport::{
     HttpTransport, JsonStreamWebsocketConnection, TransportConfig,
 };
@@ -830,9 +833,10 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
     async fn send_session_websocket_request(
         &mut self,
         body: Value,
+        request_has_turn_state: bool,
     ) -> Result<(Value, Value, ByteStream, Vec<(String, String)>, bool, bool), SdkError> {
         let (session_body, transport_body, previous_response_id_used, warmup_response_id_used) =
-            self.prepared_websocket_body(body);
+            self.prepared_websocket_body(body, request_has_turn_state)?;
         let (stream, transport_headers) = self.send_websocket_request(&transport_body).await?;
         Ok((
             session_body,
@@ -844,7 +848,11 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
         ))
     }
 
-    fn prepared_websocket_body(&self, mut body: Value) -> (Value, Value, bool, bool) {
+    fn prepared_websocket_body(
+        &self,
+        mut body: Value,
+        request_has_turn_state: bool,
+    ) -> Result<(Value, Value, bool, bool), SdkError> {
         let mut previous_response_id_used = false;
         let mut warmup_response_id_used = false;
         let explicit_previous_response_id = body
@@ -866,6 +874,15 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
             )
         };
         if let Some(explicit_previous_response_id) = explicit_previous_response_id {
+            if matches!(reset_reason.as_deref(), Some("websocket_reconnect"))
+                && !request_has_turn_state
+            {
+                tracing::info!(
+                    reason = ?reset_reason,
+                    "explicit previous_response_id requires caller replay retry after websocket reconnect without turn_state"
+                );
+                return Err(codex_websocket_reconnect_replay_retry_error());
+            }
             if reset_reason.is_some() {
                 tracing::info!(
                     reason = ?reset_reason,
@@ -896,12 +913,12 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
             ResponseTransportMode::Websocket,
             &self.model.config.endpoint_path,
         );
-        (
+        Ok((
             body,
             transport_body,
             previous_response_id_used,
             warmup_response_id_used,
-        )
+        ))
     }
 
     fn response_headers(
@@ -1118,17 +1135,24 @@ impl<'a, T: HttpTransport + Send + Sync + 'static> OpenAIResponsesTurnSession<'a
         &mut self,
         body: &Value,
         websocket_headers: &[(String, String)],
+        request_has_turn_state: bool,
     ) -> Result<SessionWebsocketRequest, SdkError> {
         if !self.should_prewarm_websocket(body) {
-            return self.send_session_websocket_request(body.clone()).await;
+            return self
+                .send_session_websocket_request(body.clone(), request_has_turn_state)
+                .await;
         }
 
-        match self.send_session_websocket_request(body.clone()).await {
+        match self
+            .send_session_websocket_request(body.clone(), request_has_turn_state)
+            .await
+        {
             Ok(result) => Ok(result),
             Err(SdkError::RateLimited { .. }) => {
                 self.ensure_websocket_connection(websocket_headers).await?;
                 self.prewarm_websocket_session(body).await?;
-                self.send_session_websocket_request(body.clone()).await
+                self.send_session_websocket_request(body.clone(), request_has_turn_state)
+                    .await
             }
             Err(err) => Err(err),
         }
@@ -1198,6 +1222,8 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
         }
 
         let websocket_headers = self.websocket_headers(&options.headers);
+        let request_has_turn_state =
+            has_nonempty_header(&websocket_headers, CODEX_TURN_STATE_HEADER);
         let reused = match self.ensure_websocket_connection(&websocket_headers).await {
             Ok(reused) => reused,
             Err(err) => {
@@ -1225,7 +1251,11 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
             previous_response_id_used,
             warmup_response_id_used,
         ) = match self
-            .send_session_websocket_request_with_prewarm(&body, &websocket_headers)
+            .send_session_websocket_request_with_prewarm(
+                &body,
+                &websocket_headers,
+                request_has_turn_state,
+            )
             .await
         {
             Ok(result) => result,
@@ -1275,6 +1305,12 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
             response_headers: Some(response_headers),
         })
     }
+}
+
+fn has_nonempty_header(headers: &[(String, String)], target: &str) -> bool {
+    headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case(target) && !value.trim().is_empty())
 }
 
 fn request_shape_matches_previous(previous: Option<&Value>, current: &Value) -> bool {
@@ -1396,14 +1432,15 @@ fn map_transport_stream_error(err: TransportError) -> SdkError {
 }
 
 fn should_fallback_to_http_after_websocket_error(err: &SdkError) -> bool {
-    !matches!(
-        err,
-        SdkError::RateLimited { .. }
-            | SdkError::Upstream {
-                status: 401 | 403,
-                ..
-            }
-    )
+    !is_codex_websocket_reconnect_replay_retry_error(err)
+        && !matches!(
+            err,
+            SdkError::RateLimited { .. }
+                | SdkError::Upstream {
+                    status: 401 | 403,
+                    ..
+                }
+        )
 }
 
 fn response_headers_with_transport(
