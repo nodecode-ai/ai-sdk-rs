@@ -1171,6 +1171,34 @@ impl<T: HttpTransport + Send + Sync + 'static> LanguageModelTurnSession
         &self.model.model_id
     }
 
+    async fn prewarm_stream(&mut self, options: v2t::CallOptions) -> Result<(), SdkError> {
+        let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
+            options,
+            &self.model.config.provider_scope_name,
+            self.model.config.default_options.as_ref(),
+        );
+        let prov = parse_openai_provider_options(
+            &options.provider_options,
+            &self.model.config.provider_scope_name,
+        );
+        let transport_selection =
+            resolve_transport_selection(&self.model.config.endpoint_path, &prov);
+        if transport_selection.requested != ResponseTransportMode::Websocket
+            || !should_use_codex_oauth_websocket_transport(&self.model.config.endpoint_path)
+            || self.state.lock().unwrap().force_http
+        {
+            return Ok(());
+        }
+
+        if let Some(limiter) = &self.model.limiter {
+            let _ = limiter.until_ready().await;
+        }
+
+        let websocket_headers = self.websocket_headers(&options.headers);
+        self.ensure_websocket_connection(&websocket_headers).await?;
+        Ok(())
+    }
+
     async fn do_stream(&mut self, options: v2t::CallOptions) -> Result<StreamResponse, SdkError> {
         let options = crate::ai_sdk_core::request_builder::defaults::build_call_options(
             options,

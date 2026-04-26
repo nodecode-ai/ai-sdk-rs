@@ -33,6 +33,13 @@ pub trait LanguageModelTurnSession: Send {
     fn provider_name(&self) -> &'static str;
     fn model_id(&self) -> &str;
 
+    async fn prewarm_stream(
+        &mut self,
+        _options: v2t::CallOptions,
+    ) -> Result<(), crate::ai_sdk_core::SdkError> {
+        Ok(())
+    }
+
     async fn do_stream(
         &mut self,
         options: v2t::CallOptions,
